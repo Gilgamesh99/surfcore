@@ -2,7 +2,7 @@
 
 ## 2026-11-12：本地 main 整合与保留提交更新
 
-按用户要求汇总三个已部署功能的代码、测试和文档，并修复更新检查/合并/失败展示。工作树 `D:/Project/surfcore-main-integration`；生产目录 `D:/Project/surfcore`；四树整合前备份在 `D:/ProgramData/DSH NEXT/Soul/backups/surfcore-main-integration-20261112`。本机版本仍 0.8.9，无版本发布。最终测试、提交与加载状态见 [整合 case](cases/2026-11-12-local-main-integration.md)；下方旧快照仅记录历史验收。
+按用户要求汇总三个已部署功能的代码、测试和文档，并修复更新检查/合并/失败展示。工作树 `D:/Project/surfcore-main-integration`；生产目录 `D:/Project/surfcore`；四树整合前备份在 `D:/ProgramData/DSH NEXT/Soul/backups/surfcore-main-integration-20261112`。本机版本仍 0.8.9，无版本发布。已将功能提交 1357389 整合到生产 main 并加载新更新器，159/159 审计、17/17 桥接回归及插件全套通过，配置/水位保留；桥接已受控重启并恢复 DSH/SnowLuma 连接。后续提交补齐真实页面的 unknown 状态汇总及交接证据。最终证据见 [整合 case](cases/2026-11-12-local-main-integration.md)；下方旧快照仅记录历史验收。
 
 ## 2026-11-11：QQ 有限续聊修复（fix/qq-continuation）
 

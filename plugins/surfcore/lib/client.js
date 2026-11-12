@@ -1611,7 +1611,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       const rows = Array.isArray(status.results) ? status.results : [];
       const available = status.availableUpdateCount ?? rows.filter((x) => x.available && x.updateAvailable && !x.blocked).length;
       const blocked = rows.filter((x) => x.blocked || x.status === "blocked").length;
-      const failed = status.failedCount ?? rows.filter((x) => x.available === false || ["failed", "unknown"].includes(x.status)).length;
+      const failed = Math.max((status.failedCount ?? 0) + (status.unknownCount ?? 0), rows.filter((x) => x.available === false || ["failed", "unknown"].includes(x.status)).length);
       const stale = rows.some((x) => x.versionStale);
       const parts = [];
       if (status.lastApply?.status === "pending_restart") parts.push("已排队，等待退出 DSH 后应用");

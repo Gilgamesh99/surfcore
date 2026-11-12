@@ -1,6 +1,6 @@
 # 本地功能整合与保留提交的远端更新（2026-11-12）
 
-状态：隔离工作树验证中；最终提交、生产加载与完整测试结果在下方记录。版本仍为 0.8.9，不 bump/tag/push/release。本次按用户明确要求整合到本机 main。
+状态：已按用户明确要求整合到本机 main，功能整合提交为 135738918ac0139150e3a1793f7ef8e035ce2971；运行实例已加载；后续提交补齐界面未知状态汇总和真实运行证据。版本仍为 0.8.9，未 bump/tag/push/release。
 
 ## 现象与根因
 
@@ -33,10 +33,13 @@
 
 - 已备份四个工作树；通过现有 Windows 代理 127.0.0.1:7897 fetch 成功，远端 main 为 0ce8580048d3dddb21860114edb8b115d5d79d1e。仅在本仓库 GitHub remote 配置代理，全局 Git 配置不变。
 - 桥接回归独立运行 17/17 通过。首次与全审计并行时 Markdown 性能用例测得 540ms 超时，独立复测通过，未放宽阈值。
-- 更新 UI 行为回归与 client contract 通过。
+- 更新 UI 行为回归与 client contract 通过。最终插件补跑中，桌宠安装守卫的固定 2.5 秒等待曾先于解压结束，产生断言及临时目录 EPERM；该测试独立复跑通过，其后剩余 24 项全部通过，未改变生产逻辑或放宽断言。
 - 完整审计 159/159 通过；插件 npm test 全套通过。Git 独立事务测试 21/21 通过，覆盖分叉、冲突恢复、状态漂移与忽略文件碰撞。
 - 恢复排队修复后，helper-env、更新服务与 ZIP apply-result 再次通过；独立只读复核确认没有剩余阻断项。图片专项 67 通过、1 Windows 文件 symlink 权限跳过；目录 junction 越界测试通过。
-- 生产整合和加载：待最后串行切换后补录。
+- 生产 main 原 28 个未提交路径全部核对快照哈希后备份、整合并快进到 1357389，工作区干净。三个配置文件逐字节哈希一致；两个角色的 B 站监听水位分别保持 1794312001、1794471146，未保存统一设置。
+- 当前 DSH 实例的真实更新接口返回 policy=preserve-local、ahead=1、behind=0、dirty=0、blocked 为空、status=latest、checkedWithFetch=true，确认已加载新更新器并成功检查远端。插件管理器启用返回 restart-required / unmanaged-plugin；随后列表为 active 且真实接口出现新字段，实际加载证据已确认，因此未重启宿主。
+- QQ 桥接通过设置页同一 restart API 从 PID 22120 切到 22712；reserved2、dshReady=true、SnowLuma connected=true。未发送测试消息或调用付费图片生成。
+- 真实页面显示 SurfCore 已跟上远端并保留本地提交；同时桌宠（当前未安装）的版本清单请求超时。UI 补测覆盖 failedCount=0、unknownCount=1 的真实返回，避免总标题误报“已是最新”。该外部清单超时与 SurfCore Git 检查独立。
 
 ## 可转发发布交接块
 
