@@ -2,7 +2,7 @@
 //
 // 覆盖的是"会伤到用户"的几条边界：
 //   · 只做 fetch 检查，不动工作区；
-//   · 只允许 --ff-only；本地有改动 / 有未推送提交时**拒绝**；
+//   · SurfCore 正常合并保留本地提交；自定义组件默认 ff-only；未提交改动拒绝；
 //   · "不再提示本次"按远端 commit 记，远端再前进会重新提示；
 //   · 不是 git 仓库的目录只是"不可查"，不能让整个功能报错。
 import assert from 'node:assert/strict';
@@ -39,6 +39,7 @@ try {
   git(['clone', remote, work], base);
   git(['checkout', '-b', 'main'], work);
   fs.writeFileSync(path.join(work, 'README.md'), '# demo\n');
+  fs.writeFileSync(path.join(work, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0' }));
   git(['add', '.'], work);
   git(['commit', '-m', 'init'], work);
   git(['push', '-u', 'origin', 'main'], work);
@@ -63,6 +64,7 @@ try {
     ok(r.behind === 1, `behind=1（实际 ${r.behind}）`);
     ok(r.changelog.some((line) => line.includes('feat: add a')), 'changelog 带上了提交信息');
     ok(r.blocked === '', '干净的工作区可以自动更新');
+    ok(r.channel === 'git' && r.updateAvailable && r.installedVersion === '1.0.0' && r.latestVersion === '1.0.0', '同版本号的远端新提交仍是 Git 更新，版本来自固定对象');
   }
 
   console.log('## 3. 本地有改动 / 未推送提交：拒绝，而不是覆盖');
@@ -72,6 +74,11 @@ try {
     ok(dirty.dirty >= 1, `识别出本地改动（${dirty.dirty} 处）`);
     ok(/未提交改动/.test(dirty.blocked), 'blocked 说明是"未提交改动"');
     git(['checkout', '--', 'README.md'], work);   // 还原测试现场
+    const originalPackage = fs.readFileSync(path.join(work, 'package.json'), 'utf8');
+    fs.writeFileSync(path.join(work, 'package.json'), JSON.stringify({ version: '9.0.0-local' }));
+    const actualVersion = await inspectComponent({ id: 'core', dir: work }, { fetch: false });
+    ok(actualVersion.blocked && actualVersion.installedVersion === '9.0.0-local' && actualVersion.latestVersion === '1.0.0', '本机版本读取实际安装文件，远端版本只取固定 Git 对象');
+    fs.writeFileSync(path.join(work, 'package.json'), originalPackage);
 
     // 本地领先：造一个未推送提交，再让它与远端分叉
     fs.writeFileSync(path.join(work, 'local.txt'), 'local\n');
@@ -85,9 +92,35 @@ try {
     git(['push', 'origin', 'main'], other);
     const diverged = await inspectComponent({ id: 'core', name: '本体', dir: work }, { fetch: true });
     ok(diverged.ahead === 1 && diverged.behind === 2, `识别出分叉（ahead=${diverged.ahead} behind=${diverged.behind}）`);
-    ok(/未推送提交/.test(diverged.blocked), '分叉时明确拒绝自动更新');
+    ok(/未推送提交/.test(diverged.blocked), '自定义组件分叉时默认拒绝自动更新');
+    const surfcore = await inspectComponent({ id: 'surfcore', name: '本体', dir: work, branch: 'main' }, { fetch: false });
+    ok(!surfcore.blocked && surfcore.updateAvailable && surfcore.policy === 'preserve-local', 'SurfCore 分叉允许保留本地提交的正常合并');
+    const explicit = await inspectComponent({ id: 'core', dir: work, gitPolicy: 'preserve-local' }, { fetch: false });
+    ok(!explicit.blocked && explicit.policy === 'preserve-local', '自定义组件可显式选择保留本地历史');
+    const blockedCountSvc = createUpdatesService({ stateDir: path.join(base, 'blocked-count'), components: () => [{ id: 'core', dir: work }] });
+    const counts = await blockedCountSvc.check({ fetch: false });
+    ok(counts.availableUpdateCount === 1 && counts.blockedUpdateCount === 1 && counts.pendingCount === 0, '阻塞的远端更新仍计入可用更新，不冒充最新');
     // 收尾：回到与远端一致（测试继续用干净状态）
     git(['reset', '--hard', 'origin/main'], work);
+    fs.writeFileSync(path.join(work, 'ahead.txt'), 'local only\n');
+    git(['add', 'ahead.txt'], work); git(['commit', '-m', 'ahead only'], work);
+    const aheadOnly = await inspectComponent({ id: 'surfcore', dir: work }, { fetch: false });
+    ok(aheadOnly.ahead === 1 && aheadOnly.behind === 0 && !aheadOnly.blocked && aheadOnly.status === 'latest', '仅本地领先可以判定没有上游更新');
+    git(['reset', '--hard', 'origin/main'], work);
+    git(['switch', '-c', 'other-branch'], work);
+    const branchMismatch = await inspectComponent({ id: 'surfcore', dir: work, branch: 'main' }, { fetch: false });
+    ok(branchMismatch.code === 'git.branch-mismatch' && branchMismatch.hint, '配置 main 不会掩盖实际分支');
+    git(['switch', 'main'], work);
+    git(['remote', 'set-url', 'origin', path.join(base, 'missing-remote.git')], work);
+    const fetchSvc = createUpdatesService({ stateDir: path.join(base, 'fetch-state'), components: () => [{ id: 'surfcore', dir: work, kind: 'git', versionRepo: 'never/request-http' }] });
+    const failedFetch = await fetchSvc.check({ fetch: true });
+    ok(failedFetch.results[0].code === 'git.fetch-failed' && failedFetch.unknownCount === 1 && failedFetch.availableUpdateCount === 0, 'fetch 失败不能用缓存或 HTTP 兜底冒充最新');
+    git(['remote', 'set-url', 'origin', remote], work);
+    const index = path.join(work, '.git', 'index'), originalIndex = fs.readFileSync(index);
+    fs.writeFileSync(index, 'corrupt index');
+    const badState = await inspectComponent({ id: 'surfcore', dir: work }, { fetch: false });
+    ok(badState.available === false && badState.code === 'git.state-unreadable' && badState.hint, 'status 失败严格拒绝判定干净');
+    fs.writeFileSync(index, originalIndex);
   }
 
   console.log('## 4. 服务层：check → pending → dismiss → 远端再前进 → 重新提示');
@@ -111,6 +144,7 @@ try {
 
     const dismissed = svc.dismiss(['core']);
     ok(dismissed.showPrompt === false && dismissed.pendingCount === 0, '「不再提示本次」后不再 prompt');
+    ok(dismissed.availableUpdateCount === 1, '忽略提示仍保留可用更新计数');
     ok(fs.existsSync(path.join(stateDir, 'updates.json')), 'dismiss 落盘到 updates.json');
 
     fs.writeFileSync(path.join(other, 'd.txt'), 'd\n');
@@ -140,9 +174,34 @@ try {
     ok(git(['rev-parse', 'HEAD'], work) === headBefore, '宿主进程内不改工作区（更新排队到退出后）');
     ok(result.results[0]?.staged === true, 'git 更新标记为 staged（退出后应用）');
     ok(result.restartRequired === true, '提示需要重启');
+    const pendingPath = path.join(stateDir, 'updates-pending.json');
+    const queued = JSON.parse(fs.readFileSync(pendingPath, 'utf8'));
+    ok(queued.fromHead === headBefore && queued.targetSha === git(['rev-parse', 'origin/main'], work) && queued.expectedBranch === 'main' && queued.policy === 'ff-only' && queued.txn, '排队任务固定 fromHead/targetSha/branch/policy/txn');
+    process.env.SURFCORE_UPDATE_NO_SPAWN = '1';
+    const duplicate = await svc.apply(['core']);
+    delete process.env.SURFCORE_UPDATE_NO_SPAWN;
+    ok(!duplicate.ok && duplicate.results[0].code === 'stage.pending-exists' && duplicate.results[0].hint, '拒绝覆盖已有排队任务');
+    ok(JSON.parse(fs.readFileSync(pendingPath, 'utf8')).txn === queued.txn, '并发拒绝保留原排队任务');
+    // A failed second attempt is independent of the successfully queued first job.
+    const stagedSvc = createUpdatesService({ stateDir, components: () => [{ id: 'core', name: '本体', dir: work }] });
+    const rollback = await stagedSvc.rollback('core');
+    ok(!rollback.ok && rollback.code === 'rollback.git-manual' && rollback.hint, 'Git 回滚不会用 ZIP 文件拷贝覆盖仓库');
     const afterStage = await svc.check({ fetch: true });
     ok(afterStage.pendingCount === 0, 'staged 后再次检查不再把同一更新当 pending');
-    ok(afterStage.lastApply?.status === 'pending_restart', 'staged 状态显示为等待重启');
+    ok(afterStage.availableUpdateCount === 1, '已排队更新仍计入远端可用更新');
+    ok(afterStage.lastApply?.status === 'failed' && afterStage.lastApply.code === 'stage.pending-exists', '并发排队失败在状态中可见');
+    const missingHelperState = path.join(base, 'missing-helper-state');
+    const missingHelperSvc = createUpdatesService({ stateDir: missingHelperState, components: () => [{ id: 'core', name: '本体', dir: work }] });
+    process.env.SURFCORE_UPDATE_HELPER = path.join(base, 'missing-helper.mjs');
+    process.env.SURFCORE_UPDATE_NO_SPAWN = '1';
+    const missingHelper = await missingHelperSvc.apply(['core']);
+    delete process.env.SURFCORE_UPDATE_HELPER; delete process.env.SURFCORE_UPDATE_NO_SPAWN;
+    ok(!missingHelper.ok && missingHelper.results[0].code === 'stage.helper-missing' && missingHelper.results[0].hint && missingHelper.pendingRestart === 0, '助手缺失的 stage 失败不报告排队成功');
+    ok(!fs.existsSync(path.join(missingHelperState, 'updates-pending.json')), 'stage 失败不遗留 pending');
+    const appliedDir = path.join(missingHelperState, 'updates-applied'); fs.mkdirSync(appliedDir);
+    fs.writeFileSync(path.join(appliedDir, 'later.json'), JSON.stringify({ component: 'core', kind: 'git', verified: true, fromHead: headBefore, targetSha: queued.targetSha, resultHead: queued.targetSha, backupRef: 'refs/surfcore-backups/example', at: new Date(Date.now() + 1000).toISOString() }));
+    const latestApply = missingHelperSvc.status().lastApply;
+    ok(latestApply.status === 'success' && latestApply.kind === 'git' && latestApply.backupRef && latestApply.resultHead === queued.targetSha, '助手较新成功证据覆盖旧 stage 失败并暴露 Git 备份信息');
 
     // blocked 的组件不动
     const blockedSvc = createUpdatesService({

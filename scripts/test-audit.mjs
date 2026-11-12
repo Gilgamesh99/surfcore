@@ -10,6 +10,8 @@ const tests = [
   'test-audit-setup.mjs', 'test-audit-setup-guards.mjs',
   // QQ scoped 工具：晚注册的全局危险工具也要补装 Schema 限制。
   'test-qq-tool-restrict-events.mjs',
+  // Controlled generation, safe owned artifacts, MCP adapter and mocked OneBot delivery.
+  'test-generated-images.mjs', 'test-magpie-image-backend.mjs', 'test-generated-image-flow.mjs',
   // DSH Desktop 安装目录里的 node 解析；bridge/scheduler/setup 共用同一个入口。
   'test-node-path.mjs',
   // DSH 会话队列（inbox 投影）解析：0.2.0 把队列从 control baseline 的
@@ -70,6 +72,7 @@ const tests = [
   // 冷却只压普通概率唤醒；以及真实 bridge.js 的 close 接口/提示词/重开接线
   // （VM 夹具，不连真 QQ）。
   'test-conversation-closure.mjs', 'test-closure-wiring.mjs',
+  'test-conversation-continuation.mjs', 'test-continuation-wiring.mjs',
   // 平台启动开关：QQ/B站 各自「是否启动」的唯一真相 + 旧 bridge.autoStart 迁移
   // （2026-10-24 用户要求；只碰临时 DSH_HOME，不启停真实桥接）。
   'test-platform-start.mjs',
@@ -246,6 +249,7 @@ const tests = [
   'test-release-manifest-verify.mjs',
   'test-voice-gates.mjs',
   'test-update-apply-result.mjs',
+  'test-update-git-apply.mjs',
   'test-update-version-fallback.mjs',
   // 版本号单一真相：根/插件 package.json 一致、无硬编码、CHANGELOG 有当前版本。
   'test-version.mjs',
@@ -299,7 +303,8 @@ let failed = 0;
 for (const test of tests) {
   console.log(`\nRunning ${test}`);
   const result = spawnSync(process.execPath, [path.join(root, 'scripts', test)], {
-    cwd: root, stdio: 'inherit', timeout: 60000,
+    // Real Git transactions create many repositories; Windows process startup needs a larger bounded budget.
+    cwd: root, stdio: 'inherit', timeout: test === 'test-update-git-apply.mjs' ? 240000 : 60000,
     env: { ...process.env, QQ_BRIDGE_TEST_LIVE: '0' },
   });
   if (result.status !== 0 || result.error) {

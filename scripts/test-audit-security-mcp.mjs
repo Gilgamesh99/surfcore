@@ -6,6 +6,7 @@ import vm from 'node:vm';
 import { test } from 'node:test';
 import { z } from 'zod';
 import { EMOTION_LABELS } from '../src/sticker-semantics.js';
+import { registerGeneratedImageTools } from '../src/generated-image-mcp.js';
 
 function loadWebTools({ safeFetch, webSearch }) {
   const tools = new Map();
@@ -114,6 +115,7 @@ function loadSnowlumaTools(fetchImpl, fixtureConfig = null, httpImpl = null) {
     fs: fixtureFs,
     SENSITIVE_RE: { test: () => false },
     serializeModelData: (value) => JSON.stringify(value),
+    registerGeneratedImageTools,
     // mcp-snowluma-safe.js 的表情工具用 z.enum(EMOTION_LABELS) 做中文枚举；
     // 这个 vm 会把 import 行整段删掉，所以枚举要显式塞进上下文（与 SENSITIVE_RE 同一套路）。
     EMOTION_LABELS,

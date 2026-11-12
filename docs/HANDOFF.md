@@ -1,7 +1,37 @@
 # 交接状态（HANDOFF）
 
+## 2026-11-12：本地 main 整合与保留提交更新
+
+按用户要求汇总三个已部署功能的代码、测试和文档，并修复更新检查/合并/失败展示。工作树 `D:/Project/surfcore-main-integration`；生产目录 `D:/Project/surfcore`；四树整合前备份在 `D:/ProgramData/DSH NEXT/Soul/backups/surfcore-main-integration-20261112`。本机版本仍 0.8.9，无版本发布。最终测试、提交与加载状态见 [整合 case](cases/2026-11-12-local-main-integration.md)；下方旧快照仅记录历史验收。
+
+## 2026-11-11：QQ 有限续聊修复（fix/qq-continuation）
+
+基于运行版本 0.8.9 / 0ce8580 的独立工作树；主仓库原有 package-lock.json 改动保留。当前没有本地 dev 分支，因此从 HEAD 建修复分支，未切主仓库、未改版本、未发布。
+
+实现参与人五分钟续聊、共用自然问句/请求分类、重开清旧冷却、短等 close 延后话题收尾；详见 [case 与发布交接块](cases/2026-11-11-qq-conversation-continuation.md)。70组目标检查通过；完整audit首轮148/155，3项补测通过，4项时间/语音/发布环境残余详见case。四个运行文件已备份应用并重启桥接，安装哈希一致，DSH/SnowLuma重新连通；未向群发测试消息、未发布。
+
+## 快照：2026-11-11 B 站全天评论/@峰时豁免
+
+- 独立工作树 `surfcore-bili-all-day`，分支 `hotfix/bili-all-day-20261111`，基线 `0ce8580`；主工作树的其它会话改动保持原样。
+- 全天评论/@改为跳过峰时顺延，预算/互动/轮询限制及其它后台任务避峰保留。专项行为测试 10/10；原始源码负对照 5/10，预期失败。
+- 完整逻辑、测试最终状态、运行时加载证据、回滚与可转发发布交接块见 [本次 case](cases/2026-11-11-bili-all-day-peak.md)。
+- 本机运行目录两处源码已应用；19:27:41 新策略日志确认重载生效，水位 `1794393251` 保留、配置未变。专项 10/10、相关插件两组通过；全审计 146/153，失败详情及 GUI 未验收限制见 case。未发布、未改版本号。
+- 后续激活不得保存统一设置或回退 `whale-listen.json`；旧进程静态导入可能缓存 scheduler，必须核对新策略日志。
+
+
 > 给「半天后的我」和接手的人：**现在做到哪、什么没验证、下一步按什么顺序做**。
 > 每次开工先读这里，收工前更新这里。时间一律写本地时间（Asia/Shanghai）。
+
+---
+
+## 快照：2026-11-12（QQ 受控生图与新图发送）
+
+- 工作树 `D:/ProgramData/DSH NEXT/Soul/surfcore-qq-images`，分支 `feat/qq-generated-images`，基线 `0ce8580`；未 bump/tag/push/release。
+- 新增 `qq_generate_image` / `qq_image_result` / `qq_send_image`，经会话令牌、白名单、持久额度、文件所有权与原有发送闸门。模型只传描述或 imageId；原生 Magpie 工具继续禁用并从 QQ schema 隐藏。
+- 使用管理员配置的 Magpie stdio；出厂总闸关闭。专用 `state/generated-images` 账本跨角色共享额度，默认每会话每天 3、全局 12、冷却 60 秒；同一请求去重，发送不确定不自动重发。
+- 已通过 audit 156/156、regressions 17 条、插件测试及本机 Magpie initialize/tools/list。复核补齐令牌轮换、发送预算回滚、角色切换、付费前路径复查；定向测试与加载最终状态见 [case](cases/2026-11-12-controlled-qq-images.md)。未实际付费生图或发送 QQ 测试消息。
+- 已按三方差异合并到 `D:/Project/surfcore`，保留既存续聊/预算改动；生产总闸和三个工具开关已开启。QQ 桥接重启后 PID 92792、reserved2、DSH/QQ 均连通。真实 MCP 无令牌探针正确拒绝，刷新现有 GUI 后看到新设置及 3/12/60000 配额。合并版图片测试 82 通过/1 权限跳过、regressions 17 通过；VM 夹具补载本地续聊纯函数。部署备份与结果在 `D:/ProgramData/DSH NEXT/Soul/backups/qq-images-deploy-20261112-v3`，原始回滚基线另保留于 v2。
+- 完整七步逻辑、测试、失败路径、回滚与发布交接见 [case](cases/2026-11-12-controlled-qq-images.md)。
 
 ---
 

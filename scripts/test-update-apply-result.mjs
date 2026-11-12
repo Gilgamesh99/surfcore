@@ -730,7 +730,7 @@ try {
     const source = fs.readFileSync(path.resolve('plugins/surfcore/lib/updates.js'), 'utf8');
     ok(source.includes("code: 'apply.unknown-channel'"), '未知 channel 有 apply.unknown-channel');
     ok(source.includes("if (report.channel === 'version' || report.channel === 'dev')"), 'dev 和 version 共用 zip 流水线');
-    ok(source.includes('if (!report.channel) {'), '只有旧数据（没有 channel）才走 git 兜底');
+    ok(!source.includes('if (!report.channel) {') && source.includes("code: 'apply.deferred-required'"), '缺少 channel 不能回退到宿主内 git merge');
   }
 
   // 14) 3 天前的 staging 会被清理（pkg.zip 残留）

@@ -24,6 +24,7 @@ import { adminFromSources, normalizeAdmin } from '../../../src/admin-identity.js
 import { DEFAULT_MEMORY_CARD_CONFIG, normalizeMemoryCardConfig } from '../../../src/memory-card.js?rev=20261025-pet-memory2';
 import { DEFAULT_VECTOR_MEMORY_CONFIG, normalizeVectorMemoryConfig } from '../../../src/vector-memory.js';
 import { normalizeCardMode } from '../../../src/share-mode.js';
+import { normalizeGeneratedImageConfig } from '../../../src/generated-images.js';
 import { normalizeClockText, normalizeWindow } from '../tools/lib/time-window.mjs';
 
 export const MASK = '********';
@@ -451,6 +452,11 @@ export function normalizeQqConfig(input) {
   cfg.biliBridge.share.card = cfg.biliBridge.share.cardMode !== 'off';
 
   if (isPlainObject(cfg.socialV2)) {
+    cfg.socialV2.images = {
+      ...normalizeGeneratedImageConfig(cfg.socialV2.images),
+      magpieCommand: String(cfg.socialV2.images?.magpieCommand ?? '').trim(),
+      model: String(cfg.socialV2.images?.model ?? '').trim(),
+    };
     cfg.socialV2.initialPromptMaxChars = finiteNumber(cfg.socialV2.initialPromptMaxChars, 2000, 100, 8000, { integer: true });
     if (isPlainObject(cfg.socialV2.media)) {
       cfg.socialV2.media.maxBytes = finiteNumber(cfg.socialV2.media.maxBytes, 8 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024, { integer: true });

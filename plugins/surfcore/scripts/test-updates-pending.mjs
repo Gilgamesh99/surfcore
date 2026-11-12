@@ -39,6 +39,23 @@ assert.equal(row.updateAvailable, true);
 assert.equal(st.pending.length, 1, '有新版时必须进 pending（决定是否弹窗）');
 assert.equal(st.showPrompt, true, 'showPrompt 必须为 true');
 
+// ZIP users need no Git executable, but a real Git directory must fail closed.
+const originalPath = process.env.PATH;
+try {
+  process.env.PATH = '';
+  const gitless = await svc.check({ fetch: true });
+  assert.equal(gitless.results[0].channel, 'version');
+  assert.equal(gitless.availableUpdateCount, 1, '没有 Git 命令的 ZIP 安装仍可更新');
+  fs.mkdirSync(path.join(pkgDir, '.git'));
+  const unreadableGit = await svc.check({ fetch: true });
+  assert.equal(unreadableGit.results[0].code, 'no-git');
+  assert.equal(unreadableGit.unknownCount, 1, '真实 Git 仓库缺 Git 命令时不能降级掩盖');
+} finally {
+  if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+  fs.rmSync(path.join(pkgDir, '.git'), { recursive: true, force: true });
+}
+await svc.check({ fetch: true });
+
 // dismiss 之后不该再提示；换版本后重新提示
 svc.dismiss();
 assert.equal(svc.status().pending.length, 0, 'dismiss 后不再提示');

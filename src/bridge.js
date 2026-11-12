@@ -52,6 +52,9 @@ import {
 import { resolvePriceTable, isPeakAt } from './model-prices.js';
 import { catalogChoices, findCatalogModel, pickCatalogFallback } from './model-options.js';
 import { createOutbox } from './outbox.js';
+import { normalizeGeneratedImageConfig } from './generated-images.js';
+import { createMagpieImageGenerator } from './magpie-image-backend.js';
+import { createGeneratedImageRoutes, imageRouteError } from './generated-image-routes.js';
 import {
   DEFAULT_QQ_FISH_GUARD, appendFishGuardTrigger, assessFishDensity, fishGuardPromptLine, fishGuardReasonText,
   isFishName, normalizeQqFishGuard,
@@ -59,8 +62,12 @@ import {
 import {
   assessConversationClosure, classifyMessage, closeGate, closurePromptBlock, closureStatus,
   closureSuppressesWake, makeClosureRecord, normalizeClosureConfig,
-  normalizeClosureRecord, reopenClosure,
+  normalizeClosureRecord, reopenClosure, isDirectedConversationMessage,
 } from './conversation-closure.js';
+import {
+  DEFAULT_CONTINUATION_WINDOW_MS, normalizeContinuation, recordConversationReply,
+  continuationMatches, continuationExpiresAt,
+} from './conversation-continuation.js';
 import {
   adminFromQqConfig, adminMarker, adminPromptBlock,
 } from './admin-identity.js';
@@ -1267,6 +1274,14 @@ function loadConfig() {
       maxRemarkChars: 20,
       ...((cfg.socialV2?.sticker?.collect) ?? {})
     }
+  };
+
+  cfg.socialV2.images = {
+    magpieCommand: '', model: '', ...cfg.socialV2?.images,
+    ...normalizeGeneratedImageConfig(cfg.socialV2?.images),
+  };
+  cfg.socialV2.tools = {
+    generateImage: true, imageResult: true, sendImage: true, ...cfg.socialV2.tools,
   };
 
   cfg.socialV2.vision = {
@@ -2530,6 +2545,8 @@ async function main() {
       isSelf: true,
       at: Date.now()
     };
+    entry.time = entry.at;
+    noteConversationReplyV2(key);
     st.recentMessages.push(entry);
     if (st.recentMessages.length > 200) st.recentMessages = st.recentMessages.slice(-200);
     st.lastAiReplyAt = entry.at;
@@ -4499,6 +4516,76 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    const imageRoutes = createGeneratedImageRoutes({
+      // Paid generation quotas belong to this installation, across characters.
+      root: path.join(STATE_DIR, 'generated-images'),
+      getConfig: () => cfg.socialV2.images,
+      generate: createMagpieImageGenerator({ getConfig: () => cfg.socialV2.images }),
+      authorize(key, token, flag, body) {
+        const captured = captureSendGuard(key);
+        return () => {
+          if (!token || !agentTokenOk(key, token) || currentMode !== 'reserved2' || !v2SessionAllowed(key)
+              || socialV2.paused || cfg.socialV2?.enabled === false || shouldBlockSilentReply(key)) {
+            throw imageRouteError('IMAGE_ACCESS_DENIED', '当前会话无权使用图片工具。', '请确认会话令牌、白名单、二代模式和暂停/静默设置。');
+          }
+          if (cfg.socialV2?.images?.enabled !== true || !v2ToolEnabled(flag)) {
+            throw imageRouteError('IMAGE_DISABLED', '生图或对应图片工具已关闭。', '请在 SurfCore → QQ → 生图与新图发送中启用，保存后重启 QQ 桥接。');
+          }
+          try { captured(); } catch {
+            throw imageRouteError('IMAGE_SESSION_CHANGED', '图片任务已取消：会话或模式已经变化。', '请在当前会话重新发起请求，不要沿用旧会话令牌。');
+          }
+          if (flag === 'generateImage' && (SENSITIVE_RE.test(String(body.prompt ?? ''))
+              || [...KNOWN_AGENT_TOKENS].some((t) => t && String(body.prompt ?? '').includes(t)))) {
+            throw imageRouteError('IMAGE_SENSITIVE_PROMPT', '绘图描述疑似包含路径或凭据，已拦截。', '请只描述画面内容，移除会话令牌、私密信息和本地路径。', 400);
+          }
+        };
+      },
+      enqueue(task) {
+        const result = sendChain.then(task);
+        sendChain = result.catch(() => {});
+        return result;
+      },
+      reserveSend(key) {
+        const st = getSocialV2State(key);
+        const turn = st.wakeConfig.wakeCount;
+        const used = Number(st.tokenTurnSent) || 0;
+        // tokenGuardSendBlock reserves a slot, so evaluate pure limits first.
+        const block = fishGuardSendBlock(key, st)
+          || sendRateLimitInfo(key, st, cfg.socialV2?.send ?? {}, 1)
+          || tokenGuardSendBlock(key, st, 1);
+        if (block) throw imageRouteError('IMAGE_SEND_LIMIT', '当前会话暂时不能发送新图。', '请等待发送额度恢复或由管理员检查群聊保护设置。', 429);
+        const reserved = Math.max(0, (Number(st.tokenTurnSent) || 0) - used);
+        const stamp = Date.now();
+        st.sendTimes.push(stamp);
+        if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+        saveSocialV2State();
+        let rolledBack = false;
+        return () => {
+          if (rolledBack) return;
+          rolledBack = true;
+          const at = st.sendTimes.indexOf(stamp);
+          if (at >= 0) st.sendTimes.splice(at, 1);
+          if (st.wakeConfig.wakeCount === turn) st.tokenTurnSent = Math.max(0, (Number(st.tokenTurnSent) || 0) - reserved);
+          saveSocialV2State();
+        };
+      },
+      async transport(key, buffer) {
+        const [kind, id] = key.split(':');
+        const result = await onebotSendSegments(kind, id, [{ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } }]);
+        return result?.message_id;
+      },
+      recordReply(key, imageId, messageId) {
+        recordSentMessagesV2(key, ['[已发送生成的新图]']);
+        const st = getSocialV2State(key);
+        Object.assign(st.recentMessages.at(-1), { messageId, generatedImage: { imageId }, hasMedia: false });
+        st.lastAiReplyAt = Date.now();
+        st.lastActionAt = Date.now();
+        st.wakeConfig.noActionCount = 0;
+        saveSocialV2State();
+        scheduleReplyCheckV2(key);
+        log(`[image] 新图已发送 ${key}: ${imageId}`);
+      },
+    });
     // 语音包服务实例：按 config.json 的 mtime 缓存（既热生效，又保住安装进度）。
     // 必须放在请求回调**外面**：每次请求新建实例会把 activeInstalls（进度）随实例丢掉，
     // 前端就只看到"开始安装…"、永远没有进度条（2026-10-28 用户反馈）。
@@ -4533,6 +4620,10 @@ async function main() {
         'Referrer-Policy': 'no-referrer'
       };
       const sendJson = (obj, status = 200) => {
+        if (obj?.ok === false && ['/api/socialV2/generate-image', '/api/socialV2/image-result', '/api/socialV2/send-image'].includes(url.pathname)) {
+          obj = { code: status === 403 ? 'IMAGE_ACCESS_DENIED' : 'IMAGE_REQUEST_FAILED',
+            hint: '请检查当前会话令牌、QQ 桥接模式和图片设置，再查询原 imageId；不要重复生成。', ...obj };
+        }
         res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...SECURITY_HEADERS });
         res.end(JSON.stringify(obj, null, 2));
       };
@@ -4745,6 +4836,10 @@ async function main() {
             sendJson({ ok: false, code: 'CONSOLE_ONLY', error: '该接口仅控制台可用', hint: '请用设置页/控制台（x-console-token）；AI 请走对应的 v2 工具面' }, 403);
             return;
           }
+        }
+        if (imageRoutes.matches(url)) {
+          await imageRoutes.handle(req, url, { readBody, sendJson });
+          return;
         }
         // 只读降级：黑话库/表情库在启动时加载失败时，写接口必须**明确失败**。
         // 旧行为是 save 函数里只打一行日志就 return，而接口照样回 {ok:true}：
@@ -6120,7 +6215,7 @@ async function main() {
           const current = fileV2 ?? ((cfg.socialV2 && typeof cfg.socialV2 === 'object') ? cfg.socialV2 : {});
           const merged = { ...current, ...body };
           // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
-          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context', 'tokenGuard', 'history']) {
+          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context', 'tokenGuard', 'history', 'images']) {
             if (body[sub] !== undefined && (body[sub] === null || typeof body[sub] !== 'object' || Array.isArray(body[sub]))) {
               merged[sub] = current[sub] ?? {};
             }
@@ -6130,7 +6225,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'generateImage', 'imageResult', 'sendImage', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6233,6 +6328,14 @@ async function main() {
                 }
               }
             }
+          }
+          if (body.images && typeof body.images === 'object' && !Array.isArray(body.images)) {
+            const imageConfig = { ...(current.images ?? {}), ...body.images };
+            merged.images = {
+              ...normalizeGeneratedImageConfig(imageConfig),
+              magpieCommand: String(imageConfig.magpieCommand ?? '').trim(),
+              model: String(imageConfig.model ?? '').trim(),
+            };
           }
           // vision：图片能力 auto / true / false
           if (body.vision && typeof body.vision === 'object') {
@@ -6467,12 +6570,14 @@ async function main() {
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
-            sendVoice: 'qq_send_voice / qq_list_voices'
+            sendVoice: 'qq_send_voice / qq_list_voices',
+            generateImage: 'qq_generate_image', imageResult: 'qq_image_result', sendImage: 'qq_send_image'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
           const enabledTools = [];
           for (const [flag, name] of Object.entries(toolMap)) {
+            if (['generateImage', 'imageResult', 'sendImage'].includes(flag) && cfg.socialV2?.images?.enabled !== true) continue;
             if (tools[flag] !== false && !(stickerToolFlags.has(flag) && !stickerEnabled())) enabledTools.push(name);
           }
           sendJson({
@@ -7250,7 +7355,7 @@ async function main() {
           }
           try {
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId });
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -7264,7 +7369,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId });
               log(`[reserved2] 工具统一发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -7347,6 +7452,7 @@ async function main() {
             st.lastActionAt = now;
             st.lastAiReplyAt = now;
             st.wakeConfig.noActionCount = 0;
+            noteConversationReplyV2(key, { atUserId: targetUserId });
             const pokeText = kind === 'group'
               ? `[拍一拍] 我拍了拍 ${targetUserId}`
               : '[拍一拍] 我拍了拍你';
@@ -8031,6 +8137,7 @@ async function main() {
             // 记录到二代会话的 recentMessages，让 AI 知道自己发过这个表情
             const label = sent.entry?.desc || sent.entry?.localNote || '表情包';
             const text = `[表情包:${label}]`;
+            noteConversationReplyV2(key, { replyToMessageId: actualReplyToMessageId, atUserId });
             st.recentMessages.push({
               messageId: sent.messageId ? String(sent.messageId) : null,
               sender: '我',
@@ -9407,7 +9514,7 @@ async function main() {
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId });
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -9418,7 +9525,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId });
               log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -9608,6 +9715,7 @@ async function main() {
         sendJson({ ok: false, error: error?.message ?? String(error) }, status);
       }
     });
+    server.on('close', () => { void imageRoutes.close().catch(() => {}); });
     server.listen(port, '127.0.0.1', () => {
       log(`本地控制台已启动：http://127.0.0.1:${port}`);
       // ACL 收紧要跑 icacls，可能被系统策略拖到几十秒；必须等控制台端口先监听，
@@ -11175,7 +11283,8 @@ async function main() {
         pendingThoughts: [],
         memberImpressions: {},
         // 上一次自然收尾记录（对话结束点 + 下次接法）；没有收过尾时为 null。
-        closure: null
+        closure: null,
+        continuation: null
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -11272,6 +11381,7 @@ async function main() {
             // 上次自然收尾：跨重启保留，才是「结束是下次更好的开始」。
             // 旧状态文件没有这个字段 → null，不影响唤醒。
             closure: normalizeClosureRecord(val.closure, cfg.socialV2?.closure),
+            continuation: normalizeContinuation(val.continuation),
             // 鱼群保护的冷却/直呼放行/触发记录要跨桥接重启保留，
             // 否则每次重启都失忆（2026-10-23 补；也供设置页读取）。
             fishGuard: (val.fishGuard && typeof val.fishGuard === 'object') ? val.fishGuard : undefined,
@@ -11392,6 +11502,7 @@ async function main() {
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           // 对话收尾记录：只存结论（收在哪 / 下次怎么接）+ 冷却时间，不存额外消息副本。
           closure: st.closure && typeof st.closure === 'object' ? st.closure : undefined,
+          continuation: normalizeContinuation(st.continuation),
           // 鱼群保护状态（2026-10-23）：冷却、直呼放行、最近触发记录。
           fishGuard: st.fishGuard && typeof st.fishGuard === 'object' ? st.fishGuard : undefined,
           fishGuardBypass: st.fishGuardBypass && typeof st.fishGuardBypass === 'object' ? st.fishGuardBypass : undefined,
@@ -11839,7 +11950,7 @@ async function main() {
     return Number(perGroupCostCache.map.get(String(key))) || 0;
   }
 
-  function tokenGuardWakeBlock(key, st, { direct = false, reason = '' } = {}) {
+  function tokenGuardWakeBlock(key, st, { direct = false, reason = '', continuation = false } = {}) {
     const g = tokenGuardCfg();
     // 额度是独立的（设置页「Token 额度」），不随「Token 防爆破」总开关一起关掉。
     const usage = bridgeDailyUsage();
@@ -11877,6 +11988,7 @@ async function main() {
       guard: g,
       cost: null,
       direct,
+      continuation,
     });
     return r.blocked
       ? { error: r.error, retryAfterMs: r.retryAfterMs || 0, reason: r.reason, dayCount: r.dayCount, maxDay: r.maxDay }
@@ -12135,6 +12247,24 @@ async function main() {
       ? requestedReadThroughSeqV2(st, body, true)
       : readThroughSeqV2(st);
     const markedCount = acknowledgeMessagesV2(st, throughSeq);
+    const continuationUntil = key.startsWith('group:') && !groupProfile(key, st).large && continuationWindowMsV2()
+      ? continuationExpiresAt(st.continuation) : 0;
+    const settled = assessment.signals?.explicitEnd
+      || assessment.signals?.lastOtherKind === 'ack'
+      || assessment.signals?.lastSelfKind === 'ending'
+      || Number(assessment.signals?.topicClosure) >= 0.8;
+    if (continuationUntil > Date.now() && !settled) {
+      // 一次短等待只结束本轮推理；不写“话题聊完”、不开始20分钟冷却。
+      // 不让模型为了保连续聊天反复空等：新消息由有限续聊窗口接管。
+      st.lastActionAt = Date.now();
+      markReadCalledKeys.add(key);
+      cancelReplyCheckV2(key);
+      saveSocialV2State();
+      log(`[续聊] ${key} 本轮结束，保留参与人续聊至 ${new Date(continuationUntil).toLocaleString()}`);
+      return { ok: true, key, deferred: true, code: 'CONTINUATION_WINDOW_OPEN',
+        continuationUntil, markedCount, unreadCount: st.unread.length, wakeKept: true,
+        note: '本轮可以结束，无需再等或重复收尾；刚聊过的成员在续聊窗口内发言仍会唤醒。暂不判定话题结束，也不进入收尾冷却。' };
+    }
     // 收尾摘要会进下一次唤醒提示，必须先脱敏已知令牌；路径/凭据由出站审计兜底，
     // 但内部状态不该原样带着令牌。
     const safeBody = {
@@ -12151,6 +12281,7 @@ async function main() {
       config,
     });
     st.closure = record;
+    st.continuation = null;
     st.lastActionAt = Date.now();
     st.wakeConfig.noActionCount = 0;
     ensureWakeableV2(st, { key });
@@ -12183,14 +12314,15 @@ async function main() {
    * 群聊：只有直接叫到/引用/提问/道别才重开，普通闲聊不打断冷却 ——
    *       否则「收尾冷却」等于没设，还是会每句都醒。
    */
-  function noteClosureReopenV2(key, st, { plain, text, quoteSelf = false, directAddress = false, media = [] } = {}) {
-    if (!st?.closure) return false;
+  function noteClosureReopenV2(key, st, { plain, text, quoteSelf = false, directAddress = false, media = [], continuing = false, addressedToOther = false } = {}) {
+    if (!st?.closure || addressedToOther) return false;
     const cls = classifyMessage({
       plain: plain ?? text, text: text ?? plain,
       quoteSelf, atSelf: directAddress, media,
     });
     const isPrivate = String(key ?? '').startsWith('private:');
-    const reopen = isPrivate || directAddress || quoteSelf || ['question', 'request', 'ending'].includes(cls.kind);
+    const reopen = isPrivate || directAddress || quoteSelf || continuing
+      || (['question', 'request'].includes(cls.kind) && isDirectedAtAi(plain ?? text));
     if (!reopen) return false;
     st.closure = reopenClosure(st.closure, { reason: cls.kind, now: Date.now() });
     return true;
@@ -12294,21 +12426,9 @@ async function main() {
     return false;
   }
 
-  // 是否"直接针对 AI"的提问/挑战：提到 AI 相关词且带疑问/比较，或对"你"开火，或追问催促
+  // 提问/请求和收尾使用同一分类，避免“哪个”被一处认出、另一处漏掉。
   function isDirectedAtAi(textContent) {
-    const lower = String(textContent ?? '').toLowerCase();
-    const aiMention = /deepseek|claude|chatgpt|gpt|肥鱼|小鲸鱼|鲸鱼|d指导|d老师|d师傅|深度求索|\bds\b|ai|人工智障|机器人|模型/.test(lower);
-    const challenge = /强|弱|行不行|能不能|会不会|是不是|一半|水平|垃圾|废物|白嫖|菜|不如|厉害|赢|输|比.*强|比.*弱/.test(lower);
-    const question = /[?？吗呢吧]|怎么|为什么|哪|谁/.test(lower);
-    if (aiMention && (question || challenge)) return true;
-    // "你/您" + 疑问/比较/挑战（放宽，避免漏掉"你有claude一半强吗"这类直接问）
-    if (/(你|您).{0,10}(吗|呢|？|\?|怎么|是不是|能不能|行不行|有没有|有|没有|比|不如|强|弱|一半|厉害|垃圾|菜|赢|输)/.test(lower)) return true;
-    if (/^(你|您)(是不是|行不行|能不能|会不会|觉得|有|没有)/.test(lower)) return true;
-    // "你是...还是... / 你是...吗 / 你是...？"（如：你是人类还是ai、你是真人吗）
-    if (/(你|您)是[^？?。！!]{0,14}(还是|或者|吗|么|？|\?)/.test(lower)) return true;
-    // 追问/催促：AI 没回时的真人式催促
-    if (/怎么不说话|人呢|回我|说话啊|理我|别装死|在不在|装死|说话/.test(lower)) return true;
-    return false;
+    return isDirectedConversationMessage(textContent);
   }
 
   // 活跃期批量检测用的"必须回"判断：不依赖 event，只认昵称/关键词/直接针对 AI 的提问
@@ -14295,7 +14415,7 @@ async function main() {
   }
 
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
-  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
+  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = [], addressedToOther = false) {
     const st = getSocialV2State(key);
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
@@ -14348,6 +14468,7 @@ async function main() {
       isSelf: false,
       // 入站时就标记：后续群名/昵称/规则改了也不影响已经发生的判定。
       fish: !isOwner && isFishName(sender, cfg.fishGuard),
+      addressedToOther: !!addressedToOther,
       media: safeMedia,
       hasMedia: safeMedia.length > 0,
       forwardIds: safeForwardIds,
@@ -14416,11 +14537,46 @@ async function main() {
     return msg;
   }
 
-  function recordSentMessagesV2(key, messages) {
+  function continuationWindowMsV2() {
+    const raw = cfg.socialV2?.wake?.continuationWindowMs;
+    return raw === undefined ? DEFAULT_CONTINUATION_WINDOW_MS
+      : Math.max(0, Math.min(DEFAULT_CONTINUATION_WINDOW_MS, Number(raw) || 0));
+  }
+
+  function noteConversationReplyV2(key, target = {}) {
+    if (!key.startsWith('group:')) return;
+    const st = getSocialV2State(key);
+    if (groupProfile(key, st).large) { st.continuation = null; return; }
+    st.continuation = recordConversationReply({
+      previous: st.continuation, messages: st.recentMessages,
+      seenSeqs: st.modelSeenSeqs, windowMs: continuationWindowMsV2(),
+      replyToMessageId: target.replyToMessageId ?? undefined,
+      atUserId: target.atUserId ?? undefined,
+    });
+  }
+
+  function addressesOtherV2(event, quoteTargetIsSelf) {
+    const at = atInfo(event?.message, [event?.self_id, selfUserId]);
+    if (at.atSelf || quoteTargetIsSelf) return false;
+    const message = event?.message;
+    const hasQuote = Array.isArray(message) ? message.some((seg) => seg?.type === 'reply')
+      : /\[CQ:reply,/.test(String(message ?? ''));
+    return at.atOther || hasQuote;
+  }
+
+  function isContinuationV2(key, st, event, quoteTargetIsSelf) {
+    if (!key.startsWith('group:') || !continuationWindowMsV2() || groupProfile(key, st).large) return false;
+    if (addressesOtherV2(event, quoteTargetIsSelf)) return false;
+    if (isFishName(event?.sender?.card || event?.sender?.nickname || '', cfg.fishGuard)) return false;
+    return continuationMatches(st.continuation, event?.user_id ?? event?.sender?.user_id);
+  }
+
+  function recordSentMessagesV2(key, messages, target = {}) {
     const st = getSocialV2State(key);
     const now = Date.now();
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
+    if (list.length) noteConversationReplyV2(key, target);
     for (let i = 0; i < list.length; i++) {
       const text = redactKnownTokensOnly(String(list[i] ?? '')).slice(0, 200);
       st.recentMessages.push({
@@ -14605,6 +14761,9 @@ async function main() {
       const atSelf = atInfo(event?.message, [event?.self_id, selfUserId]).atSelf;
       if (atSelf || quoteTargetIsSelf) return 'atMention';
     }
+    // 引用/点名其他群友时，不把“你更喜欢哪个”误当作在问机器人。
+    if (addressesOtherV2(event, quoteTargetIsSelf)) return null;
+    if (!large && isContinuationV2(key, st, event, quoteTargetIsSelf)) return 'continuation';
     if (tr.nameMention && selfNickname) {
       // 用 plainContent（当前消息自己的文字）：textContent 含 `[引用 某人：原文]`，
       // 引用一条恰好提到机器人昵称的旧消息不该算「叫了名字」（那是被动触发的付费回合）。
@@ -15199,7 +15358,16 @@ async function main() {
     const directWake = groupProfileNow.large
       ? (isHardDirectWakeReason(reason) || hasStrictDirectUnread(st.unread, { selfNickname }))
       : (isSmallGroupDirectWake(reason) || fishGuardDirectUnread(st) || fishGuardOwnerUnread(st) || Boolean(bypass));
-    const tokenWake = tokenGuardWakeBlock(key, st, { direct: directWake, reason });
+    const continuationWake = reason === 'continuation' && !groupProfileNow.large && continuationWindowMsV2() > 0
+      && st.unread.some((m) => !m.isSelf && !m.fish && !m.addressedToOther
+        && continuationMatches(st.continuation, m.userId));
+    if (reason === 'continuation' && !continuationWake) {
+      log(`[续聊] ${key} 参与人窗口已过期或未读已处理，取消旧续聊唤醒`);
+      return;
+    }
+    const tokenWake = tokenGuardWakeBlock(key, st, {
+      direct: reason === 'continuation' ? false : directWake, reason, continuation: continuationWake,
+    });
     if (tokenWake) {
       // 记下最近一次硬拦（额度用完这类）：以前只写日志，界面上什么都看不到。
       st.lastWakeBlock = {
@@ -15249,7 +15417,7 @@ async function main() {
     const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
     // 被直接 @ / 叫到 / 引用 / 拍一拍时，强制实时唤醒：越过 2 分钟间隔和旧的 1 分钟/12 小时限频。
     // 仍然受 Token 的每日次数与近 24h 花费上限约束，不能靠 @ 无限烧。
-    const directBypass = directWake && tokenGuardCfg().enabled !== false && tokenGuardCfg().directBypassGap !== false;
+    const directBypass = (directWake || continuationWake) && tokenGuardCfg().enabled !== false && tokenGuardCfg().directBypassGap !== false;
     if (!directBypass && ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour))) {
       let retryAfterMs = 0;
       if (maxPerMinute > 0 && recentMinute >= maxPerMinute) {
@@ -16293,7 +16461,8 @@ async function main() {
         await ensureFishGroupName(id);
       }
       const sender = displayName;
-      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
+      const addressedToOther = kind === 'group' && addressesOtherV2(event, quoteTargetIsSelf);
+      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []), addressedToOther);
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);
       if (socialV2.paused) {
@@ -16301,7 +16470,8 @@ async function main() {
         return;
       }
       const st = getSocialV2State(key);
-      const directed = !senderIsFish && (quoteTargetIsSelf || isDirectAddress(textContent, event, kind));
+      const directed = !senderIsFish && !addressedToOther && (quoteTargetIsSelf || isDirectAddress(plainContent, event, kind));
+      const continuing = !senderIsFish && isContinuationV2(key, st, event, quoteTargetIsSelf);
       // 鱼群保护：同一批 bot 同群时先闭嘴。只影响“自动参与群聊”，
       // 被直接叫到/管理员说话仍可回一句（规则可关）。
       const fish = evaluateConversationFishGuard(key, st, {
@@ -16326,10 +16496,18 @@ async function main() {
         }
       }
       // 对方又开口：上次的收尾记录保留，但标记为「已重开」（下次提示词会说是新的开始）。
-      noteClosureReopenV2(key, st, {
+      const reopened = noteClosureReopenV2(key, st, {
         plain: plainContent, text: textContent,
         quoteSelf: quoteTargetIsSelf, directAddress: directed, media: mediaList,
+        continuing, addressedToOther,
       });
+      const endedContinuation = continuing && classifyMessage(plainContent).kind === 'ending';
+      if (endedContinuation) {
+        st.continuation = normalizeContinuation({ ...st.continuation,
+          participants: st.continuation.participants.filter((p) => p.userId !== String(event.user_id)) });
+      }
+      // append 已在上面落盘；重开/道别必须再保存，不能让重启复活旧冷却或续聊资格。
+      if (reopened || endedContinuation) saveSocialV2State();
       if (!st.bootstrapSent) {
         st.bootstrapSent = true;
         saveSocialV2State();

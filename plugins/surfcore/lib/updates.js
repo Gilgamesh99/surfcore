@@ -9,8 +9,8 @@
  *
  * 设计原则（和项目其它地方的删除/覆盖纪律一致）：
  *   1. **只读检查、显式确认更新**：检查只做 `git fetch`，不动工作区；
- *   2. **只允许快进**：更新用 `merge --ff-only`，本地有改动 / 有未推送提交一律拒绝，
- *      绝不 `reset --hard`、绝不 stash 用户东西；
+ *   2. **保留本地提交**：SurfCore 可正常 merge；其他组件默认只快进。
+ *      所有 Git 写入等待宿主退出，固定 SHA、复核现场、建立备份；不 stash、不强制覆盖；
  *   3. **"不再提示"只对这一次的远端 commit 生效**：`dismissed[id] = 远端 sha`，
  *      远端有新提交就会重新提示；
  *   4. **不阻塞启动**：检查是异步的，网络/仓库不存在都只是"这一项不可用"。
@@ -21,7 +21,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const GIT_TIMEOUT_MS = 30_000;
@@ -69,13 +69,15 @@ function ghHeaders(extra = {}) {
 }
 
 function runGit(args, { timeout = GIT_TIMEOUT_MS } = {}) {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GCM_INTERACTIVE: 'never', GIT_NO_REPLACE_OBJECTS: '1' };
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE']) delete env[key];
   return new Promise((resolve) => {
     execFile('git', args, {
       windowsHide: true,
       timeout,
       maxBuffer: 4 * 1024 * 1024,
       // 绝不能卡在交互式凭据提示上（拉私有仓库时宁可失败）
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GCM_INTERACTIVE: 'never' },
+      env,
     }, (error, stdout, stderr) => {
       resolve({
         ok: !error,
@@ -222,6 +224,32 @@ export function helperSpawnEnv(execPath = process.execPath, baseEnv = process.en
   const base = path.basename(String(execPath || '')).toLowerCase();
   if (base !== 'node' && base !== 'node.exe') env.ELECTRON_RUN_AS_NODE = '1';
   return env;
+}
+
+/** Spawn is not a handshake: Node may exit before it even loads the helper. */
+function monitorHelperStartup(child, { pendingFile, txn, fail }) {
+  let settled = false;
+  const matchesPending = () => {
+    try { return Boolean(txn) && JSON.parse(fs.readFileSync(pendingFile, 'utf8'))?.txn === txn; } catch { return false; }
+  };
+  const stop = (code, reason) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    if (!matchesPending()) return; // A late callback must never clear a newer job.
+    try { if (child.exitCode === null && child.signalCode === null) child.kill(); } catch {}
+    fail(code, reason);
+  };
+  const timeout = setTimeout(() => {
+    try {
+      const started = JSON.parse(fs.readFileSync(pendingFile + '.started', 'utf8'));
+      if (matchesPending() && started.txn === txn && Number(started.pid) === child.pid) { settled = true; return; }
+    } catch {}
+    stop('stage.helper-not-started', '更新助手未留下匹配的启动记录，请检查助手脚本与队列锁后重新检查更新');
+  }, 2500);
+  timeout.unref?.();
+  child.once('error', (error) => stop('stage.spawn-failed', '启动更新助手失败：' + String(error.message).slice(0, 160)));
+  child.once('exit', (code, signal) => stop('stage.helper-exited', '更新助手在启动确认前退出（' + (signal || code) + '），请检查助手脚本与 updates-pending.json.lock'));
 }
 
 export function readInstalledMeta(dir) {
@@ -595,8 +623,9 @@ export async function inspectComponent(component, opts = {}) {
   if (kind === 'release') return inspectReleaseComponent(component, opts);
   if (kind === 'git') {
     const git = await inspectGitComponent(component, opts);
-    if (git.available || !component?.versionRepo) return git;
-    // 不是 git 仓库 / 没有 remote（zip 安装、开发副本）：退化成版本号比对
+    const gitlessZip = git.code === 'no-git' && normalizeDir(component?.dir) && !fs.existsSync(path.join(component.dir, '.git'));
+    if ((git.code !== 'not-a-git-repo' && !gitlessZip) || !component?.versionRepo) return git;
+    // ZIP 安装可以没有 Git 命令；真实 Git 仓库的任何错误都不能用版本检查掩盖。
     const byVersion = await inspectVersionComponent(component, opts).catch(() => null);
     return byVersion ? { ...git, ...byVersion, gitReason: git.reason } : git;
   }
@@ -607,7 +636,7 @@ export async function inspectComponent(component, opts = {}) {
     const top = inside.ok ? await runGit(['-C', dir, 'rev-parse', '--show-toplevel']) : { ok: false };
     const isOwnRepo = inside.ok && inside.stdout.trim() === 'true'
       && top.ok && path.resolve(top.stdout.trim()).toLowerCase() === path.resolve(dir).toLowerCase();
-    if (isOwnRepo) return inspectGitComponent(component, opts);
+    if (isOwnRepo || fs.existsSync(path.join(dir, '.git'))) return inspectGitComponent(component, opts);
   }
   if (component?.versionUrl) return inspectReleaseComponent(component, opts);
   // 没有版本清单、但有版本仓库 → 按「提交级比对」查（语音包就是这种：
@@ -620,117 +649,89 @@ export async function inspectComponent(component, opts = {}) {
     if (hasAny) return inspectVersionComponent(component, opts);
   }
   const git = await inspectGitComponent(component, opts);
-  if (git.available || !component?.versionRepo) return git;
+  if (git.code !== 'not-a-git-repo' || !component?.versionRepo) return git;
   const byVersion = await inspectVersionComponent(component, opts).catch(() => null);
   return byVersion ? { ...git, ...byVersion, gitReason: git.reason } : git;
 }
 
-/** 检查单个 git 组件（只读；`fetch` 时才会碰网络）。 */
+/** Git history, not semver, decides whether an update exists. */
 export async function inspectGitComponent(component, { fetch = true } = {}) {
   const id = String(component?.id ?? '').trim();
-  const name = String(component?.name ?? id);
   const dir = normalizeDir(component?.dir);
-  const base = { id, name, dir: dir || String(component?.dir ?? ''), kind: component?.kind ?? 'component' };
-  if (!id) return { ...base, available: false, reason: '组件缺少 id' };
-  if (!dir) return { ...base, available: false, reason: '目录不存在（还没安装？）' };
-
-  // 先确认 git 本身在不在：不在时不能报"不是 git 仓库"（会把人引去 git clone，而他根本没有 git）
-  const gitVersion = await gitAvailable();
-  if (!gitVersion) {
-    return {
-      ...base, available: false, status: 'unknown', code: 'no-git',
-      reason: '本机没有找到 git 命令（PATH 与常见安装位置都没有）',
-      hint: '可以手动下载新版覆盖安装；或安装 git 后启用自动更新检查',
-    };
-  }
-  const inside = await runGit(['-C', dir, 'rev-parse', '--is-inside-work-tree']);
+  const base = { id, name: String(component?.name ?? id), dir: dir || String(component?.dir ?? ''), kind: component?.kind ?? 'component', channel: 'git' };
+  const fail = (code, reason, extra = {}) => ({ ...base, available: false, updateAvailable: false, status: 'unknown', code, reason, error: reason, hint: '先处理此 Git 检查错误，再点「检查更新」；不会自动覆盖本地文件', ...extra });
+  if (!id || !dir) return fail('git.missing-directory', '组件 id 或安装目录不存在');
+  if (!await gitAvailable()) return fail('no-git', '本机没有找到 git 命令');
+  const git = (...args) => runGit(['-C', dir, ...args]);
+  const inside = await git('rev-parse', '--is-inside-work-tree');
   if (!inside.ok || inside.stdout.trim() !== 'true') {
-    return {
-      ...base, available: false, status: 'unknown', code: 'not-a-git-repo',
-      reason: '这个目录不是 git 仓库（zip 安装的目录都是这样）',
-      hint: '会改用版本号比对；若仍查不到，可手动下载新版覆盖',
-    };
+    // A broken/unsafe repository is not a ZIP install. Never hide its errors with HTTP.
+    return fail(fs.existsSync(path.join(dir, '.git')) ? 'git.repository-unreadable' : 'not-a-git-repo', '这个目录无法读取为 git 工作区');
   }
-  // ⚠️ 子目录在某个仓库里时 rev-parse 也会返回 true（语音包在 <repo>/state/voice-packs 下就会命中），
-  // 必须要求“仓库根就是这个目录”，否则会把语音包当成本体仓库、显示同样的提交列表（2026-10-28 反馈）。
-  const top = await runGit(['-C', dir, 'rev-parse', '--show-toplevel']);
-  const topDir = top.ok ? path.resolve(top.stdout.trim()) : '';
-  if (!topDir || topDir.toLowerCase() !== path.resolve(dir).toLowerCase()) {
-    return { ...base, available: false, reason: '目录在别的 git 仓库里（不是它自己的仓库），改用版本/提交比对' };
-  }
-  const remoteUrl = await runGit(['-C', dir, 'remote', 'get-url', 'origin']);
-  if (!remoteUrl.ok) return { ...base, available: false, status: 'unknown', code: 'no-origin', reason: '没有配置 origin remote', hint: '改用版本号比对；或手动下载新版覆盖' };
-
-  let branch = String(component?.branch ?? '').trim();
-  if (!branch) {
-    const current = await runGit(['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD']);
-    branch = current.ok ? current.stdout.trim() : DEFAULT_BRANCH;
-  }
-  if (!branch || branch === 'HEAD') {
-    return { ...base, available: false, status: 'unknown', code: 'detached-head', reason: '处于 detached HEAD，无法判断该更新到哪个分支', hint: '切回 main 分支后重试，或手动下载新版覆盖' };
-  }
-
-  let fetchError = '';
+  const top = await git('rev-parse', '--show-toplevel');
+  if (!top.ok) return fail('git.repository-unreadable', '无法读取 Git 仓库根目录');
+  const canonical = (p) => { const real = fs.realpathSync(p); return process.platform === 'win32' ? real.toLowerCase() : real; };
+  if (canonical(top.stdout.trim()) !== canonical(dir)) return fail('not-a-git-repo', '目录在别的 git 仓库里（不是它自己的仓库）');
+  const gitDirOut = await git('rev-parse', '--absolute-git-dir');
+  if (!gitDirOut.ok) return fail('git.repository-unreadable', '无法读取 Git 元数据目录');
+  const repoRoot = fs.realpathSync(dir), gitDir = fs.realpathSync(gitDirOut.stdout.trim());
+  const current = await git('symbolic-ref', '--quiet', '--short', 'HEAD');
+  if (!current.ok || !current.stdout.trim()) return fail('detached-head', '处于 detached HEAD，无法安全更新');
+  const branch = current.stdout.trim();
+  const expected = String(component?.branch ?? '').trim();
+  if (expected && branch !== expected) return fail('git.branch-mismatch', '当前分支 ' + branch + ' 与配置分支 ' + expected + ' 不一致', { branch });
+  const remoteUrl = await git('remote', 'get-url', 'origin');
+  if (!remoteUrl.ok) return fail('no-origin', '没有可读取的 origin remote', { branch });
   if (fetch) {
-    const fetched = await runGit(['-C', dir, 'fetch', '--quiet', '--no-tags', 'origin', branch]);
-    if (!fetched.ok) fetchError = (fetched.stderr || fetched.message || 'git fetch 失败').trim().slice(0, 300);
+    const fetched = await git('fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/' + branch + ':refs/remotes/origin/' + branch);
+    if (!fetched.ok) return fail('git.fetch-failed', 'git fetch 失败；不能把缓存的远端提交当成最新', { branch, fetchError: 'fetch failed' });
   }
-
-  const local = await runGit(['-C', dir, 'rev-parse', 'HEAD']);
-  const remote = await runGit(['-C', dir, 'rev-parse', `origin/${branch}`]);
-  if (!remote.ok) {
-    return {
-      ...base, available: false, branch, status: 'unknown', code: 'remote-unreachable',
-      reason: fetchError || `取不到 origin/${branch}（远端分支名不对？）`,
-      hint: '检查网络后重试；或手动下载新版覆盖',
-    };
+  const local = await git('rev-parse', '--verify', 'HEAD^{commit}');
+  const remote = await git('rev-parse', '--verify', 'refs/remotes/origin/' + branch + '^{commit}');
+  if (!local.ok || !remote.ok) return fail('remote-unreachable', '无法读取本地或 origin/' + branch + ' 的提交', { branch });
+  const fromHead = local.stdout.trim(), targetSha = remote.stdout.trim();
+  const dirtyOut = await git('status', '--porcelain=v1', '--untracked-files=all');
+  const counts = await git('rev-list', '--left-right', '--count', fromHead + '...' + targetSha);
+  if (!dirtyOut.ok || !counts.ok || !/^\d+\s+\d+$/.test(counts.stdout.trim())) return fail('git.state-unreadable', '无法确认工作区状态或提交差异', { branch });
+  const [ahead, behind] = counts.stdout.trim().split(/\s+/).map(Number);
+  const dirty = dirtyOut.stdout.split('\n').filter(Boolean).length;
+  const policy = component?.gitPolicy ?? (id === 'surfcore' ? 'preserve-local' : 'ff-only');
+  let blocked = '', code = behind > 0 ? 'new-commit' : 'up-to-date', hint = '';
+  const block = (c, reason, h) => { if (!blocked) { code = c; blocked = reason; hint = h; } };
+  if (!['ff-only', 'preserve-local'].includes(policy)) block('git.invalid-policy', '未知 Git 更新策略', '检查组件 gitPolicy 配置');
+  if (dirty) block('local-changes', '本地有未提交改动（含未跟踪文件）', '先自行保存并提交本地改动，再检查更新');
+  for (const marker of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer', 'BISECT_LOG', 'index.lock']) {
+    const p = await git('rev-parse', '--git-path', marker);
+    if (!p.ok) return fail('git.state-unreadable', '无法确认 Git 操作状态', { branch });
+    if (fs.existsSync(path.resolve(dir, p.stdout.trim()))) block('git.operation-in-progress', 'Git 操作尚未结束', '先自行完成或中止已有 Git 操作，再检查更新');
   }
-  const dirtyOut = await runGit(['-C', dir, 'status', '--porcelain']);
-  const dirty = dirtyOut.ok ? dirtyOut.stdout.split('\n').filter((line) => line.trim()).length : null;
-  const behindOut = await runGit(['-C', dir, 'rev-list', '--count', `HEAD..origin/${branch}`]);
-  const aheadOut = await runGit(['-C', dir, 'rev-list', '--count', `origin/${branch}..HEAD`]);
-  if (!behindOut.ok) {
-    return {
-      ...base, available: false, branch, status: 'unknown', code: 'rev-list-failed',
-      reason: `取不到落后提交数：${(behindOut.stderr || behindOut.message || '').trim().slice(0, 160) || '未知原因'}`,
-      hint: '稍后重试；若持续失败，可手动下载新版覆盖',
-    };
+  if (behind > 0) {
+    const shallow = await git('rev-parse', '--is-shallow-repository');
+    const ancestor = await git('merge-base', fromHead, targetSha);
+    if (!shallow.ok || !ancestor.ok || shallow.stdout.trim() !== 'false') block('git.history-unproven', '历史不完整或没有共同祖先，无法证明安全合并', '先人工补全并检查仓库历史，再检查更新');
+    if (ahead > 0 && policy === 'ff-only') block('local-ahead', '本地有未推送提交且已分叉，此组件只允许快进更新', '保留本地提交，人工合并远端；或显式配置 gitPolicy 为 preserve-local');
   }
-  const behind = Number(behindOut.stdout.trim()) || 0;
-  const ahead = aheadOut.ok ? Number(aheadOut.stdout.trim()) || 0 : 0;
+  const versionAt = async (sha) => {
+    const result = await git('show', sha + ':package.json');
+    try { return result.ok ? String(JSON.parse(result.stdout).version ?? '') : ''; } catch { return ''; }
+  };
+  let installedVersion = '';
+  try { installedVersion = String(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version ?? ''); } catch {}
+  const latestVersion = await versionAt(targetSha);
   let changelog = [];
   if (behind > 0) {
-    const log = await runGit(['-C', dir, 'log', '--oneline', '--no-merges', `HEAD..origin/${branch}`]);
+    const log = await git('log', '--oneline', '--no-merges', fromHead + '..' + targetSha);
     if (log.ok) changelog = log.stdout.split('\n').map((line) => line.trim()).filter(Boolean).slice(0, MAX_CHANGELOG);
   }
-  const remoteVersion = await fetchRemoteVersion(String(component?.versionRepo || '').trim() || ownerRepoOf(remoteUrl.stdout.trim()));
-  return {
-    ...base, available: true, branch, channel: 'git',
-    latestVersion: remoteVersion || '',
-    remoteUrl: remoteUrl.stdout.trim(),
-    local: local.ok ? local.stdout.trim() : '',
-    remote: remote.stdout.trim(),
-    behind, ahead, dirty, changelog,
-    fetchError: fetchError || undefined,
-    updateAvailable: behind > 0,
-    blocked: dirty > 0 ? '本地有未提交改动' : (ahead > 0 ? '本地有未推送提交（会分叉，拒绝自动合并）' : ''),
-    status: (dirty > 0 || ahead > 0) ? 'blocked' : (behind > 0 ? 'update' : 'latest'),
-    code: dirty > 0 ? 'local-changes' : (ahead > 0 ? 'local-ahead' : (behind > 0 ? 'new-commit' : 'up-to-date')),
-    hint: dirty > 0 ? '先提交或 stash 本地改动，再检查更新' : (ahead > 0 ? '先把本地提交推送或回退，再做自动更新' : ''),
-  };
+  return { ...base, available: true, branch, repoRoot, gitDir, policy,
+    installedVersion, latestVersion, local: fromHead, remote: targetSha,
+    ahead, behind, dirty, changelog, updateAvailable: behind > 0, blocked, code, hint,
+    status: blocked ? 'blocked' : behind > 0 ? 'update' : 'latest', checkedWithFetch: fetch };
 }
 
-/** 快进合并一个组件。调用方已经确认过 `updateAvailable` 与 `blocked`。 */
-export async function fastForwardComponent(component) {
-  const dir = normalizeDir(component?.dir);
-  if (!dir) return { ok: false, error: '目录不存在' };
-  const branch = String(component?.branch ?? '').trim() || DEFAULT_BRANCH;
-  const merged = await runGit(['-C', dir, 'merge', '--ff-only', `origin/${branch}`], { timeout: 60_000 });
-  if (!merged.ok) {
-    return { ok: false, error: (merged.stderr || merged.message || '合并失败').trim().slice(0, 400) };
-  }
-  const head = await runGit(['-C', dir, 'rev-parse', 'HEAD']);
-  return { ok: true, head: head.ok ? head.stdout.trim() : '' };
+/** Live host updates are forbidden; the deferred helper owns all Git writes. */
+export async function fastForwardComponent() {
+  return { ok: false, code: 'apply.deferred-required', error: 'Git 更新必须由退出后的更新助手执行', hint: '重新检查并排队更新，然后退出 DSH' };
 }
 
 /**
@@ -1189,21 +1190,25 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
         return {
           status: 'failed', code, component: j.component ?? '',
           reason: String(j.error ?? '应用更新失败').slice(0, 300),
-          hint: code === 'stage.expired'
+          kind: j.kind, fromHead: j.fromHead, targetSha: j.targetSha, resultHead: j.resultHead,
+          backupRef: j.backupRef, txn: j.txn, restored: j.restored, paths: j.paths, verified: false,
+          hint: j.hint || (code === 'stage.expired'
             ? '上次暂存已过期（等 DSH 退出的时间太久）：点「立即更新」重新下载即可'
             : code === 'verify.version-mismatch'
               ? '发布包与清单不一致：手动下载该版本覆盖，重试无效'
               : code === 'apply.unknown-kind'
                 ? '更新助手不认识这种任务类型（插件缺陷）：请反馈，并手动下载 zip 覆盖'
-                : '备份与 staging 仍保留；可重试或手动覆盖 zip',
+                : '备份与 staging 仍保留；可重试或手动覆盖 zip'),
           at: j.at ?? null,
         };
       }
       if (fs.existsSync(pendingFile)) {
+        const job = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
         return {
           status: 'pending_restart', code: 'apply.queued',
           reason: '有更新已排队，等待 DSH 退出后应用',
-          hint: '完全退出并重新打开 DSH；若反复不生效，可手动覆盖 zip',
+          kind: job.kind, component: job.component, fromHead: job.fromHead, targetSha: job.targetSha, txn: job.txn,
+          hint: job.kind === 'git' ? '完全退出 DSH 后助手将应用已检查的提交；失败请查看更新记录和 backupRef' : '完全退出并重新打开 DSH；若反复不生效，可手动覆盖 zip',
           at: null,
         };
       }
@@ -1216,7 +1221,9 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
             return {
               status: 'success', code: 'apply.verified', component: j.component ?? '',
               to: j.to ?? '', version: j.version ?? '', at: j.at ?? null, backup: j.backup ?? '',
-              reason: `已更新并验证：v${j.version ?? j.to ?? '?'}`,
+              kind: j.kind, fromHead: j.fromHead, targetSha: j.targetSha, resultHead: j.resultHead,
+              backupRef: j.backupRef, txn: j.txn, verified: true,
+              reason: j.kind === 'git' ? `已更新并验证 Git 历史：${String(j.resultHead || '').slice(0, 12)}` : `已更新并验证：v${j.version ?? j.to ?? '?'}`,
             };
           }
           return {
@@ -1236,7 +1243,13 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
   function status() {
     const results = state.results ?? [];
     const pending = pendingOf(results);
-    const unknown = results.filter((row) => row && !row.available && row.status === 'unknown' && !row.blocked);
+    const unknown = results.filter((row) => row && !row.available && row.status !== 'failed' && !row.blocked);
+    const failed = results.filter((row) => row?.status === 'failed');
+    const availableUpdates = results.filter((row) => row?.available && row.updateAvailable);
+    const blockedUpdates = availableUpdates.filter((row) => row.blocked);
+    const diskApply = readLastApply();
+    const lastApply = !state.lastApplyFailure || (Date.parse(diskApply?.at || '') > Date.parse(state.lastApplyFailure.at || ''))
+      ? diskApply : state.lastApplyFailure;
     return {
       ok: true,
       checking,
@@ -1246,9 +1259,12 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
       results,
       pending,
       pendingCount: pending.length,
+      availableUpdateCount: availableUpdates.length,
+      blockedUpdateCount: blockedUpdates.length,
+      failedCount: failed.length,
       unknown,
       unknownCount: unknown.length,
-      lastApply: state.lastApplyFailure ?? readLastApply(),
+      lastApply,
       channel: channel() === 'dev' ? 'dev' : 'stable',
       download: downloadProgress,
       githubTokenConfigured: githubTokenConfigured(),
@@ -1316,7 +1332,7 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
         lastError: String(error?.message ?? error),
         lastCheckAt: now(),
         results: (state.results ?? []).map((row) => ({
-          ...row, status: 'failed', code: 'check-failed',
+          ...row, available: false, updateAvailable: false, status: 'failed', code: 'check-failed',
           reason: `检查更新失败：${String(error?.message ?? error).slice(0, 200)}`,
           hint: '检查网络后重试；持续失败请复制诊断信息',
         })),
@@ -1335,6 +1351,13 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
     const item = list().find((x) => String(x.id) === want);
     const target = normalizeDir(item?.dir);
     if (!target) return { ok: false, code: 'rollback.no-target', reason: '找不到安装目录', hint: '在设置页确认安装目录' };
+    const gitProbe = await runGit(['-C', target, 'rev-parse', '--is-inside-work-tree']);
+    if (fs.existsSync(path.join(target, '.git')) || (gitProbe.ok && gitProbe.stdout.trim() === 'true')) {
+      const last = readLastApply();
+      const backupRef = last?.component === want ? last.backupRef || '' : '';
+      return { ok: false, status: 'blocked', code: 'rollback.git-manual', error: 'Git 更新暂不支持自动回滚', reason: 'Git 更新暂不支持自动回滚', backupRef,
+        hint: backupRef ? '先退出 DSH 并保存当前改动；用 git show ' + backupRef + ' 检查原提交，再由维护者执行受保护的 Git 恢复。不会复制 ZIP 备份覆盖仓库。' : '先退出 DSH 并保存改动；从更新记录的 backupRef 或 refs/surfcore-backups/ 检查原提交，请维护者协助恢复。' };
+    }
     const base = path.join(stateDir, 'backups');
     let entries = [];
     try {
@@ -1651,7 +1674,7 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
       }
 
       downloadProgress = { ...(downloadProgress ?? {}), active: false, phase: 'stage' };
-      const staged = stageDeferredApply({
+      const staged = await stageDeferredApply({
         kind: 'zip', component: String(item.id), target: dir, staging: src, to: String(report?.latestVersion ?? ''),
         txn, backup: backup.dir, from: report?.installedVersion ?? '',
         manifest: { version: pkg.manifest.version ?? '', files: Object.keys(pkg.manifest.files).length },
@@ -1680,57 +1703,43 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
   }
 
 /** 写 pending 文件 + 起独立进程（等本宿主退出后执行覆盖）。 */
-  function stageDeferredApply(job) {
-    // 新一次排队 = 新尝试：上一轮的 .failed 不能再压住它
-    try { fs.rmSync(path.join(stateDir, 'updates-pending.json.failed'), { force: true }); } catch {}
-
+  async function stageDeferredApply(job) {
     const pendingFile = path.join(stateDir, 'updates-pending.json');
-    const payload = {
-      ...job,
-      waitPid: process.pid,
-      logFile: path.join(stateDir, 'apply-update.log'),
-      createdAt: new Date().toISOString(),
+    const payload = { ...job, txn: job.txn || randomUUID(), waitPid: process.pid, logFile: path.join(stateDir, 'apply-update.log'), createdAt: new Date().toISOString() };
+    let ownsPending = false;
+    const fail = (code, reason) => {
+      const result = { ok: false, code, error: reason, reason, hint: '处理更新助手故障后重新检查；已有排队任务需先完成', pendingFile };
+      if (ownsPending) {
+        try {
+          if (JSON.parse(fs.readFileSync(pendingFile, 'utf8')).txn !== payload.txn) return result;
+          fs.writeFileSync(pendingFile + '.failed', JSON.stringify({ ...payload, ...result, at: new Date().toISOString() }, null, 2));
+          fs.rmSync(pendingFile, { force: true });
+        } catch {}
+      }
+      return result;
     };
-    fs.mkdirSync(stateDir, { recursive: true });
-    fs.writeFileSync(pendingFile, `${JSON.stringify(payload, null, 2)}
-`, 'utf8');
-    // 测试里不想真的起"等宿主退出"的进程时，设 SURFCORE_UPDATE_NO_SPAWN=1
-    if (process.env.SURFCORE_UPDATE_NO_SPAWN === '1') return { ok: true, pid: null, pendingFile, spawned: false };
-    const helper = String(process.env.SURFCORE_UPDATE_HELPER || '').trim() || path.join(REPO_ROOT, 'scripts', 'apply-update.mjs');
-    if (!fs.existsSync(helper)) {
-      return {
-        ok: false, code: 'stage.helper-missing',
-        reason: `更新助手文件不存在：${helper}`,
-        pendingFile,
-      };
-    }
-    let child;
     try {
-      child = spawn(process.execPath, [helper, '--pending', pendingFile], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-        cwd: stateDir,
-        env: helperSpawnEnv(),
+      fs.mkdirSync(stateDir, { recursive: true });
+      if (fs.existsSync(pendingFile)) return fail('stage.pending-exists', '已有更新排队，不能覆盖并发任务');
+      const helper = String(process.env.SURFCORE_UPDATE_HELPER || '').trim() || path.join(REPO_ROOT, 'scripts', 'apply-update.mjs');
+      if (!fs.existsSync(helper)) return fail('stage.helper-missing', '更新助手文件不存在：' + helper);
+      fs.writeFileSync(pendingFile, JSON.stringify(payload, null, 2) + '\n', { flag: 'wx' });
+      ownsPending = true;
+      fs.rmSync(pendingFile + '.failed', { force: true });
+      fs.rmSync(pendingFile + '.started', { force: true });
+      if (process.env.SURFCORE_UPDATE_NO_SPAWN === '1') return { ok: true, pid: null, pendingFile, spawned: false };
+      const child = spawn(process.execPath, [helper, '--pending', pendingFile], {
+        detached: true, stdio: 'ignore', windowsHide: true, cwd: stateDir, env: helperSpawnEnv(),
       });
-    } catch (error) {
-      return {
-        ok: false, code: 'stage.spawn-failed',
-        reason: `启动更新助手失败：${String(error?.message ?? error).slice(0, 160)}`,
-        pendingFile,
-      };
-    }
-    child.on('error', (error) => {
-      pluginLog(`[updates] 更新助手启动出错（${pendingFile}）：${String(error?.message ?? error)}`);
-    });
-    child.unref();
-    // 2.5 秒后看 helper 有没有留 .started：Electron 没带 RUN_AS_NODE 时会静默退出，必须报出来。
-    const startedFile = `${pendingFile}.started`;
-    setTimeout(() => {
-      if (fs.existsSync(startedFile)) return;
-      pluginLog(`[updates] 更新助手没有启动（${pendingFile}）：请重启 DSH 让其重试，或手动覆盖 zip`);
-    }, 2500).unref?.();
-    return { ok: true, pid: child.pid, pendingFile };
+      const spawned = await new Promise((resolve) => {
+        child.once('spawn', () => resolve({ ok: true }));
+        child.once('error', (error) => resolve(fail('stage.spawn-failed', '启动更新助手失败：' + String(error.message).slice(0, 160))));
+      });
+      if (!spawned.ok) return spawned;
+      monitorHelperStartup(child, { pendingFile, txn: payload.txn, fail });
+      child.unref();
+      return { ok: true, pid: child.pid, pendingFile };
+    } catch (error) { return fail(error.code === 'EEXIST' ? 'stage.pending-exists' : 'stage.spawn-failed', String(error.message || error)); }
   }
 
   async function apply(ids, opts = {}) {
@@ -1819,42 +1828,21 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
         }
 
         if (report.channel === 'git') {
-          // 同样不能在宿主进程里 merge：工作区文件正在被使用。交给退出后的独立进程。
-          const dir = normalizeDir(item.dir);
-          if (!dir) { results.push({ id: item.id, ok: false, error: '目录不存在' }); continue; }
-          const staged = stageDeferredApply({
-            kind: 'git', component: String(item.id), target: dir,
-            branch: String(item.branch || report.branch || 'main'), to: String(report.latest ?? ''),
+          // Never merge loaded plugin files in the host. Capture the exact checked state.
+          const staged = await stageDeferredApply({
+            kind: 'git', component: String(item.id), target: report.dir,
+            repoRoot: report.repoRoot, gitDir: report.gitDir, expectedBranch: report.branch,
+            fromHead: report.local, targetSha: report.remote, policy: report.policy,
+            from: report.installedVersion, to: report.latestVersion, txn: randomUUID(),
           });
-          if (staged.ok) stagedTargets.set(String(item.id), targetKeyOf(report));
-          pluginLog(`[updates] ${item.id} 已排队 git 更新，等 DSH 退出后执行（pid=${staged.pid ?? '?'}）`);
+          if (!staged.ok) { results.push({ id: item.id, ...staged }); continue; }
+          stagedTargets.set(String(item.id), targetKeyOf(report));
           results.push({
             id: item.id, ok: true, staged: true, needRestart: true,
-            status: 'pending_restart', code: 'staged',
-            from: report.local, to: report.latest,
-            message: `${report.name} 已排队更新（${report.behind} 个提交）；退出 DSH 后自动应用（尚未更新）`,
+            status: 'pending_restart', code: 'staged', from: report.local, to: report.remote,
+            fromHead: report.local, targetSha: report.remote, policy: report.policy,
+            message: report.name + ' 已排队更新（' + report.behind + ' 个提交）；退出 DSH 后自动应用（尚未更新）',
             restart: '退出并重新打开 DSH',
-          });
-          continue;
-        }
-
-        // 兼容非常老的检查结果（没有 channel 字段）：那时只有 git 组件。
-        if (!report.channel) {
-          const merged = await fastForwardComponent({ ...item, branch: report.branch });
-          if (!merged.ok) {
-            results.push({
-              id: item.id, ok: false, code: 'apply.git-failed',
-              error: merged.error,
-              hint: /ENOENT/.test(String(merged.error))
-                ? '本机没有 git 命令：zip 安装不该走 git 更新（插件缺陷，请反馈）；可手动下载 zip 覆盖'
-                : '先处理本地改动/网络后重试',
-            });
-            continue;
-          }
-          results.push({
-            id: item.id, ok: true, from: report.local, to: merged.head,
-            message: `${report.name} 已更新（${report.behind} 个提交）`,
-            restart: String(item.id).startsWith('surfvoice') ? '重启对应语音服务' : (item.id === 'surfcore' ? '重启 DSH' : '重启对应组件'),
           });
           continue;
         }
@@ -1995,26 +1983,40 @@ export { resumePendingApply };
  * 这里把 waitPid 改成当前进程并重新拉起 —— 用户下一次退出 DSH 就会应用。
  */
 function resumePendingApply({ stateDir, pluginLog = () => {} } = {}) {
+  const pendingFile = path.join(stateDir, 'updates-pending.json');
+  let pending;
+  const fail = (code, reason) => {
+    const hint = '检查更新助手脚本与 updates-pending.json.lock；修复后重新检查并排队更新';
+    try {
+      if (!pending?.txn || JSON.parse(fs.readFileSync(pendingFile, 'utf8'))?.txn !== pending.txn) return false;
+      fs.writeFileSync(pendingFile + '.failed', JSON.stringify({ ...pending, ok: false, code, error: reason, reason, hint, at: new Date().toISOString() }, null, 2));
+      fs.rmSync(pendingFile, { force: true });
+    } catch {}
+    pluginLog('[updates] 重试未完成更新失败：', reason);
+    return false;
+  };
   try {
-    const pendingFile = path.join(stateDir, 'updates-pending.json');
     if (!fs.existsSync(pendingFile)) return false;
-    const pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
-    const started = `${pendingFile}.started`;
+    pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
+    if (!pending || typeof pending !== 'object' || Array.isArray(pending)) return false;
+    const started = pendingFile + '.started';
+    const isAlive = (pid) => { if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return false; try { process.kill(Number(pid), 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+    try { const marker = JSON.parse(fs.readFileSync(started, 'utf8')); if (marker.txn === pending.txn && isAlive(marker.pid)) return true; } catch {}
+    try { if (isAlive(Number(fs.readFileSync(pendingFile + '.lock', 'utf8')))) return true; } catch {}
     try { fs.rmSync(started, { force: true }); } catch {}
+    pending.txn ||= randomUUID();
     pending.waitPid = process.pid;
     pending.resumedAt = new Date().toISOString();
-    fs.writeFileSync(pendingFile, `${JSON.stringify(pending, null, 2)}
-`, 'utf8');
-    const helper = path.join(REPO_ROOT, 'scripts', 'apply-update.mjs');
+    fs.writeFileSync(pendingFile, JSON.stringify(pending, null, 2) + '\n', 'utf8');
+    const helper = String(process.env.SURFCORE_UPDATE_HELPER || '').trim() || path.join(REPO_ROOT, 'scripts', 'apply-update.mjs');
+    if (!fs.existsSync(helper)) return fail('stage.helper-missing', '更新助手文件不存在：' + helper);
     const child = spawn(process.execPath, [helper, '--pending', pendingFile], {
       detached: true, stdio: 'ignore', windowsHide: true, cwd: stateDir, env: helperSpawnEnv(),
     });
+    monitorHelperStartup(child, { pendingFile, txn: pending.txn, fail });
     child.unref();
     pluginLog(`[updates] 发现未完成的更新（${pending.component} → v${pending.to ?? '?'}），已重新排队（pid=${child.pid ?? '?'}）`);
     return true;
-  } catch (error) {
-    pluginLog('[updates] 重试未完成更新失败：', String(error?.message ?? error));
-    return false;
-  }
+  } catch (error) { return fail('stage.spawn-failed', String(error?.message ?? error)); }
 }
 

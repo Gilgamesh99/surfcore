@@ -5,6 +5,7 @@ import {
   DEFAULT_CLOSURE_CONFIG,
   normalizeClosureConfig,
   classifyMessage,
+  isDirectedConversationMessage,
   assessConversationClosure,
   closurePromptBlock,
   closureSuppressesWake,
@@ -29,6 +30,7 @@ function test(name, fn) {
 }
 
 const now = Date.now();
+let nextSeq = 1;
 const msg = (text, { self = false, minutesAgo = 0, atSelf = false, quoteSelf = false } = {}) => ({
   isSelf: self,
   sender: self ? '弥' : '小咪',
@@ -37,7 +39,7 @@ const msg = (text, { self = false, minutesAgo = 0, atSelf = false, quoteSelf = f
   time: now - minutesAgo * 60 * 1000,
   atSelf,
   quoteSelf,
-  seq: Math.floor(Math.random() * 1e6),
+  seq: nextSeq++,
 });
 
 test('配置归一化：默认开、冷却 20 分钟、坏值收敛', () => {
@@ -65,6 +67,52 @@ test('消息分类：道别 / 提问 / 请求 / 附和 / 实质内容', () => {
   assert.equal(classifyMessage('谢谢').kind, 'ack');
   assert.equal(classifyMessage('那咱们扯平啦，谁都不许先低头').kind, 'substantive');
   assert.equal(classifyMessage('那咱们扯平啦，谁都不许先低头').settled, true);
+});
+
+test('真实原神追问和了解请求：分类与直接提问判据一致', () => {
+  for (const [text, kind] of [['原神和命运二你更喜欢哪个', 'question'], ['你现在去了解一下', 'request']]) {
+    assert.equal(classifyMessage(text).kind, kind);
+    assert.equal(isDirectedConversationMessage(text), true);
+    const assessment = assessConversationClosure({ kind: 'group', now, messages: [msg(text)] });
+    assert.equal(assessment.signals.awaitingTheirAnswer, true);
+    assert.equal(closeGate(assessment).blocked, true);
+  }
+  assert.equal(isDirectedConversationMessage('原神和命运二都玩过'), false);
+  assert.equal(isDirectedConversationMessage('今天天气怎么样'), false);
+});
+
+test('明确请求停止算 ending；提到回复但没请求停止不误判', () => {
+  for (const text of ['别回复了', '别再回复了', '不用再回复', '不要再打扰我']) {
+    assert.equal(classifyMessage(text).kind, 'ending', text);
+  }
+  assert.notEqual(classifyMessage('别回复错了，我还在等你回答这个问题').kind, 'ending');
+});
+
+test('指向其他人的问题不形成对机器人的未答问题', () => {
+  const otherQuestion = { ...msg('原神和命运二你更喜欢哪个'), addressedToOther: true };
+  const assessment = assessConversationClosure({ kind: 'group', now, messages: [otherQuestion] });
+  assert.equal(assessment.signals.awaitingTheirAnswer, false);
+  assert.equal(closeGate(assessment).blocked, false);
+  const directed = assessConversationClosure({ kind: 'group', now, messages: [{ ...otherQuestion, addressedToOther: false }] });
+  assert.equal(closeGate(directed).blocked, true);
+});
+
+test('重开立即释放旧冷却并保留上次收尾摘要', () => {
+  const record = { at: now - 1000, cooldownUntil: now + 20 * 60 * 1000, reopenedAt: 0, summary: '聊过游戏偏好', nextOpening: '继续游戏话题' };
+  const reopened = reopenClosure(record, { now, reason: 'question' });
+  assert.equal(reopened.reopenedAt, now);
+  assert.equal(reopened.cooldownUntil, now);
+  assert.equal(reopened.summary, record.summary);
+  assert.equal(reopened.nextOpening, record.nextOpening);
+  assert.equal(record.reopenedAt, 0, 'pure function leaves persisted input untouched');
+  assert.equal(closureStatus(reopened, now).cooldownActive, false);
+  const legacyReopened = { at: now, cooldownUntil: now + 20 * 60 * 1000, reopenedAt: now + 1 };
+  assert.equal(closureStatus(legacyReopened, now + 1).cooldownActive, false, 'status agrees with wake suppression for legacy reopened records');
+  for (const reason of ['probability', 'replyCheck', 'proactiveCheck']) {
+    assert.equal(closureSuppressesWake(reopened, reason, now), false);
+    assert.equal(closureSuppressesWake({ ...reopened, cooldownUntil: now + 20 * 60 * 1000 }, reason, now), false, 'legacy reopened records may still have a future cooldown');
+  }
+  assert.equal(closureSuppressesWake({ ...record, reopenedAt: now - 2000 }, 'replyCheck', now), true, 'a reopen older than the current closure cannot bypass it');
 });
 
 test('用户原场景：对方收束 + 我回「嗯嗯」→ 可以收尾', () => {

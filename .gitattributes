@@ -1,0 +1,2 @@
+# Windows launch scripts require CRLF in every checkout.
+*.bat text eol=crlf

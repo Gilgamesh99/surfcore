@@ -20,6 +20,7 @@ import { z } from 'zod';
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
 import { EMOTION_LABELS } from './sticker-semantics.js';
+import { registerGeneratedImageTools } from './generated-image-mcp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1199,6 +1200,8 @@ if (cfg.socialV2?.tools?.getImages !== false) {
     }
   );
 }
+
+registerGeneratedImageTools({ server, z, agentApi });
 
 // ── 表情包体系工具（二代仿真模式） ─────────────────────────────────────────
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listStickers !== false) {

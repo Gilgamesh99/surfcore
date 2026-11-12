@@ -784,8 +784,9 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
           rec.phase = '改用在线源';
         }
         await fetchToLocal(cfg, id, src, dir, (p, phase) => {
-          rec.progress = p;
-          rec.phase = phase;
+          // Transfer completion is not installation completion: config sanitization and validation still follow.
+          rec.progress = Math.min(99, p);
+          rec.phase = phase === '完成' ? '准备配置' : phase;
         }, { mirror });
         await flattenSingleDir(dir);
         // GitHub archive 解压出来可能带只读属性，后面复制 config / 拉模型会写不进去。

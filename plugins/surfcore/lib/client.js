@@ -1385,6 +1385,7 @@ F("sessionCwd", "会话工作目录", "留空用 surfcore 根目录", "text", { 
       markRead: "标记已读", closeConversation: "对话收尾", memory: "轻量记忆", slangQuery: "查黑话", slangSubmit: "提交黑话",      getImages: "看图", getForwardMsg: "看合并转发", sendPoke: "拍一拍", listStickers: "表情列表",
       getStickerImage: "表情图片", sendSticker: "发表情", setStickerRemark: "改表情备注",
       stickerNote: "表情笔记", collectSticker: "收藏表情", getSelfImage: "看自己形象", sendVoice: "发语音",
+      generateImage: "生成新图", imageResult: "查询生图", sendImage: "发送新图",
     };
 
     const QQ_ADV_CATEGORIES = [
@@ -1394,7 +1395,7 @@ F("sessionCwd", "会话工作目录", "留空用 surfcore 根目录", "text", { 
       { title: "唤醒与收尾", members: ["唤醒与潜水", "二代 · 唤醒与潜水", "对话收尾", "二代 · 对话收尾判断", "二代 · 上线补历史消息"] },
       { title: "发送与上下文", members: ["二代 · 发送与节奏", "二代 · 等待与上下文", "二代 · 主动与反馈"] },
       { title: "群聊与学习", members: ["群聊（chat 模式）", "黑话学习", "联网搜索"] },
-      { title: "工具与媒体", members: ["工具面", "二代 · 工具开关", "表情包", "图片能力", "语音"] },
+      { title: "工具与媒体", members: ["工具面", "二代 · 工具开关", "表情包", "图片能力", "生图与新图发送", "语音"] },
       { title: "其他", members: null },
     ];
 
@@ -1519,7 +1520,7 @@ F("sessionCwd", "会话工作目录", "留空用 surfcore 根目录", "text", { 
         F("listen.commentIntervalSec", "检查间隔（秒）", "建议 ≥300", "number", { min: 60 }),
         F("listen.scope", "监听范围", "回复我的 / 回复+@", "select", { options: [["both", "回复 + @"], ["reply", "只回复我"]] }),
         F("listen.oncePerPerson", "同一个人最多回一条", "30 天内只回一次", "switch"),
-        F("listen.allDay", "全天监听", "关掉 = 只在她醒着的窗口里回", "switch"),
+        F("listen.allDay", "全天监听", "开启 = 评论/@ 全天倾听，不受峰时顺延影响（仍受额度和互动限制）；关闭 = 只在她醒着的窗口里回", "switch"),
         F("listen.dm", "私信监听", "有私信就叫醒她", "switch"),
         F("listen.dmScope", "私信监听范围", "只认主人 / 谁找她都回", "select", { options: [["owner", "只认主人"], ["all", "谁找她都回"]] }),
         F("listen.live", "直播间监听", "", "switch"),
@@ -1606,8 +1607,41 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
     }
 
     // ── 概览 ────────────────────────────────────────────────────────────────
+    function updateSummary(status = {}) {
+      const rows = Array.isArray(status.results) ? status.results : [];
+      const available = status.availableUpdateCount ?? rows.filter((x) => x.available && x.updateAvailable && !x.blocked).length;
+      const blocked = rows.filter((x) => x.blocked || x.status === "blocked").length;
+      const failed = status.failedCount ?? rows.filter((x) => x.available === false || ["failed", "unknown"].includes(x.status)).length;
+      const stale = rows.some((x) => x.versionStale);
+      const parts = [];
+      if (status.lastApply?.status === "pending_restart") parts.push("已排队，等待退出 DSH 后应用");
+      if (available) parts.push(`${available} 个有更新`);
+      if (blocked) parts.push(`${blocked} 个更新受阻`);
+      if (failed) parts.push(`${failed} 个检查失败（见详情）`);
+      if (stale) parts.push("使用缓存结果，请重试检查");
+      if (parts.length) return { ok: false, warn: true, text: parts.join("；"), available };
+      return { ok: rows.length > 0, warn: false, text: rows.length ? "已是最新" : "还没检查到组件", available: 0 };
+    }
+
+    function updateItemState(item) {
+      const git = item.channel === "git";
+      const ver = item.latestVersion ? ` v${item.installedVersion || "?"} → v${item.latestVersion}${item.versionStale ? "（缓存）" : ""}` : "";
+      if (item.blocked || item.status === "blocked") return `更新受阻：${item.reason || item.blocked || "请重新检查"}`;
+      if (item.available === false || ["failed", "unknown"].includes(item.status)) return `检查失败：${item.reason || "请重新检查"}`;
+      if (item.updateAvailable) return `有更新${ver}`;
+      if (git && item.ahead > 0) return `已跟上远端，保留 ${item.ahead} 个本地提交${item.installedVersion ? `（v${item.installedVersion}）` : ""}`;
+      return `已是最新${ver}`;
+    }
+
+    const updatePromptSignature = (results) => (Array.isArray(results) ? results : [])
+      .filter((x) => x && x.updateAvailable)
+      .map((x) => `${x.id ?? x.name ?? ""}@${x.targetSha || x.remoteSha || x.remote || x.latestSha || x.latestVersion || ""}`)
+      .sort().join("|");
+
     function UpdatesModal({ status, onClose, onDone, onStaged, toast }) {
-      const pending = Array.isArray(status?.pending) ? status.pending : [];
+      const rows = Array.isArray(status?.results) ? status.results : (status?.pending ?? []);
+      const queued = status?.lastApply?.status === "pending_restart";
+      const pending = rows.filter((item) => !queued && item.available && item.updateAvailable && !item.blocked && !["failed", "unknown"].includes(item.status));
       // 远端只拿到提交号时显示「提交 abc1234」而不是 "vabc1234"（否则用户以为是乱码）
       const fmtV = (v) => {
         const t = String(v ?? "").trim();
@@ -1653,7 +1687,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       const applySelected = async (opts = {}) => {
         const overwriteModified = opts?.overwriteModified === true;
         const firstInstall = opts?.firstInstall === true;
-        const ids = [...selected];
+        const ids = pending.filter((item) => selected.has(item.id)).map((item) => item.id);
         if (!ids.length) return;
         setWorking(true);
         setDl(null);
@@ -1697,12 +1731,12 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       };
       return h("div", { className: "qbw-modal-backdrop", onClick: (e) => { if (e.target === e.currentTarget && !working) onClose?.(); } },
         h("div", { className: "qbw-modal", style: { maxWidth: "600px", maxHeight: "82vh", display: "flex", flexDirection: "column" } },
-          h("h3", { style: { flexShrink: 0 } }, pending.length > 1 ? `发现 ${pending.length} 个可用更新` : "发现可用更新"),
+          h("h3", { style: { flexShrink: 0 } }, `更新详情：${updateSummary(status).text}`),
           h("div", { style: { flex: "1 1 auto", minHeight: 0, overflow: "auto", paddingRight: "2px" } },
           h("p", null, (() => {
             // 让用户一眼看到"这次更新到什么版本"（以前只有提交列表，用户不知道是哪个版本）
             const withVer = pending.filter((x) => x.latestVersion);
-            if (!withVer.length) return "git 安装做快进（--ff-only）；zip 安装会下载新包覆盖代码。两种都不会动 config.json 与记忆卡。";
+            if (!withVer.length) return "SurfCore 源码安装会保留已提交的本地功能并合并远端更新；遇到冲突会停止并保留原版本。配置与记忆卡保持原样。";
             const parts = withVer.map((x) => `${x.name} v${x.installedVersion || "?"} → ${fmtV(x.latestVersion)}`);
             return `${parts.join("　")}；更新不会动 config.json 与记忆卡。`;
           })()),
@@ -1731,25 +1765,19 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
                 ? "只安装 vX.Y.Z-dev.N 的 Pre-release；正式用户不要开。"
                 : "只安装正式 Release；Pre-release 不会打扰你。"));
           })(),
-          pending.length ? pending.map((item) => h("div", { key: item.id, style: { border: "1px solid rgba(127,127,127,.24)", borderRadius: "10px", padding: "10px 12px", margin: "0 0 8px" } },
+          rows.length ? rows.map((item) => h("div", { key: item.id, style: { border: "1px solid rgba(127,127,127,.24)", borderRadius: "10px", padding: "10px 12px", margin: "0 0 8px" } },
             h("label", { style: { display: "flex", gap: "8px", alignItems: "center", fontWeight: 600 } },
-              h("input", { type: "checkbox", checked: selected.has(item.id), onChange: () => toggle(item.id), disabled: working }),
+              h("input", { type: "checkbox", checked: selected.has(item.id), onChange: () => toggle(item.id), disabled: working || !pending.some((x) => x.id === item.id) }),
               item.name,
               h("span", { className: "qbw-chip", style: { marginLeft: "auto" } },
-                item.channel === "version" || item.channel === "dev"
-                  ? `v${item.installedVersion} → ${fmtV(item.latestVersion)}${item.channel === "dev" ? "（测试通道）" : ""}`
-                  : item.channel === "release"
-                    ? `${item.installedVersion ? `v${item.installedVersion}` : "未安装"} → ${fmtV(item.latestVersion)}`
-                    : (item.latestVersion
-                      ? `v${item.installedVersion || "?"} → ${fmtV(item.latestVersion)}（${item.behind} 个提交）`
-                      : `${item.behind} 个提交（到 ${String(item.remote || "").slice(0, 7)}）`))),
+                updateItemState(item))),
             h("div", { className: "qbw-hint", style: { marginTop: "4px" } },
               `${item.dir} · ${item.branch ?? ""}${item.dirty ? ` · ⚠️ 本地有 ${item.dirty} 处改动` : ""}${item.ahead ? ` · ⚠️ 本地领先 ${item.ahead}` : ""}${Number(item.asset?.size) > 0 ? ` · 安装包 ${sizeText(item.asset.size)}` : (item.channel === "dev" || item.channel === "version" ? " · 包大小未知（GitHub 归档）" : "")} · ${item.channel === "release" ? "版本清单" : item.channel === "version" ? "版本追踪" : item.channel === "dev" ? "测试通道（Pre-release）" : "git 仓库"}`),
             item.blocked ? h("div", { className: "qbw-hint", style: { color: "var(--qbw-err-text)" } }, `不能自动更新：${item.blocked}`) : null,
-            item.blocked ? h("div", { className: "qbw-hint" }, "处理办法：本仓库有未提交改动时，先 commit/stash 再更新；或者直接用新版本的 zip 覆盖安装。") : null,
+            item.hint ? h("div", { className: "qbw-hint" }, `建议：${item.hint}`) : null,
             (item.changelog ?? []).length ? h("ul", { style: { margin: "6px 0 0 18px", padding: 0, fontSize: "11.5px", lineHeight: "18px", opacity: 0.82 } },
               item.changelog.slice(0, 8).map((line, index) => h("li", { key: index }, line))) : null,
-            (item.changelog ?? []).length > 8 ? h("div", { className: "qbw-hint" }, `…另有 ${item.changelog.length - 8} 条`) : null)) : h("p", null, "当前没有可用更新。"),
+            (item.changelog ?? []).length > 8 ? h("div", { className: "qbw-hint" }, `…另有 ${item.changelog.length - 8} 条`) : null)) : h("p", null, "还没有检查结果，请返回后点击检查更新。"),
           h("label", { style: { display: "flex", gap: "8px", alignItems: "center", marginTop: "4px" } },
             h("input", { type: "checkbox", checked: never, onChange: (e) => setNever(e.target.checked), disabled: working }),
             h("span", { className: "qbw-hint" }, "不再提示本次更新（只对这次的远端版本生效；有更新提交时会重新提醒）")),
@@ -2003,10 +2031,6 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       // 每次打开设置页都弹，服务都还没启动就先被拦一下）。
       // 记在 localStorage：同一批版本只自动弹一次；「稍后」也不会第二天重弹；换新版本会再提醒。
       const UPDATE_PROMPT_SEEN_KEY = "surfcore.updatePromptSeen";
-      const updatePromptSignature = (results) => (Array.isArray(results) ? results : [])
-        .filter((x) => x && x.updateAvailable)
-        .map((x) => `${x.id ?? x.name ?? ""}@${x.latestVersion ?? x.latestSha ?? ""}`)
-        .sort().join("|");
       useEffect(() => {
         if (autoPrompted || !updates?.showPrompt) return;
         const sig = updatePromptSignature(updates.results);
@@ -2022,19 +2046,12 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
         setBusy("updates");
         try {
           const r = await api("/updates", { method: "POST", body: { action: "check" } });
-          const n = r.pendingCount ?? 0;
-          const unknown = r.unknownCount ?? 0;
-          const pendingRestart = r.lastApply?.status === "pending_restart";
-          toast(n
-            ? `发现 ${n} 个组件有更新（安装后需重启 DSH）`
-            : pendingRestart
-              ? "✓ 更新已下载，请重启 DSH 生效"
-              : unknown
-                ? `无法判定 ${unknown} 个组件是否有更新（见详情）`
-                : "已是最新");
-          if (n) setRestartHint({ staged: false, count: n });
-          else if (pendingRestart) setRestartHint({ staged: true, count: 1 });
-          if (n && openOnHit) setUpdateOpen(true);
+          const summary = updateSummary(r);
+          toast(summary.text);
+          if (r.lastApply?.status === "pending_restart") setRestartHint({ staged: true, count: 1 });
+          else if (summary.available) setRestartHint({ staged: false, count: summary.available });
+          else setRestartHint(null);
+          if (summary.warn && openOnHit) setUpdateOpen(true);
           await reload();
           return r;
         } catch (e) {
@@ -2417,13 +2434,8 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
             h("div", { className: "qbw-hint" }, "一键启动会按勾选项启动，已在跑的不重复启动；QQ 会按需打开已安装的 SnowLuma，并弹出「加载 QQ 账号」窗口自动检测进程（QQ 本身未登录时仍需扫码）。勾选「向量记忆」会启动 Embedding runtime 并把记忆方式切到向量（自检不过不会切）；一键停止会把记忆方式切回叙事。不会关闭 SnowLuma 本体。人格卡在「角色」页维护。")),
           h("div", { className: "qbw-card" },
             h("h4", null, "更新 ", (() => {
-              const rows = updates.results ?? [];
-              const bad = rows.filter((x) => !x.available);
-              const stale = rows.filter((x) => x.versionStale);
-              if (updates.pendingCount > 0) return h(StatusDot, { ok: false, warn: true }, `${updates.pendingCount} 个可更新`);
-              if (bad.length) return h(StatusDot, { ok: false, warn: true }, `部分查不到（${bad[0].name}：${bad[0].reason || "网络/限流"}）`);
-              if (stale.length) return h(StatusDot, { ok: false, warn: true }, "用的是缓存结果（上次拉取失败）");
-              return h(StatusDot, { ok: true }, "已是最新");
+              const summary = updateSummary(updates);
+              return h(StatusDot, { ok: summary.ok, warn: summary.warn }, summary.text);
             })()),
             h("div", { className: "qbw-kv" }, h("span", null, "上次检查"), h("span", null, updates.lastCheckAt ? fmtTime(updates.lastCheckAt) : "还没查过")),
             (() => {
@@ -2440,7 +2452,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
                     : `${la.reason || "结果未知"}${la.hint ? `（${la.hint}）` : ""}`;
               return h("div", { className: "qbw-kv" }, h("span", null, "上次更新"), h("span", { style: { color } },
                 text,
-                la.status === "failed"
+                la.status === "failed" && la.rollbackAvailable !== false && la.kind !== "git"
                   ? h(Btn, {
                     kind: "qbw-btn2", disabled: !!busy,
                     onClick: async () => {
@@ -2458,22 +2470,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
             h("div", { className: "qbw-kv" }, h("span", null, "组件"), h("span", null,
               (updates.results ?? []).length
                 ? updates.results.map((item) => {
-                  // 三种结果必须说清（AGENTS 1.7）：有更新 / 已是最新 / 查不到（附原因）。
-                  // 不允许把"查不到/失败"显示成"最新"（2026-10-29 事故）。
-                  const ver = item.latestVersion
-                    ? (item.ahead
-                      ? ` 本地 v${item.installedVersion} 领先发布 v${item.latestVersion}`
-                      : ` v${item.installedVersion ?? "?"}→v${item.latestVersion}`)
-                      + (item.versionStale ? "（缓存）" : "")
-                    : "";
-                  const st = item.status ?? "";
-                  if (st === "update") return `${item.name}（有更新${ver}）`;
-                  if (st === "latest") return `${item.name}（已是最新${ver}）`;
-                  if (st === "blocked") return `${item.name}（更新被阻止：${item.blocked || item.reason || "原因不明"}）`;
-                  if (st === "failed") return `${item.name}（检查失败：${item.reason || "原因不明"}）`;
-                  if (st === "unknown") return `${item.name}（查不到：${item.reason || "原因不明"}）`;
-                  if (item.available) return `${item.name}${item.updateAvailable ? `（有更新${ver}）` : `（已是最新${ver}）`}`;
-                  return `${item.name}（查不到：${item.reason || "原因不明"}）`;
+                  return `${item.name}（${updateItemState(item)}）`;
                 }).join(" · ")
                 : "还没检查")),
             (() => {
@@ -2481,11 +2478,11 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
               const bad = (updates.results ?? []).filter((x) => x.status === "unknown" || x.status === "failed" || x.status === "blocked");
               if (!bad.length) return null;
               return h("div", { className: "qbw-hint", style: { color: "var(--qbw-err-text)", marginTop: "4px" } },
-                bad.map((x) => `${x.name}：${x.reason || "原因不明"}${x.hint ? `（${x.hint}）` : ""}`).join("；"));
+                bad.map((x) => `${x.name}：${x.reason || x.blocked || "请重新检查"}${x.hint ? `（${x.hint}）` : ""}`).join("；"));
             })(),
             (updates.results ?? []).filter((item) => item.available && item.blocked && item.updateAvailable).length
               ? h("div", { className: "qbw-hint", style: { color: "var(--qbw-err-text)" } },
-                "有组件因本地改动/未推送提交被拒，详情点「查看详情」。")
+                "有组件暂时无法更新，详情与处理建议见「查看详情」。")
               : null,
             (updates.pending ?? []).length
               ? h("div", { className: "qbw-hint", style: { marginTop: "2px" } },
@@ -3726,7 +3723,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       const tools = Object.keys(cfg?.socialV2?.tools ?? {});
       const groups = [...QQ_FIELDS];
       if (tools.length) {
-        groups.push({ group: "二代 · 工具开关", note: "关掉即从模型工具面移除", fields: tools.map((key) => F(`socialV2.tools.${key}`, TOOL_LABELS[key] ?? key, key, "switch")) });
+        groups.push({ group: "二代 · 工具开关", note: "图片工具关闭后由桥接立即拒绝；其他工具列表在 MCP 启动时载入，改完需重启。",  fields: tools.map((key) => F(`socialV2.tools.${key}`, TOOL_LABELS[key] ?? key, key, "switch")) });
       }
       groups.push({ group: "表情包", fields: [
         F("socialV2.sticker.enabled", "启用表情包", "", "switch"),
@@ -3739,6 +3736,19 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
         F("socialV2.sticker.collect.maxPerMinute", "每分钟最多收藏", "", "number", { min: 0 }),
         F("socialV2.sticker.collect.maxPerHour", "每小时最多收藏", "", "number", { min: 0 }),
         F("socialV2.sticker.collect.maxRemarkChars", "备注最大字符", "", "number", { min: 0 }),
+      ]});
+      groups.push({ group: "生图与新图发送", note: "使用 Magpie 的图片生成模型。新图只能发回请求它的 QQ 会话；失败也计入生成额度，避免重复扣费。保存后重启 QQ 桥接；首次新增工具还需重新连接 SnowLuma MCP（重启 DSH）。", fields: [
+        F("socialV2.images.enabled", "启用生图与新图发送", "总闸；还需打开工具面中的生成、查询、发送开关", "switch"),
+        F("socialV2.images.magpieCommand", "Magpie 程序", "本机 Magpie 可执行文件的完整路径", "text", { wide: true, browse: "file" }),
+        F("socialV2.images.model", "图片模型", "留空使用 Magpie 当前图片模型；指定时填 provider/model", "text"),
+        F("socialV2.images.dailyPerKey", "每会话每天最多生成", "默认 3；0 = 不允许生成", "number", { min: 0, max: 100 }),
+        F("socialV2.images.dailyGlobal", "全局每天最多生成", "默认 12；按本机日期计数，包含失败尝试", "number", { min: 0, max: 1000 }),
+        F("socialV2.images.cooldownMs", "同会话生成间隔（ms）", "默认 60000", "number", { min: 0, max: 86400000 }),
+        F("socialV2.images.concurrencyGlobal", "同时生成上限", "默认 2；同一会话只能同时生成 1 张", "number", { min: 1, max: 2 }),
+        F("socialV2.images.maxBytes", "单图最大字节数", "最大 10485760（10 MB）", "number", { min: 1, max: 10485760 }),
+        F("socialV2.images.retentionMs", "图片可发送期限（ms）", "默认 86400000（24 小时），过期不能发送", "number", { min: 1, max: 86400000 }),
+        F("socialV2.images.maxEntries", "图片记录容量", "默认 128；满后明确停止，管理员停桥接后归档，不自动删除", "number", { min: 1, max: 512 }),
+        F("socialV2.images.generationTimeoutMs", "生成超时（ms）", "默认 300000（5 分钟）；超时不自动重试", "number", { min: 1000, max: 600000 }),
       ]});
       groups.push({ group: "图片能力", note: "auto=查 DSH 模型目录；目录里找不到的第三方模型默认按“不支持”走文字兜底，避免 ACP 直接拒绝图片块。若你确认该模型支持图片，可强制选「支持」。", fields: [
         F("socialV2.vision.imageInput", "模型图片输入", "auto / 支持 / 不支持；改完重启 DSH", "select", { options: [["auto", "自动识别"], ["true", "支持图片输入"], ["false", "不支持（文字兜底）"]] }),
@@ -8262,7 +8272,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
     exports.BILI_FIELDS = BILI_FIELDS;
     exports.QQ_BILI_SHARE_FIELDS = QQ_BILI_SHARE_FIELDS;
     // 仅供 Node 契约测试验证路径归一化；浏览器运行时不使用。
-    exports.__test = { pathKeys, setPath };
+    exports.__test = { pathKeys, setPath, updateSummary, updateItemState, updatePromptSignature, UpdatesModal };
     return module.exports;
   },
 });

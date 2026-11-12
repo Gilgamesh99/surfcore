@@ -61,7 +61,7 @@ export function msUntilNextLocalDay(now = Date.now()) {
  */
 export function evaluateWakeBudget({
   key = '', wakeTimes = [], budgetTimes = null, reason = '',
-  now = Date.now(), guard = DEFAULT_TOKEN_GUARD, cost = null, direct = false,
+  now = Date.now(), guard = DEFAULT_TOKEN_GUARD, cost = null, direct = false, continuation = false,
 } = {}) {
   const g = { ...DEFAULT_TOKEN_GUARD, ...(guard && typeof guard === 'object' ? guard : {}) };
   const clean = (arr) => (Array.isArray(arr) ? arr : []).map(Number).filter((t) => Number.isFinite(t) && t > 0);
@@ -90,7 +90,8 @@ export function evaluateWakeBudget({
   }
   const gap = Math.max(0, Math.round(num(g.minWakeGapMs, 0)));
   const last = times.length ? Math.max(...times) : 0;
-  const bypassGap = direct === true && g.directBypassGap !== false;
+  // 已验证的有限续聊只豁免节奏间隔，不豁免每日次数、费用或发送条数。
+  const bypassGap = (direct === true || (reason === 'continuation' && continuation === true)) && g.directBypassGap !== false;
   if (!bypassGap && gap > 0 && last && now - last < gap) {
     return {
       blocked: true,

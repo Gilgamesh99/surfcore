@@ -59,10 +59,16 @@ import * as qqAt from '../src/qq-at.js';
 import * as modelOptions from '../src/model-options.js';
 import { createBiliMemory } from '../src/bili-memory.js';
 import { createOutbox } from '../src/outbox.js';
+import { normalizeGeneratedImageConfig } from '../src/generated-images.js';
+import { createGeneratedImageRoutes, imageRouteError } from '../src/generated-image-routes.js';
 import { isLoopbackBaseUrl } from '../src/dsh-port.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
+// Local continuation hotfixes add pure bridge imports; exercise them when present.
+const continuationFile = path.join(root, 'src', 'conversation-continuation.js');
+const conversationContinuation = fs.existsSync(continuationFile)
+  ? await import(pathToFileURL(continuationFile).href) : {};
 
 /** 0.1s / 16k 单声道的最小 wav（只要头正确，voice-tts 就不会当成空文件）。 */
 function wavFixture() {
@@ -231,6 +237,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     runPurpose, purposeState, notePurposeTurnEnded, notePurposeOutbound, startPurposeLoop, warmPurposeState,
     // 对话收尾判断：测试可直接调内部函数（不连真 QQ）。
     closeConversationV2, assessClosureV2, closureConfigV2, closureSuppressesWake, noteClosureReopenV2,
+    evaluateWakeTriggerV2, scheduleReplyCheckV2, isDirectedAtAi, saveSocialV2State, loadSocialV2State, markReadCalledKeys,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator, synthesizeVoiceText,
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
     setMode(value) { currentMode = value; },
@@ -267,6 +274,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...dshModelFollow,
     ...commandSpam,
     createOutbox,
+    normalizeGeneratedImageConfig, createGeneratedImageRoutes, imageRouteError,
+    createMagpieImageGenerator: () => async () => { throw new Error('Real generation forbidden in bridge fixtures'); },
     ...voiceDiagnostics,
     ...allowlist,
     ...callname,
@@ -277,7 +286,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...adminIdentity, ...roleCard, ...personaLayers, ...wakePolicy, ...groupPolicy, ...actionPlanner, ...sessionMap, ...contextTelemetry, ...memoryCard, ...vectorMemory, ...biliCard, ...characterStore, ...historyCatchup,
     ...questionAnswers, ...ownerAudit, ...turnGuard, ...gateEvents,
     ...purposeEngine,
-    ...conversationClosure,
+    ...conversationClosure, ...conversationContinuation,
     ...sessionRollover,
     ...wakeBatch,
     ...wakeFilter,

@@ -130,6 +130,11 @@ const LOCAL_EXECUTION_TOOLS = [
 ]
 
 const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
+  // 生图走受控 qq_generate_image / qq_image_result / qq_send_image；
+  // 原始 Magpie 接口接受任意路径/参考图，不能向 QQ 会话暴露。
+  'mcp__magpie-image__generate_image',
+  'mcp__magpie-image__generate_video',
+  'mcp__magpie-image__generation_result',
   // 本地执行面（见上）
   ...LOCAL_EXECUTION_TOOLS,
   // dsh-super-injector / 开发注入器（0.1.7-rc.2 实测注册的全局工具）

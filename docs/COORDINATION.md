@@ -18,6 +18,8 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **本机 main 整合（2026-11-12）** | `D:/Project/surfcore-main-integration` | `fix/local-main-integration-20261112` | 汇总现有 QQ/B站修复、测试/文档及保留本地提交的 Git 更新；Lead 串行生产整合 | 验证中；用户明确要求本机 main，未授权发布；四工作树已备份 |
+| **QQ 受控生图（2026-11-12）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-qq-images` | `feat/qq-generated-images`（基线 `0ce8580`） | 三个图片工具、服务/发送/配置/UI、隔离测试与本机加载 | 完成：已合并加载并启用；审计 156/156，生产图片 82 通过/1 权限跳过、回归 17 通过，设置页已核验；不发布 |
 | **协调/发布**（本对话） | `D:\deepseekwork\surfcore` | `dev` | 规则、登记表、合并、发版 | 进行中 |
 | **bug 修复** | `D:\deepseekwork\surfcore-bugfix` | `fix/persona-tone-dedup` @ `672fef0` | 0.8.7 前的 5 个批次 | ✅ 已随 0.8.7/0.8.8 发布 |
 | **优化 · 唯一会话** | `D:\deepseekwork\surfcore-optimize` | `feat/optimize` @ `cbaa613` | OPT-001 已合并并随 `0.8.8-dev.1` 发布；继续下一批 | 🕒 进行中 |

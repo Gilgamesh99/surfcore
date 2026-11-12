@@ -272,7 +272,7 @@ export function apply(ctx) {
   });
 
   // ── 组件更新（2026-10-26 用户要求）──────────────────────────────────────
-  // 检查 SurfCore 本体 + 语音包 + 桌宠 + 未来登记的扩展：只读 git fetch，更新只允许 --ff-only。
+  // 检查 SurfCore 本体 + 桌宠 + 扩展：源码更新在宿主退出后保留本地提交并合并，冲突时停止。
   // 组件清单每次动态解析：换路径 / 新装包 / 新扩展都不用重启插件。
   const updates = createUpdatesService({
     stateDir: STATE_DIR,

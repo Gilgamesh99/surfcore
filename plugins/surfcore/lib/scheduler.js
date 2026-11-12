@@ -965,12 +965,14 @@ export function startScheduler(ctx, opts) {
   async function listenTick() {
     if (!interactEnabled()) return
     if (listening) return
-    if (peakBlockedNow('评论区倾听')) return
-    if (await budgetBlockedNow('评论区倾听')) return
     let cfg
     try { cfg = JSON.parse(fs.readFileSync(CFG_FILE_REF, 'utf8')) } catch { cfg = {} }
     const listenerCfg = cfg.listen ?? {}
     if (listenerCfg.comment === false) return                    // 评论区监听关掉了 ✓
+    // 全天倾听是接收别人发来的评论/@；不随主动后台任务一起延到谷时。
+    // 非全天模式仍保留避峰；两种模式都必须通过 token 预算和原有互动限制。
+    if (!listenerCfg.allDay && peakBlockedNow('评论区倾听')) return
+    if (await budgetBlockedNow('评论区倾听')) return
     // 下限 60 秒（2026-10-18 测试期曾临时放宽到 2 秒 ✓ 已还原 ✓ —— B站 接口经不起每 2 秒锤 ✗）
     const interval = Math.max(60, Number(listenerCfg.commentIntervalSec ?? 300)) * 1000
     if (Date.now() - lastListenAt < interval) return
@@ -1341,6 +1343,7 @@ export function startScheduler(ctx, opts) {
   const timerDm = setInterval(() => { dmTick().catch(() => {}) }, 20_000)   // 2026-10-19: 60s -> 20s, 私信要像聊天; 每次只是一个 get_sessions 请求 很轻
   const timer3 = setInterval(() => { liveTick().catch(() => {}) }, 60_000)     // 直播间：挂了就一直跑，断了自动重挂 ✓
   log(`[bili-whale] 自主生物钟已启动（每 ${TICK_MS / 1000}s tick · 会话 ${sessionId}）；监听 + 直播间监看都挂上了 ✓`)
+  log('[bili-whale] 倾听策略：全天评论/@ 不受峰时顺延影响；token 预算和互动限制仍有效')
 
   return {
     /** 设置页一保存就调它：清掉旧计划，下一次 tick 按新配置重算 ✓ */

@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { helperSpawnEnv } from '../lib/updates.js';
+import { helperSpawnEnv, resumePendingApply } from '../lib/updates.js';
 
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'surfcore-update-helper-'));
 let failures = 0;
@@ -59,8 +59,73 @@ try {
   // 2026-11-01 起：失败 = 本次尝试结束，删 pending、只留 .failed（避免下次启动重试坏包/永远显示旧失败）
   ok(!fs.existsSync(badPending), '失败后删除 pending（.failed 是唯一真相）');
   ok(!fs.existsSync(`${badPending}.started`), '失败后清理 .started');
+
+  // 4) Resume uses the same real child-process handshake as a fresh queue.
+  const previousHelper = process.env.SURFCORE_UPDATE_HELPER;
+  const fixtures = [];
+  const pause = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const fixturePrelude = "import fs from 'node:fs'; const file=process.argv[3]; const job=JSON.parse(fs.readFileSync(file,'utf8')); fs.writeFileSync(file+'.fixture-pid',String(process.pid)); ";
+  const resumeFixture = (name, { source, missing = false, lock = '', staleMarker = false } = {}) => {
+    const stateDir = path.join(base, name);
+    fs.mkdirSync(stateDir);
+    const file = path.join(stateDir, 'updates-pending.json');
+    const job = { kind: 'zip', component: 'surfcore', txn: name, target, staging, to: '9.9.9', waitPid: 999999 };
+    fs.writeFileSync(file, JSON.stringify(job));
+    if (lock) fs.writeFileSync(file + '.lock', lock);
+    if (staleMarker) fs.writeFileSync(file + '.started', JSON.stringify({ pid: process.pid, txn: 'other-transaction' }));
+    if (source !== undefined || missing) {
+      const helper = path.join(stateDir, 'helper.mjs');
+      if (!missing) fs.writeFileSync(helper, source);
+      process.env.SURFCORE_UPDATE_HELPER = helper;
+    } else delete process.env.SURFCORE_UPDATE_HELPER;
+    const resumed = resumePendingApply({ stateDir });
+    fixtures.push(file);
+    return { file, resumed, job };
+  };
+  const expectFailure = async (f, code) => {
+    const deadline = Date.now() + 6000;
+    while (!fs.existsSync(f.file + '.failed') && Date.now() < deadline) await pause(50);
+    const result = JSON.parse(fs.readFileSync(f.file + '.failed', 'utf8'));
+    assert.equal(result.code, code);
+    assert.ok(result.error && result.hint);
+    assert.equal(result.txn, f.job.txn);
+    assert.equal(fs.existsSync(f.file), false, 'failed resume releases only its pending job');
+  };
+  try {
+    const missing = resumeFixture('missing-helper', { missing: true });
+    assert.equal(missing.resumed, false);
+    const corrupt = resumeFixture('corrupt-helper', { source: 'this is invalid JS!', staleMarker: true });
+    const locked = resumeFixture('invalid-lock', { lock: 'not-a-pid' });
+    const silent = resumeFixture('no-handshake', { source: fixturePrelude + 'setTimeout(()=>{},10000);' });
+    const wrongMarker = resumeFixture('wrong-handshake', { source: fixturePrelude + "fs.writeFileSync(file+'.started',JSON.stringify({txn:'wrong-job',pid:process.pid})); setTimeout(()=>{},10000);" });
+    const wrongPid = resumeFixture('wrong-pid', { source: fixturePrelude + "fs.writeFileSync(file+'.started',JSON.stringify({txn:job.txn,pid:process.pid+1})); setTimeout(()=>{},10000);" });
+    const healthy = resumeFixture('valid-handshake', { source: fixturePrelude + "fs.writeFileSync(file+'.started',JSON.stringify({txn:job.txn,pid:process.pid})); setTimeout(()=>{},10000);" });
+    const moved = resumeFixture('newer-job', { source: fixturePrelude + "fs.writeFileSync(file,JSON.stringify({...job,txn:'newer-transaction'})); fs.writeFileSync(file+'.failed',JSON.stringify({txn:'newer-transaction',code:'newer-evidence'}));" });
+    const active = resumeFixture('active-lock', { lock: String(process.pid) });
+    assert.equal(active.resumed, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(active.file, 'utf8')), active.job, 'live helper lock prevents duplicate resume');
+    await Promise.all([
+      expectFailure(missing, 'stage.helper-missing'),
+      expectFailure(corrupt, 'stage.helper-exited'),
+      expectFailure(locked, 'stage.helper-exited'),
+      expectFailure(silent, 'stage.helper-not-started'),
+      expectFailure(wrongMarker, 'stage.helper-not-started'),
+      expectFailure(wrongPid, 'stage.helper-not-started'),
+    ]);
+    assert.equal(fs.existsSync(healthy.file), true, 'matching live helper handshake keeps queue');
+    assert.equal(fs.existsSync(healthy.file + '.failed'), false);
+    assert.equal(JSON.parse(fs.readFileSync(moved.file, 'utf8')).txn, 'newer-transaction');
+    assert.equal(JSON.parse(fs.readFileSync(moved.file + '.failed', 'utf8')).code, 'newer-evidence', 'old exit/timeout cannot overwrite new evidence');
+    ok(true, '恢复队列：助手缺失、语法损坏、坏锁和启动超时均留下可操作失败并释放队列');
+    ok(true, '恢复队列：启动标记必须匹配事务，活跃锁与新事务不被旧回调改动');
+  } finally {
+    if (previousHelper === undefined) delete process.env.SURFCORE_UPDATE_HELPER; else process.env.SURFCORE_UPDATE_HELPER = previousHelper;
+    for (const file of fixtures) {
+      try { process.kill(Number(fs.readFileSync(file + '.fixture-pid', 'utf8'))); } catch {}
+    }
+  }
 } finally {
-  fs.rmSync(base, { recursive: true, force: true });
+  await fs.promises.rm(base, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 }
 
 if (failures) { console.error(`\n${failures} 项失败`); process.exit(1); }

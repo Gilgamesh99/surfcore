@@ -64,10 +64,10 @@ export function normalizeClosureConfig(raw = {}) {
 //   substantive 有实际内容（不是上面任何一类）
 
 const END_ANY_RE = /(晚安|拜拜|再见|886|先这样|先这么着|先撤|溜了|去忙|下了|睡了|不聊了|回头聊|改天聊|明天聊|下次聊|到此为止)/;
-const END_STRONG_RE = /^(晚安|拜拜|再见|886|先这样|先这么着|先撤|溜了|去忙了?|下了|睡了|不聊了|回头聊|改天聊|明天聊|下次聊)[呀啦哦喔~～。！!？?…，,、\s]*$/;
+const END_STRONG_RE = /^(晚安|拜拜|再见|886|先这样|先这么着|先撤|溜了|去忙了?|下了|睡了|不聊了|回头聊|改天聊|明天聊|下次聊|别(?:再)?回复(?:了)?|不用再回复(?:了)?|不要再打扰我)[呀啦哦喔~～。！!？?…，,、\s]*$/;
 const QUESTION_TAIL_RE = /[?？]\s*$/;
 const QUESTION_WORD_RE = /(吗|嘛|么|咋|怎么|为什么|为啥|什么|哪个|哪里|哪儿|谁|多少|几点|是不是|有没有|能不能|可不可以|要不要|好不好|对不对|行不行|在不在|忙不忙|睡了吗|吃了吗)\s*[。！!…～~]*$/;
-const REQUEST_RE = /(帮我|帮忙|麻烦你|请你|能不能帮我|可以帮我|教我|告诉我|说说|讲讲|发我|给我|推荐|查一下|搜一下|找一下|看一下|写一个|弄一个|来个|整一个)/;
+const REQUEST_RE = /(帮我|帮忙|麻烦你|请你|能不能帮我|可以帮我|教我|告诉我|说说|讲讲|发我|给我|推荐|查一下|搜一下|找一下|看一下|写一个|弄一个|来个|整一个)|(?:你|您).{0,8}(?:了解|查|搜|看|解释|介绍|说|讲)(?:一)?下/;
 const ACK_RE = /^(?:嗯+|哦+|噢+|喔+|好+|行+|可以|收到|了解|明白|懂了|知道了|ok|okay|没问题|谢谢|多谢|感谢|辛苦了|哈哈+|hhh+|嘻嘻|草|艹|笑死|绝了|666|？+|\?+|在|嗯哼|确实|对的|是啊|是的|成)[呀啦哦喔呢吧啊嘛的滴嘞~～。！!？?…，,、\s]*$/i;
 // 「收束语气」：不是道别，但明显在给一个话题画句号。
 const SETTLED_RE = /(说好了|就这么定|扯平|一言为定|成交|定了|好啦|行啦|算啦|先这样|以后再说|下次再说|不说了|不提了|到此为止|翻篇)/;
@@ -259,7 +259,7 @@ export function assessConversationClosure(input = {}) {
 
   // 未答的提问：对方问了我、我还没接。这是唯一会「硬阻止收尾」的信号。
   const awaitingTheirAnswer = Boolean(
-    otherClass && ['question', 'request'].includes(otherClass.kind)
+    otherClass && !lastOther?.addressedToOther && ['question', 'request'].includes(otherClass.kind)
     && (!lastSelf || (Number(lastSelf.time) || 0) < (Number(lastOther.time) || 0))
   );
   const openLoops = awaitingTheirAnswer ? 1 : 0;
@@ -403,6 +403,7 @@ export function closurePromptBlock(assessment, { record = null, now = Date.now()
   const openText = s.openLoops > 0 ? '有未答的提问/请求' : '没有未答的提问';
   lines.push(`- 未完成：${openText}。判断：${VERDICT_ADVICE[assessment.verdict] ?? '继续观察'}。`);
   lines.push('如果判断可以收尾：不要再补一句，调用 qq_close_conversation（可留 summary / nextOpening）。这不是潜水，不用沉睡前观察；对方再找你、开新话题仍会照常醒。如果还要聊就正常回；只是等对方补充，用 qq_wait_for_messages(purpose="reply")。不要用收尾逃避提问/求助，也不要每轮都收尾。');
+  lines.push('刚答完实质内容、只安静了几十秒，不等于话题聊完。小群刚聊过的成员有有限续聊窗口；close 若返回 deferred=true，本轮即可结束，等待新消息唤醒，不要重复收尾或连续空等。明确道别、双方已收束才立即结束话题。');
   if (record && record.at) {
     if (record.reopenedAt && now - Number(record.reopenedAt) < 10 * 60 * 1000) {
       lines.push(`上次这段刚收过尾，现在对方又开口了：这是新的开始，别复读上次的结尾。${formatClosureRecord(record, now)}`);
@@ -423,7 +424,7 @@ export function closureStatus(record, now = Date.now()) {
     summary: record.summary ?? '',
     nextOpening: record.nextOpening ?? '',
     cooldownUntil: Number(record.cooldownUntil) || 0,
-    cooldownActive: Number(record.cooldownUntil) > now,
+    cooldownActive: closureSuppressesWake(record, 'replyCheck', now),
     reopenedAt: Number(record.reopenedAt) || 0,
   };
 }
@@ -490,8 +491,24 @@ export function normalizeClosureRecord(raw, config = {}) {
  */
 const SOFT_WAKE_REASONS = new Set(['probability', 'replyCheck', 'proactiveCheck']);
 
+/** 群聊提问唤醒与收尾共用分类；是否指向其他群友由入站路由先判断。 */
+export function isDirectedConversationMessage(value) {
+  const lower = text(value).toLowerCase();
+  const kind = classifyMessage(lower).kind;
+  const aiMention = /deepseek|claude|chatgpt|gpt|肥鱼|小鲸鱼|鲸鱼|d指导|d老师|d师傅|深度求索|\bds\b|ai|人工智障|机器人|模型/.test(lower);
+  const challenge = /强|弱|行不行|能不能|会不会|是不是|一半|水平|垃圾|废物|白嫖|菜|不如|厉害|赢|输|比.*强|比.*弱/.test(lower);
+  const question = /[?？吗呢吧]|怎么|为什么|哪|谁/.test(lower);
+  if (['question', 'request'].includes(kind) && (aiMention || /你|您/.test(lower))) return true;
+  if (aiMention && (question || challenge)) return true;
+  if (/(你|您).{0,10}(吗|呢|？|\?|怎么|是不是|能不能|行不行|有没有|有|没有|比|不如|强|弱|一半|厉害|垃圾|菜|赢|输)/.test(lower)) return true;
+  if (/^(你|您)(是不是|行不行|能不能|会不会|觉得|有|没有)/.test(lower)) return true;
+  if (/(你|您)是[^？?。！!]{0,14}(还是|或者|吗|么|？|\?)/.test(lower)) return true;
+  return /怎么不说话|人呢|回我|说话啊|理我|别装死|在不在|装死|说话/.test(lower);
+}
+
 export function closureSuppressesWake(record, reason, now = Date.now()) {
   if (!record || !Number(record.cooldownUntil)) return false;
+  if (Number(record.reopenedAt) >= Number(record.at) && Number(record.reopenedAt) > 0) return false;
   if (now >= Number(record.cooldownUntil)) return false;
   const base = String(reason ?? '').split(':')[0];
   return SOFT_WAKE_REASONS.has(base);
@@ -501,7 +518,7 @@ export function closureSuppressesWake(record, reason, now = Date.now()) {
 export function reopenClosure(record, { reason = 'new-message', now = Date.now() } = {}) {
   if (!record) return null;
   if (record.reopenedAt && now - Number(record.reopenedAt) < 60 * 1000) return record;
-  return { ...record, reopenedAt: now, reopenReason: truncateChars(reason, 40) };
+  return { ...record, reopenedAt: now, reopenReason: truncateChars(reason, 40), cooldownUntil: Math.min(Number(record.cooldownUntil) || now, now) };
 }
 
 /**

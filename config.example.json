@@ -211,7 +211,24 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": false
+      "sendVoice": false,
+      "generateImage": true,
+      "imageResult": true,
+      "sendImage": true
+    },
+    "images": {
+      "enabled": false,
+      "magpieCommand": "",
+      "model": "",
+      "dailyPerKey": 3,
+      "dailyGlobal": 12,
+      "cooldownMs": 60000,
+      "concurrencyGlobal": 2,
+      "concurrencyPerKey": 1,
+      "maxBytes": 10485760,
+      "retentionMs": 86400000,
+      "maxEntries": 128,
+      "generationTimeoutMs": 300000
     },
     "wake": {
       "defaultMode": "diving",
