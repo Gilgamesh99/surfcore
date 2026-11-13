@@ -20,7 +20,9 @@
 
 ## 验证
 
-合并后完整审计完成159/163：旧R11耗时1060ms、提交前清单不匹配、两组Windows更新夹具超过审计的60/240秒上限。独立重跑桥接回归17/17及test-update-apply-result均通过；其余Git更新、完整插件及提交后清单验证继续核对，不将原分支结果冒充集成结果。消息顺序工作流43/43通过；宿主smoke与platform-start隔离测试通过。最终检查与本机激活证据在加载后补记。
+合并后完整审计完成159/163：旧R11耗时1060ms、提交前清单不匹配、两组Windows更新夹具超过审计的60/240秒上限。四项随后分别复验通过：桥接回归17/17、更新结果夹具、Git更新21项，以及提交后800文件清单验证（0问题）。这是完整运行后定向复验，不宣称一次163/163。
+
+插件共45个脚本，累计44个通过；唯一未通过的是test-update-helper-env.mjs:89，预期stage.helper-exited、实际stage.helper-not-started。相同夹具在原生产基线c9b8dbe也复现，相关更新实现和断言未修改。首轮在该脚本中断后，剩余31个脚本全部补跑通过。集成版专项结果：动态读取20/20、私信读取21/21、消息顺序与投递工作流43/43、实际宿主监听18/18，CLI/设置API与隔离smoke通过。
 
 ## 运行与备份
 
@@ -28,11 +30,14 @@
 - 隔离目录：D:/ProgramData/DSH NEXT/Soul/surfcore-bili-integration；生产目录：D:/Project/surfcore。
 - 备份：D:/ProgramData/DSH NEXT/Soul/backups/surfcore-bili-integration-20261113-2217（Git bundles、脱离仓库的私有配置与状态副本、哈希清单）。
 - GUI：http://127.0.0.1:57328；版本保持0.8.9，无tag、push或发布。
-- 激活状态：尚待本轮验证完成。真实QQ分享/B站结果私信不作为本轮测试自动执行。
+- 已于2026-11-13 23:06后快进并加载0efd84f（实现与首轮清单，后续仅追加验收文档/清单）。PluginManager调用返回RPC异常时按真实状态回读：关闭后路由404，恢复后enabled=true、fiberPhase=active，新私信任务路由200。五份配置/角色/Git配置哈希保持。
+- 桥接重启控制请求45秒超时，未盲目重试；后续只读核验进程PID21944、生产根D:/Project/surfcore、reserved2、DSH与SnowLuma均在线，新指定群解析路由200且唯一匹配“命运糕手”。
+- 23:09私信任务API显示成功轮询、无阻断、无待处理任务；人格原文均8656字符，QQ实际注入8722、B站8840，预算10000。现有GUI刷新后新私信面板和两分钟补卡说明可见；截图保存在D:/ProgramData/DSH NEXT/Soul/surfcore-bili-integration-ui.png。
+- 真实QQ分享/B站结果私信未作为本轮测试自动执行，历史漏读请求未回放。
 
 ## 更新与回滚
 
-此次不修改 updates.js、apply-update.mjs 或更新策略。preserve-local 继续 fetch 后按固定的 fromHead/targetSha 合并，检查漂移/脏目录，创建备份引用并验证两侧祖先；未来真实语义冲突仍需人工解决。清单生成必须在干净的代码提交之后，且再次 --verify-ref HEAD。不得用ZIP覆盖或reset到远端来“保持同步”。
+此次不修改 updates.js、apply-update.mjs 或更新策略。23:11真实POST检查已完成远端fetch：SurfCore为latest/up-to-date，policy=preserve-local，branch=main，checkedWithFetch=true，behind=0、dirty=0；当时实现HEAD0efd84f比远端0ce8580多12个本地提交。后续仅追加验收文档和清单提交。preserve-local继续按固定的fromHead/targetSha合并，检查漂移/脏目录，创建备份引用并验证两侧祖先；未来真实语义冲突仍需人工解决。清单生成在干净代码提交之后，且再次--verify-ref HEAD。没有ZIP覆盖、reset、推送或改动远端配置。
 
 回滚先停止插件和桥接的相关入口并保存最新 dm-await-state、dm-tasks 与 bili-dm-share 回执。通过可审阅反向提交恢复代码、重生成清单、重新加载；不要回退旧水位或发送锁强制重试。备份只用于核对与受控恢复，不可自动覆盖更新后的用户状态。
 
