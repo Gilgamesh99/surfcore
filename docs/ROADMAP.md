@@ -1,5 +1,9 @@
 # 路线图与路线守则（ROADMAP）
 
+## 2026-11-13：补齐B站动态和转发原文阅读
+
+现有@收件箱只提供外层摘要，两个旧详情工具也只取desc；转发原文需读取orig，现代图文需features=itemOpusStyle及major.opus.summary。选择共享只读读取器，并让监听器将结果直接附入模型上下文，避免仅提示模型找工具却仍漏读。digest/read-dynamic/旧check入口统一解析、预算和错误；保留原回复坐标、额度、水位和人格逻辑。图片只提供链接，上游不完整摘要明确报出。根因、权衡、验证、失败路径及回滚见[case](cases/2026-11-13-bili-dynamic-reading.md)。当前为待集成代码，不改版本或发布路线。
+
 > 本文件是「做什么、按什么顺序做、什么时候该放弃」的唯一权威。**改路线先改这里**，再动代码。
 > 配套：开工动线见 [`../AGENTS.md`](../AGENTS.md)，踩坑见 [`PITFALLS.md`](PITFALLS.md)，交接见 [`HANDOFF.md`](HANDOFF.md)。
 

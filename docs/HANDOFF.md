@@ -1,5 +1,9 @@
 # 交接状态（HANDOFF）
 
+## 2026-11-13：B站@动态与转发原文阅读
+
+隔离分支feat/bili-dynamic-reading，基线f3fff44，工作目录D:/ProgramData/DSH NEXT/Soul/surfcore-bili-reading。补齐收到@→动态详情→orig→Opus正文→模型上下文；新增read-dynamic，原有查询与digest复用。截图对应真实动态已只读验收成功：外层@、原作者、完整公测公告和1张图片链接均取得；监听器离线用例验证正文实际进入排队prompt。reader20项、最终listener15项、真实CLI夹具和插件全套通过；audit完整运行159/161，剩余依赖补丁和性能两项分别复验通过。独立审查3项边界修复均有回归覆盖。完整测试结果、失败路径和发布交接见[case](cases/2026-11-13-bili-dynamic-reading.md)。当前仅代码分支，尚未部署到生产插件；无版本变更、对外发送或用户状态写入。
+
 ## 2026-11-13：整卡10000预算与请求去重
 
 独立工作树 D:/Project/surfcore-full-persona，基线1b50c65；现有角色原文保持。整卡绕开旧代行过滤及多处切片，QQ/B站每个模型步骤只保留当前卡，桌宠重新构造完整system；错误时明确停下。代码与专项验证见[case及发布交接](cases/2026-11-13-full-persona-requests.md)。已部署到生产main并经当前GUI、QQ真实prompt、B站构造器验收：同一proplus整卡8656字，预算10000，原文哈希不变，桥接连接恢复。专项/真实SDK15项、插件全套、超时夹具单独复跑通过；仅旧R11性能断言在基线和候选均失败。备份及全部证据见case；不改版本、不发布。

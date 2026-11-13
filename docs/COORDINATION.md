@@ -18,6 +18,7 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **B站转发原文阅读（2026-11-13）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-bili-reading` | `feat/bili-dynamic-reading`（基线 `f3fff44`；沙箱内独立 clone） | 动态只读查询、转发/Opus 解析、@ 唤醒上下文、离线与只读验收 | 代码与验收完成，待集成/重载；reader20、listener15、CLI与插件全套通过，audit159/161后两项复验通过；未部署、未发布、未对外发送 |
 | **完整人格与去重（2026-11-13）** | `D:/Project/surfcore-full-persona` | `fix/full-persona-10000`（基线 `1b50c65`；本机无 dev） | QQ/B站/桌宠整卡预算10000、每次模型请求人格去重、配置备份与本机验收；Lead 串行运行时变更 | 完成部署与真实页面/提示词验收；原文保持，预算10000；专项/插件通过，旧R11性能残余见case；未发布 |
 | **本机 main 整合（2026-11-12）** | `D:/Project/surfcore-main-integration` | `fix/local-main-integration-20261112` | 汇总现有 QQ/B站修复、测试/文档及保留本地提交的 Git 更新；Lead 串行生产整合 | 完成整合并加载：1357389 + 后续 UI 汇总/交接补丁；审计159/159、回归17/17、插件通过；四树备份、配置/水位保留，未发布 |
 | **QQ 受控生图（2026-11-12）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-qq-images` | `feat/qq-generated-images`（基线 `0ce8580`） | 三个图片工具、服务/发送/配置/UI、隔离测试与本机加载 | 完成：已合并加载并启用；审计 156/156，生产图片 82 通过/1 权限跳过、回归 17 通过，设置页已核验；不发布 |

@@ -156,12 +156,22 @@ try {
   patch(globalThis, 'fetch', async (input, init = {}) => {
     const url = new URL(String(input));
     if (!fixture || url.origin !== 'https://api.bilibili.com'
-      || !['/x/msgfeed/reply', '/x/msgfeed/at'].includes(url.pathname)
+      || !['/x/msgfeed/reply', '/x/msgfeed/at', '/x/web-interface/nav', '/x/polymer/web-dynamic/v1/detail'].includes(url.pathname)
       || (init.method ?? 'GET') !== 'GET' || init.body !== undefined) {
       return forbidden(`unexpected fetch: ${url.origin}${url.pathname}`);
     }
-    const kind = url.pathname.endsWith('/at') ? 'at' : 'reply';
     assert.equal(init.headers?.cookie, 'SESSDATA=OFFLINE_ONLY; bili_jct=OFFLINE_CSRF; buvid3=OFFLINE_DEVICE');
+    if (url.pathname === '/x/web-interface/nav') {
+      fixture.fetches.push('nav');
+      return { ok: true, status: 200, json: async () => ({ code: 0, data: { wbi_img: { img_url: 'https://i0.hdslb.com/bfs/wbi/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png', sub_url: 'https://i0.hdslb.com/bfs/wbi/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png' } } }) };
+    }
+    if (url.pathname.endsWith('/detail')) {
+      fixture.fetches.push('detail');
+      assert.equal(url.searchParams.get('features'), 'itemOpusStyle');
+      assert.equal(url.searchParams.get('id'), '1270031871116312601');
+      return { ok: true, status: 200, json: async () => fixture.dynamicResponse };
+    }
+    const kind = url.pathname.endsWith('/at') ? 'at' : 'reply';
     fixture.fetches.push(kind);
     return { json: async () => ({ code: 0, data: { items: structuredClone(fixture.feeds[kind]), cursor: '', last_view_at: fixture.initialCursor } }) };
   });
@@ -258,6 +268,57 @@ try {
     assert.match(text, /【有人找你】1 条新消息：Offline visitor（@）/);
     assert.deepEqual(f.inspections, ['offline-bili-listener']);
     assert.deepEqual(f.budgetCalls, ['bili', 'bili']);
+    assert.equal(f.cursor(), f.incomingTime);
+  });
+
+  for (const scenario of ['complete', 'blocked', 'partial']) await check(`forwarded original scenario ${scenario} reaches the actual queued model prompt with appropriate hints`, async () => {
+    const blocked = scenario === 'blocked';
+    const f = begin();
+    const notice = incomingAt(f.incomingTime);
+    notice.item = { ...notice.item, business_id: 17, subject_id: 1270031871116312601, uri: 'https://t.bilibili.com/1270031871116312601', source_content: '@Offline fixture' };
+    f.feeds.at.splice(0, f.feeds.at.length, notice);
+    fixture.dynamicResponse = blocked ? { code: -352, message: 'risk control' } : { code: 0, data: { item: {
+      id_str: '1270031871116312601', type: 'DYNAMIC_TYPE_FORWARD',
+      basic: { comment_id_str: '1270031871116312601', comment_type: 17 },
+      modules: { module_author: { name: 'Outer author' }, module_dynamic: { desc: { text: '@Offline fixture' } } },
+      orig: { id_str: '1262230883329376274', type: 'DYNAMIC_TYPE_DRAW', modules: {
+        module_author: { name: 'Original author' },
+        module_dynamic: { desc: null, major: { type: 'MAJOR_TYPE_OPUS', opus: { summary: { text: '公测正式定档 11月26日！', has_more: scenario === 'partial' }, pics: [{ url: 'https://i0.hdslb.com/bfs/new_dyn/offline.jpg' }] } } },
+      } },
+    } } };
+    await f.scheduler.listenTick();
+    assert.deepEqual(f.fetches, ['reply', 'at', 'nav', 'detail']);
+    assert.equal(f.prompts.length, 1);
+    const text = f.prompts[0].content.map((part) => part.text ?? '').join('\n');
+    if (blocked) {
+      assert.match(text, /352|风控/);
+      assert.match(text, /read-dynamic/);
+      assert.doesNotMatch(text, /公测正式定档/);
+    } else {
+      assert.match(text, /Original author/);
+      assert.match(text, /公测正式定档 11月26日/);
+      assert.match(text, /转发原文/);
+      assert.match(text, /1270031871116312601/);
+      if (scenario === 'partial') assert.match(text, /原文内容不完整/);
+    }
+    assert.match(text, /仅当本次输出长度或批量阅读预算截断时/);
+    assert.match(text, /不要立即重复请求/);
+    assert.match(text, /comment-digest --hours 24 --max-dynamics 0/);
+    assert.doesNotMatch(text, /缺失\/截断时先用/);
+    assert.equal(f.cursor(), f.incomingTime, 'failure is delivered visibly, not silently replayed forever');
+    assert.deepEqual(f.budgetCalls, ['bili', 'bili']);
+  });
+
+  for (const business of [11, 17]) await check(`dynamic type ${business} with no recoverable ID visibly reports unread original without guessing`, async () => {
+    const f = begin();
+    const notice = incomingAt(f.incomingTime);
+    notice.item = { ...notice.item, business_id: business, subject_id: business === 11 ? 54321 : 1270031871116312601, uri: '' };
+    f.feeds.at.splice(0, f.feeds.at.length, notice);
+    await f.scheduler.listenTick();
+    assert.deepEqual(f.fetches, ['reply', 'at']);
+    assert.equal(f.prompts.length, 1);
+    assert.match(f.prompts[0].content[0].text, /原文未读取/);
+    assert.match(f.prompts[0].content[0].text, /缺少可靠的链接或精确 ID/);
     assert.equal(f.cursor(), f.incomingTime);
   });
 
