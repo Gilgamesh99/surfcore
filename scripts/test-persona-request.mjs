@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { inspect } from 'node:util';
 import { installPersonaRequestHooks, PERSONA_START, PERSONA_END, PERSONA_SECTION, stripPersonaBlocks } from '../src/persona-request.js';
 
 const wrap = text => `${PERSONA_START}\n${text}\n${PERSONA_END}`;
@@ -67,7 +68,14 @@ function stream(ctx, options, terminal) {
   const run = index => index === listeners.length ? terminal() : listeners[index](options, () => run(index + 1));
   return run(0);
 }
-function registry(existing) { const ctx = scope(); ctx.agents = { list: () => existing }; return ctx; }
+const roots = new WeakMap();
+function registry(existing) {
+  const ctx = scope(); existing.forEach(agent => roots.set(agent, ctx));
+  ctx.agents = { list: () => existing };
+  const emit = ctx.emit;
+  ctx.emit = (event, data) => { if (event === 'agent/created') roots.set(data.agent, ctx); return emit(event, data); };
+  return ctx;
+}
 function systemNodes(agent) {
   return agent.session.surface.nodes.map(seq => ({ seq, event: agent.session.eventAt(seq) })).filter(node => node.event.type === 'system/message');
 }
@@ -88,7 +96,7 @@ function projectSystem(agent, rendered, startsSeries, inHistory = true) {
     if (text(nodes[0]) !== rendered) replaceSystem(agent, nodes[0].seq, rendered);
   } else if (text(latest) !== rendered) agent.session.append('system/message', { message: message('system', rendered) });
 }
-async function request(agent, { pending = [], extraSections = [], variables = {}, kind = 'enter', startsRequestSeries, inHistory = true, completePrompt } = {}) {
+async function request(agent, { pending = [], extraSections = [], variables = {}, kind = 'enter', startsRequestSeries, inHistory = true, completePrompt, verify = true } = {}) {
   const context = { agent, scope: agent };
   const sections = [ { name: 'host-safety', text: 'KEEP SYSTEM SAFETY' }, ...extraSections,
     ...[...agent.ctx.sections.values()].map(item => ({ name: item.name, text: typeof item.text === 'function' ? item.text(context) : item.text, interpolate: item.interpolate })) ];
@@ -103,7 +111,9 @@ async function request(agent, { pending = [], extraSections = [], variables = {}
   if (next.kind !== 'enter') return { decision: next, originalDecision: decision };
   projectSystem(agent, rendered, next.startsRequestSeries === true, inHistory);
   for (const item of next.messages) agent.session.append('user/message', item);
-  return { decision: next, rendered, assembled, messages: agent.session.surface.nodes.map(seq => (agent.session.eventAt(seq).type === 'user/message' ? agent.session.eventAt(seq).data : agent.session.eventAt(seq).data.message)).filter(Boolean) };
+  const messages = agent.session.surface.nodes.map(seq => (agent.session.eventAt(seq).type === 'user/message' ? agent.session.eventAt(seq).data : agent.session.eventAt(seq).data.message)).filter(Boolean);
+  if (verify) stream(roots.get(agent), freeze({ sessionId: agent.session.id, messages }), () => null);
+  return { decision: next, rendered, assembled, messages };
 }
 let passed = 0;
 async function test(name, run) { await run(); passed++; console.log(`PASS ${name}`); }
@@ -303,23 +313,163 @@ await test('complete override and duplicate final cards stop before provider dis
   const card = 'GUARDED{{literal}}';
   const api = installPersonaRequestHooks(ctx, { resolve: target => target.platform ? { platform: target.platform, text: card } : null });
   let dispatched = 0; const output = (async function* () {})(); const terminal = () => { dispatched++; return output; };
-  const overridden = await request(qq, { completePrompt: 'COMPLETE REPLACED ALL SECTIONS' });
+  const overridden = await request(qq, { completePrompt: 'COMPLETE REPLACED ALL SECTIONS', verify: false });
   const rejected = freeze({ sessionId: qq.session.id, messages: overridden.messages }); const before = JSON.stringify(rejected);
-  assert.throws(() => stream(ctx, rejected, terminal), /exactly once/);
+  assert.throws(() => stream(ctx, rejected, terminal), /缺少当前人格卡/);
+  assert.equal(api.getStatus().error.reason, 'missing');
   assert.equal(dispatched, 0); assert.equal(JSON.stringify(rejected), before);
   assert.equal(api.getStatus().error.code, 'PERSONA_REQUEST_INTEGRITY'); assert.ok(api.getStatus().error.hint);
   const valid = await request(qq); const accepted = freeze({ sessionId: qq.session.id, messages: valid.messages });
   assert.equal(stream(ctx, accepted, terminal), output); assert.equal(dispatched, 1);
-  const duplicate = freeze({ sessionId: qq.session.id, messages: [...valid.messages, message('user', wrap(card))] });
-  assert.throws(() => stream(ctx, duplicate, terminal), /exactly once/); assert.equal(dispatched, 1);
+  const duplicate = freeze({ sessionId: qq.session.id, messages: [...valid.messages, message('system', wrap(card))] });
+  assert.throws(() => stream(ctx, duplicate, terminal), /多份人格卡/);
+  assert.equal(api.getStatus().error.reason, 'duplicate'); assert.equal(dispatched, 1);
   const truncated = freeze({ sessionId: qq.session.id, messages: [message('system', wrap('GUARDED'))] });
-  assert.throws(() => stream(ctx, truncated, terminal), /exactly once/);
+  assert.throws(() => stream(ctx, truncated, terminal), /与当前角色不一致/);
+  assert.equal(api.getStatus().error.reason, 'mismatch');
+  const incomplete = freeze({ sessionId: qq.session.id, messages: [message('system', PERSONA_START + '\nCUT')] });
+  assert.throws(() => stream(ctx, incomplete, terminal), /人格区块不完整/);
+  assert.equal(api.getStatus().error.reason, 'incomplete');
+  assert.deepEqual(api.getStatus().error.counts, { systemBlocks: 0, matchingSystemBlocks: 0, systemStarts: 1, systemEnds: 0, directToolCopies: 0, ptcToolCopies: 0 });
   assert.equal(stream(ctx, freeze({ sessionId: plain.session.id, messages: [] }), terminal), output);
   assert.equal(stream(ctx, freeze({ sessionId: qq.session.id, purpose: 'compaction', messages: [] }), terminal), output);
   assert.equal(stream(ctx, freeze({ sessionId: 'unrelated', messages: [] }), terminal), output);
   const fresh = agent('qq-before-assembly', 'qq'); await ctx.emit('agent/created', { agent: fresh });
-  assert.throws(() => stream(ctx, freeze({ sessionId: fresh.session.id, messages: [] }), terminal), /exactly once/);
+  assert.throws(() => stream(ctx, freeze({ sessionId: fresh.session.id, messages: [] }), terminal), /缺少当前人格卡/);
   api.dispose(); assert.equal((ctx.listeners.get('llm/stream') ?? []).length, 0);
+});
+
+// Reproduce the old builder with synthetic data; no live card, token or session.
+const clipNotice = '\n…（素材过长，已省略中间部分）…\n';
+const clippedWake = () => {
+  const prefix = '【主动找主人 · 目的回合】\n现在是测试时间。\n\n【你的身份与记忆（背景）】\nKEEP ROLE\n【人格卡（你是这样的人）】\n';
+  const full = prefix + wrap('【身份底座】\nOLD-CLIPPED-CARD\n' + '旧'.repeat(10000))
+    + '\n【记忆卡】\n' + 'KEEP MATERIAL\n'.repeat(1300) + '\n【现在做】\nKEEP SEND RULES AND MEMO\n【待续】无';
+  return '【当前时间】2026-11-13 19:15 +08:00\n\n' + full.slice(0, 8800) + clipNotice + full.slice(-5600);
+};
+function appendCall(target, id, name) {
+  return target.session.append('assistant/message', { message: message('assistant', '', { content: [{ type: 'tool-call', id, name, arguments: {} }] }) });
+}
+function appendDispatch(target, { id = 'inner', parent = 'outer', root = parent, name = 'mcp__snowluma__qq_get_prompt', isError = false, startOnly = false } = {}) {
+  const data = { rootCallId: root, parentCallId: parent, subCallId: id, name, arguments: {} };
+  target.session.append('tool/ptc-dispatch-start', data, {});
+  if (!startOnly) target.session.append('tool/ptc-dispatch', { ...data, isError, content: [] }, {});
+}
+await test('clipped old purpose wakes recover historical and pending messages without losing the tail', async () => {
+  const qq = agent('qq-clipped-wake', 'qq'); const ctx = registry([qq]);
+  const api = installPersonaRequestHooks(ctx, { resolve: () => ({ platform: 'qq', text: 'CURRENT INTACT CARD' }) });
+  await request(qq);
+  const clipped = clippedWake();
+  assert.equal(occurrences(clipped, PERSONA_START), 1); assert.equal(occurrences(clipped, PERSONA_END), 0);
+  const original = message('user', clipped); const raw = qq.session.append('user/message', original);
+  const pending = message('user', clipped);
+  const result = await request(qq, { pending: [pending] });
+  const repaired = result.messages.filter(item => item.role === 'user');
+  assert.equal(repaired.length, 2);
+  const expected = clipped.slice(0, clipped.indexOf(PERSONA_START)) + clipped.slice(clipped.indexOf(clipNotice));
+  for (const item of repaired) assert.equal(texts([item]), expected);
+  assert.ok(texts(repaired).includes('KEEP SEND RULES AND MEMO'));
+  assert.equal(occurrences(texts(result.messages), 'CURRENT INTACT CARD'), 1);
+  assert.equal(qq.session.eventAt(raw.seq).data, original); assert.equal(texts([pending]), clipped);
+  assert.equal(result.decision.startsRequestSeries, true);
+  assert.equal(api.getStatus().revision, '20261113-persona-recovery'); assert.equal(api.getStatus().error, null);
+  api.dispose();
+});
+await test('marker discussion, unrelated tools and lookalike truncation notices remain data', async () => {
+  const qq = agent('qq-marker-discussion', 'qq'); const ctx = registry([qq]);
+  const api = installPersonaRequestHooks(ctx, { resolve: () => ({ platform: 'qq', text: 'CURRENT QUOTE SAFE' }) });
+  const quoted = [
+    message('user', 'Discuss ' + PERSONA_START + ' and ' + PERSONA_END + ' as delimiters.'),
+    message('user', 'Empty delimiter example:\n' + PERSONA_START + '\n' + PERSONA_END),
+    message('user', 'Not a generated wake ' + PERSONA_START + '\nquoted fragment' + clipNotice + 'KEEP TAIL'),
+    message('assistant', 'Example start marker: ' + PERSONA_START),
+    message('assistant', 'Example delimiters: ' + PERSONA_START + ' ... ' + PERSONA_END),
+    message('tool', JSON.stringify({ role: { hint: wrap('FOREIGN DATA') } }), { toolCallId: 'unknown' }),
+  ];
+  for (const item of quoted) qq.session.append(item.role === 'user' ? 'user/message' : item.role === 'tool' ? 'tool/result' : 'assistant/message', item.role === 'user' ? item : { message: item });
+  const result = await request(qq);
+  for (const item of quoted) assert.ok(result.messages.includes(item), 'quotations retain object identity');
+  api.dispose();
+});
+await test('code-mode output wrappers, escaped JSON and console logs clean before the final frozen request', async () => {
+  const old = 'OLD TOOL CARD\nEND';
+  const payload = { ok: true, role: { name: 'KEEP ROLE', hint: wrap(old) + '\nKEEP ADMIN' }, memory: { text: 'KEEP MEMORY' }, keep: [1, false, null], tools: ['qq_read'] };
+  const mcp = { content: [{ type: 'text', text: JSON.stringify(payload) }, { type: 'image', data: 'KEEP IMAGE BYTES' }], structuredContent: payload };
+  const variants = [
+    JSON.stringify(payload), JSON.stringify(mcp), JSON.stringify([{ result: { deeply: [payload] } }]),
+    JSON.stringify({ result: JSON.stringify(mcp) }), JSON.stringify(wrap(old) + '\nKEEP ADMIN'),
+    JSON.stringify(mcp).replaceAll('<', '\\u003c'),
+    inspect(mcp, { depth: 8, maxStringLength: 10000, colors: false }),
+    'KEEP LOG PREFIX\n' + JSON.stringify(payload) + '\nKEEP LOG SUFFIX\n' + JSON.stringify(mcp),
+  ];
+  for (const [index, text] of variants.entries()) {
+    const qq = agent('qq-code-' + index, 'qq'); const ctx = registry([qq]);
+    const api = installPersonaRequestHooks(ctx, { resolve: () => ({ platform: 'qq', text: 'CURRENT CODE CARD' }) });
+    await request(qq);
+    // Only the nested journal record is needed; the assistant call may be absent.
+    appendDispatch(qq);
+    const image = { type: 'image', data: 'KEEP BINARY', mimeType: 'image/png' };
+    const tool = message('tool', text, { toolCallId: 'outer', source: { kind: 'tool', callId: 'outer' }, content: [{ type: 'text', text }, image] });
+    const raw = qq.session.append('tool/result', { message: tool, durationMs: 17, custom: 'KEEP EVENT' });
+    const result = await request(qq); const rewritten = result.messages.find(item => item.role === 'tool');
+    assert.equal(occurrences(texts([rewritten]), PERSONA_START), 0, 'variant ' + index);
+    assert.ok(texts([rewritten]).includes('KEEP ADMIN'));
+    assert.equal(rewritten.id, tool.id); assert.equal(rewritten.toolCallId, 'outer'); assert.equal(rewritten.content[1], image);
+    assert.equal(qq.session.eventAt(raw.seq).data.message, tool);
+    if (index < 6) {
+      const normalized = value => {
+        if (typeof value === 'string') { try { return normalized(JSON.parse(value)); } catch { return stripPersonaBlocks(value); } }
+        if (Array.isArray(value)) return value.map(normalized);
+        return value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, child]) => [key, normalized(child)])) : value;
+      };
+      assert.deepEqual(normalized(JSON.parse(texts([rewritten]))), normalized(JSON.parse(text)), 'JSON values and non-persona fields survive');
+    }
+    assert.equal(result.decision.startsRequestSeries, true);
+    assert.equal(api.getStatus().lastUpdate.rewrittenMessages, 1);
+    const stable = await request(qq); assert.equal(stable.decision.startsRequestSeries, false);
+    api.dispose();
+  }
+});
+await test('raw journal provenance survives compaction and propagates to parent and root results', async () => {
+  const qq = agent('qq-ancestry', 'qq'); const ctx = registry([qq]);
+  const direct = appendCall(qq, 'direct', 'qq_get_prompt');
+  const outer = appendCall(qq, 'root', 'run_code');
+  appendDispatch(qq, { id: 'parent', parent: 'root', root: 'root', name: 'run_code', isError: true });
+  appendDispatch(qq, { id: 'leaf', parent: 'parent', root: 'root' });
+  for (const id of ['direct', 'parent', 'root']) qq.session.append('tool/result', { message: message('tool', JSON.stringify({ role: { hint: wrap('OLD ANCESTRY') }, keep: id }), { toolCallId: id }) });
+  qq.session.surface.nodes = qq.session.surface.nodes.filter(seq => seq !== direct.seq && seq !== outer.seq);
+  const api = installPersonaRequestHooks(ctx, { resolve: () => ({ platform: 'qq', text: 'ANCESTRY CURRENT' }) });
+  const result = await request(qq);
+  assert.ok(!texts(result.messages).includes('OLD ANCESTRY'));
+  assert.equal(api.getStatus().lastUpdate.rewrittenMessages, 3);
+  assert.equal(qq.session.eventAt(direct.seq).data.message.content[0].name, 'qq_get_prompt');
+  api.dispose();
+});
+await test('start-only, failed and unrelated child dispatches do not claim other tool data', async () => {
+  const qq = agent('qq-failed-dispatch', 'qq'); const ctx = registry([qq]);
+  const api = installPersonaRequestHooks(ctx, { resolve: () => ({ platform: 'qq', text: 'FAILED DISPATCH CURRENT' }) });
+  appendDispatch(qq, { id: 'start-child', parent: 'start', startOnly: true });
+  appendDispatch(qq, { id: 'error-child', parent: 'error', isError: true });
+  appendDispatch(qq, { id: 'other-child', parent: 'other', name: 'qq_read' });
+  const originals = ['start', 'error', 'other', 'no-provenance'].map(id => message('tool', JSON.stringify({ role: { hint: wrap('KEEP FOREIGN CARD') } }), { toolCallId: id }));
+  for (const original of originals) qq.session.append('tool/result', { message: original });
+  const result = await request(qq); for (const original of originals) assert.ok(result.messages.includes(original));
+  assert.equal(api.getStatus().lastUpdate.rewrittenMessages, 0); api.dispose();
+});
+await test('unrepaired known copies report direct or PTC counts without leaking persona text', async () => {
+  const qq = agent('qq-late-copy', 'qq'); const ctx = registry([qq]); const card = 'PRIVATE CARD SENTINEL';
+  const api = installPersonaRequestHooks(ctx, { resolve: () => ({ platform: 'qq', text: card }) });
+  const valid = await request(qq); appendCall(qq, 'late-direct', 'qq_get_prompt'); appendDispatch(qq, { parent: 'late-ptc' });
+  for (const [id, field] of [['late-direct', 'directToolCopies'], ['late-ptc', 'ptcToolCopies']]) {
+    const options = freeze({ sessionId: qq.session.id, messages: [...valid.messages, message('tool', JSON.stringify({ result: [{ role: { hint: wrap(card) } }] }), { toolCallId: id })] });
+    const before = JSON.stringify(options); let dispatched = false;
+    assert.throws(() => stream(ctx, options, () => { dispatched = true; }), /工具历史仍含重复人格卡/);
+    assert.equal(dispatched, false); assert.equal(JSON.stringify(options), before);
+    const error = api.getStatus().error; assert.equal(error.reason, 'history-copy'); assert.equal(error.counts[field], 1);
+    assert.equal(error.counts.matchingSystemBlocks, 1); assert.ok(error.hint);
+    assert.ok(!JSON.stringify(error).includes(card)); error.counts[field] = 99; assert.equal(api.getStatus().error.counts[field], 1);
+  }
+  api.dispose();
 });
 
 const sdkArg = process.argv.indexOf('--sdk-root');
@@ -370,19 +520,50 @@ if (sdkArg >= 0) await test('installed SDK scoped assembly and append-only surfa
     const head = target.session.surface.nodes[0];
     target.session.append('system/message', { message: llm.createSystemMessage(rendered) }, { surfaceOp: { op: 'replace', startSeq: head, endSeq: head }, sourceEventSeqs: [head] });
     await assemble(); decision = await step(); assert.equal(decision.startsRequestSeries, false);
-    card = 'SDK-CHANGED'; await assemble(); decision = await step(); assert.equal(decision.startsRequestSeries, true);
-    assert.ok(!texts(target.session.deriveMessages()).includes('SDK-LITERAL'));
-    const global = await pluginCtx.systemPrompt.assemble({}); assert.ok(!renderPrompt(global).includes(card));
     let dispatched = 0; const output = (async function* () {})();
     const runtime = { ctx: root, adapterStream: () => { dispatched++; return output; } };
-    const send = text => llm.LlmRuntime.prototype.streamWithRegistration.call(runtime, freeze({ sessionId: target.session.id, messages: [llm.createSystemMessage(text)] }));
+    const send = (messages = target.session.deriveMessages()) => llm.LlmRuntime.prototype.streamWithRegistration.call(runtime, freeze({ sessionId: target.session.id, messages }));
+    assert.equal(send(), output); assert.equal(dispatched, 1);
+    const ptcCall = llm.createAssistantMessage({ source: { provider: 'test', model: 'test' }, content: [{ type: 'tool-call', id: 'sdk-outer', name: 'run_code', arguments: {} }] });
+    target.session.append('assistant/message', { message: ptcCall }, { surfaceOp: 'append' });
+    appendDispatch(target, { id: 'sdk-inner', parent: 'sdk-outer' });
+    const payload = { role: { name: 'KEEP SDK ROLE', hint: wrap(card) + '\nKEEP SDK ADMIN' }, keep: { number: 42 } };
+    const envelope = { content: [{ type: 'text', text: JSON.stringify(payload) }], structuredContent: payload };
+    const wrapped = llm.createToolResultMessage({ callId: 'sdk-outer', isError: false, content: [
+      { type: 'text', text: JSON.stringify([{ result: envelope }]) },
+      { type: 'text', text: 'KEEP LOG\n' + inspect(envelope, { depth: 8 }) + '\nKEEP LOG TAIL' },
+    ] });
+    const wrappedRaw = target.session.append('tool/result', { message: wrapped, durationMs: 21 }, { surfaceOp: 'append' });
+    const clipped = llm.createUserMessage({ source: { kind: 'user', rpcId: 'offline-rpc' }, content: [{ type: 'text', text: clippedWake() }] });
+    const clippedRaw = target.session.append('user/message', clipped, { surfaceOp: 'append' });
+    await assemble(); decision = await step(); assert.equal(decision.startsRequestSeries, true);
+    assert.equal(api.getStatus().lastUpdate.rewrittenMessages, 2);
+    const actualMessages = target.session.deriveMessages();
+    assert.ok(!texts(actualMessages).includes('OLD-CLIPPED-CARD'));
+    assert.ok(texts(actualMessages).includes('KEEP SEND RULES AND MEMO'));
+    assert.equal(occurrences(texts(actualMessages), PERSONA_START), 1);
+    const actualTool = actualMessages.find(item => item.toolCallId === 'sdk-outer');
+    assert.equal(actualTool.id, wrapped.id);
+    assert.equal(JSON.parse(actualTool.content[0].text)[0].result.structuredContent.role.hint, '\nKEEP SDK ADMIN');
+    assert.deepEqual(target.session.eventAt(wrappedRaw.seq).data.message, wrapped);
+    assert.deepEqual(target.session.eventAt(clippedRaw.seq).data, clipped);
+    assert.equal(send(), output); assert.equal(dispatched, 2);
+    await assemble(); decision = await step(); assert.equal(decision.startsRequestSeries, false);
+    assert.equal(send(), output); assert.equal(dispatched, 3);
+    card = 'SDK-CHANGED'; const changed = renderPrompt(await assemble()); decision = await step(); assert.equal(decision.startsRequestSeries, true);
+    assert.ok(!texts(target.session.deriveMessages()).includes('SDK-LITERAL'));
+    const currentHead = target.session.surface.nodes[0];
+    target.session.append('system/message', { message: llm.createSystemMessage(changed) }, { surfaceOp: { op: 'replace', startSeq: currentHead, endSeq: currentHead }, sourceEventSeqs: [currentHead] });
+    const global = await pluginCtx.systemPrompt.assemble({}); assert.ok(!renderPrompt(global).includes(card));
+    assert.equal(send(), output); assert.equal(dispatched, 4);
     const removeComplete = target.ctx.systemPrompt.section({ name: 'complete-test', order: 0, complete: true, text: 'COMPLETE OVERRIDE' });
     try {
       const overridden = renderPrompt(await assemble()); assert.equal(overridden, 'COMPLETE OVERRIDE');
-      assert.throws(() => send(overridden), /exactly once/); assert.equal(dispatched, 0);
-      assert.equal(api.getStatus().error.code, 'PERSONA_REQUEST_INTEGRITY');
+      const badMessages = [llm.createSystemMessage(overridden), ...target.session.deriveMessages().filter(item => item.role !== 'system')];
+      assert.throws(() => send(badMessages), /缺少当前人格卡/); assert.equal(dispatched, 4);
+      assert.equal(api.getStatus().error.reason, 'missing');
     } finally { removeComplete(); }
-    assert.equal(send(renderPrompt(await assemble())), output); assert.equal(dispatched, 1);
+    await assemble(); assert.equal(send(), output); assert.equal(dispatched, 5);
     api.dispose();
     assert.ok(!(await assemble()).sections.some(section => section.name === PERSONA_SECTION));
   } finally { api.dispose(); await binding.dispose(); await hookFiber.dispose(); await promptFiber.dispose(); }

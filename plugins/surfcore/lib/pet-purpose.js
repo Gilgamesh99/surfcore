@@ -38,7 +38,7 @@ import {
   planNextFire,
   selectPurpose,
   summarizePurposeState,
-} from '../../../src/purpose-engine.js';
+} from '../../../src/purpose-engine.js?rev=20261113-persona-recovery';
 import { activeBiliDir, activeMemoryPaths } from '../../../src/character-persona.js';
 import { QQ_STATE_DIR } from './paths.js';
 import { readQqConfig, readUnified, writeJsonAtomic } from './store.js';

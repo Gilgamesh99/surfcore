@@ -106,7 +106,7 @@ import { fileStamp, isStale } from '../../../src/config-stamps.js';
 import { createContextTelemetry } from '../../../src/context-telemetry.js';
 import { createBillingService } from './billing.js';
 import { createPersonaClassifier } from './persona-classify.js';
-import { installPersonaRequestHooks } from '../../../src/persona-request.js?rev=20261113-full-persona';
+import { installPersonaRequestHooks } from '../../../src/persona-request.js?rev=20261113-persona-recovery';
 import { createPersonaResolver, currentPersonaSnapshot, stripLegacyPersonaText } from './persona-runtime.js';
 
 // 版本号只有一个来源：仓库根 package.json（与 plugins/surfcore/package.json 必须一致，

@@ -1,5 +1,9 @@
 # 踩坑档案（PITFALLS）
 
+## 2026-11-13：人格完整性不能只验证独立构造器
+
+目的唤醒在拼接完整卡后仍按整段头55%/尾35%截断，留下start而无end；旧守卫扫描所有消息导致QQ报错。应按结构保护人格和操作规约，只裁素材，并定界恢复旧生成残片。必须将真实完整历史经deriveMessages冻结送到最终模型边界，不能只测system或工具造型；PTC归属从成功dispatch及parent/root恢复，普通标记讨论不等于人格注入。详见[回归case](cases/2026-11-13-persona-request-recovery.md)。
+
 ## 2026-11-13：整卡模式仍截断，以及in-history重复人格
 
 full不是绕过所有预算的开关：B站原硬上限6000、QQ旧代行过滤、目的与桌宠的二次slice会继续删正文。整卡必须统一完整性验证，超限报错；split才裁剪。历史system最新文本相同时，宿主startsRequestSeries也不会自动清掉更早副本；每步需要清理明确归属的人格块，并保留工具配对和其他system内容。真实user/message的data本身是Message，和system/tool的data.message不同，mock必须覆盖真实信封。跨插件目录的共享模块需revision更新，否则热重载仍可能使用旧代码。完整路径、选择、错误与验证见[case](cases/2026-11-13-full-persona-requests.md)。

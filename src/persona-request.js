@@ -10,43 +10,53 @@ const digest = value => createHash('sha256').update(value).digest('hex');
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const textOf = message => (message?.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('');
 const isPromptTool = name => typeof name === 'string' && /(?:^|[._/:])qq_get_prompt$/.test(name);
+const isCardBlock = block => /^(?:\r?\n|\\+(?:r\\+)?n)/.test(block.slice(PERSONA_START.length))
+  && block.slice(PERSONA_START.length, -PERSONA_END.length).trim().length > 0;
 
 /** Remove only the plugin's explicitly bounded prompt fragments. */
 export function stripPersonaBlocks(text) {
-  return String(text).replace(OWNED_BLOCK, '').replace(LEGACY_QQ, '$1').replace(LEGACY_BILI, '');
+  return String(text).replace(OWNED_BLOCK, block => isCardBlock(block) ? '' : block).replace(LEGACY_QQ, '$1').replace(LEGACY_BILI, '');
 }
 
-function cleanPromptJSON(text, clean) {
+// Old purpose wakes sliced the whole prompt at 55% and kept a 35% tail.
+// Recover only that generated envelope, never an isolated marker in conversation.
+function stripClippedPurpose(text) {
+  const start = text.indexOf(PERSONA_START);
+  const notice = text.indexOf('\n…（素材过长，已省略中间部分）…\n', start);
+  const purpose = text.indexOf('【主动找主人 · 目的回合】\n');
+  const generated = purpose === 0 || purpose > 0 && purpose < 256 && text.startsWith('【当前时间】');
+  const background = text.indexOf('\n【你的身份与记忆（背景）】\n');
+  const tail = text.slice(notice);
+  if (!generated || background <= purpose || start <= background || notice <= start
+    || !tail.includes('\n【现在做】\n') || !tail.includes('\n【待续】')
+    || text.split(PERSONA_START).length !== 2 || text.includes(PERSONA_END)
+    || !text.slice(0, start).endsWith('【人格卡（你是这样的人）】\n')
+    || !text.slice(start + PERSONA_START.length).startsWith('\n【身份底座】')) return text;
+  return text.slice(0, start) + text.slice(notice);
+}
+
+// PTC returns arbitrary JSON wrappers/arrays, JSON inside strings, or console
+// logs. Decode before rewriting so escaped quotes and other JSON fields survive.
+// Called only for results positively attributed to qq_get_prompt by the journal.
+function transformPromptOutput(text, transform) {
   let parsed;
-  try { parsed = JSON.parse(text); } catch { return text; }
-  let changed = false;
-  function visit(value) {
-    if (!record(value)) return value;
-    let result = value;
-    const set = (key, next) => {
-      if (next === value[key]) return;
-      if (result === value) result = { ...value };
-      result[key] = next;
-      changed = true;
-    };
-    if (record(value.role) && typeof value.role.hint === 'string') {
-      const hint = clean(value.role.hint, 'role.hint');
-      if (hint !== value.role.hint) set('role', { ...value.role, hint });
+  try { parsed = JSON.parse(text); } catch { return transform(text, ''); }
+  function visit(value, field = '') {
+    if (typeof value === 'string') return field === 'role.hint'
+      ? transform(value, field) : transformPromptOutput(value, transform);
+    if (!record(value) && !Array.isArray(value)) return value;
+    let next = value;
+    for (const [key, child] of Object.entries(value)) {
+      const updated = visit(child, field === 'role' && key === 'hint' ? 'role.hint' : key);
+      if (updated === child) continue;
+      if (next === value) next = Array.isArray(value) ? [...value] : { ...value };
+      // Define an own property even for a JSON key named __proto__.
+      Object.defineProperty(next, key, { value: updated, enumerable: true, writable: true, configurable: true });
     }
-    // MCP envelopes can be nested. Do not walk arbitrary memory/chat fields.
-    for (const key of ['data', 'structuredContent']) if (record(value[key])) set(key, visit(value[key]));
-    if (Array.isArray(value.content)) {
-      const content = value.content.map(block => {
-        if (block?.type !== 'text' || typeof block.text !== 'string') return block;
-        const next = cleanPromptJSON(block.text, clean);
-        return next === block.text ? block : { ...block, text: next };
-      });
-      if (content.some((block, index) => block !== value.content[index])) set('content', content);
-    }
-    return result;
+    return next;
   }
   const next = visit(parsed);
-  return changed ? JSON.stringify(next) : text;
+  return next === parsed ? text : JSON.stringify(next);
 }
 
 /**
@@ -70,19 +80,21 @@ export function installPersonaRequestHooks(ctx, { resolve, stripLegacyText, onUp
   const agents = new Map();
   const disposers = [];
   let disposed = false;
-  const status = { active: true, attachedAgents: 0, requests: 0, rewrites: 0, lastUpdate: null, error: null };
+  const status = { revision: '20261113-persona-recovery', active: true, attachedAgents: 0, requests: 0, rewrites: 0, lastUpdate: null, error: null };
   function getStatus() {
-    return { ...status, lastUpdate: status.lastUpdate && { ...status.lastUpdate }, error: status.error && { ...status.error } };
+    return { ...status, lastUpdate: status.lastUpdate && { ...status.lastUpdate },
+      error: status.error && { ...status.error, ...(status.error.counts ? { counts: { ...status.error.counts } } : {}) } };
   }
   function report() {
     try { onUpdate?.(getStatus()); } catch { /* A status observer cannot alter a request. */ }
   }
-  function failed(agent, error, integrity = false) {
+  function failed(agent, error, integrity = null) {
     status.error = {
       ok: false, code: integrity ? 'PERSONA_REQUEST_INTEGRITY' : 'PERSONA_REQUEST_FAILED',
       error: '当前人格无法安全加入模型请求，本次请求已停止。',
-      hint: integrity ? '请检查会话的完整提示词（complete）与 section 过滤设置，恢复单份人格后重试。' : '请检查人格卡长度和平台设置；修正后重试本轮。',
+      hint: '请检查人格卡长度和平台设置；修正后重试本轮。',
       agentId: String(agent.id ?? ''),
+      ...integrity,
     };
     report();
     throw error;
@@ -93,7 +105,7 @@ export function installPersonaRequestHooks(ctx, { resolve, stripLegacyText, onUp
     if (typeof scope?.systemPrompt?.section !== 'function' || typeof scope?.on !== 'function') {
       failed(agent, new TypeError('agent-scoped systemPrompt.section and context events are required'));
     }
-    const state = { persona: null, owned: false, resolved: false, sectionResolved: false, assembled: false, assemblyKey: null, lastKey: null, calls: new Map(), cursor: 0, disposers: [] };
+    const state = { persona: null, owned: false, resolved: false, sectionResolved: false, assembled: false, assemblyKey: null, lastKey: null, calls: new Map(), parents: new Map(), cursor: 0, disposers: [] };
     function resolvePersona() {
       try {
         const persona = resolve(agent);
@@ -113,22 +125,23 @@ export function installPersonaRequestHooks(ctx, { resolve, stripLegacyText, onUp
     }
     state.resolvePersona = resolvePersona;
     const clean = (text, role, toolName = '', field = '') => {
-      let next = stripPersonaBlocks(text);
+      let next = stripPersonaBlocks(role === 'user' ? stripClippedPurpose(text) : text);
       if (stripLegacyText) {
         next = stripLegacyText(next, { agent, role, toolName, persona: state.persona, field });
         if (typeof next !== 'string') throw new TypeError('stripLegacyText must return a string');
       }
       return next;
     };
-    const rewriteMessage = (message, toolName = '') => {
+    const rewriteMessage = (message, source = state.calls.get(message?.toolCallId ?? message?.source?.callId)) => {
       if (!message || !Array.isArray(message.content)) return message;
       if (!['system', 'user', 'tool'].includes(message.role)) return message;
-      if (message.role === 'tool' && !isPromptTool(toolName)) return message;
+      if (message.role === 'tool' && !source) return message;
       let changed = false;
       const content = message.content.map(block => {
         if (block.type !== 'text' || typeof block.text !== 'string') return block;
         const text = message.role === 'tool'
-          ? cleanPromptJSON(block.text, (hint, field) => clean(hint, 'tool', toolName, field))
+          ? transformPromptOutput(block.text, (text, field) => field === 'role.hint'
+            ? clean(text, 'tool', source.name, field) : stripPersonaBlocks(text))
           : clean(block.text, message.role);
         if (text === block.text) return block;
         changed = true;
@@ -137,26 +150,45 @@ export function installPersonaRequestHooks(ctx, { resolve, stripLegacyText, onUp
       return changed ? { ...message, content } : message;
     };
     const rememberCalls = event => {
-      const message = event?.data?.message;
+      const data = event?.data;
+      if (event?.type === 'tool/ptc-dispatch' || event?.type === 'tool/ptc-dispatch-start') {
+        if (typeof data?.subCallId !== 'string') return;
+        state.parents.set(data.subCallId, [data.parentCallId, data.rootCallId].filter(id => typeof id === 'string' && id !== data.subCallId));
+        // A start or failed dispatch proves no returned persona. Successful nested
+        // output can survive even when a later statement makes its parent fail.
+        if (event.type === 'tool/ptc-dispatch' && data.isError === false && isPromptTool(data.name)) {
+          state.calls.set(data.subCallId, { name: data.name, kind: 'ptc' });
+        }
+      }
+      const message = data?.message;
       if (message?.role !== 'assistant') return;
       for (const block of message.content ?? []) {
-        if (block.type === 'tool-call' && typeof block.id === 'string' && isPromptTool(block.name)) state.calls.set(block.id, block.name);
+        if (block.type === 'tool-call' && typeof block.id === 'string' && isPromptTool(block.name)) {
+          state.calls.set(block.id, { name: block.name, kind: 'direct' });
+        }
       }
     };
+    function refreshCalls(nodes = []) {
+      // Raw events retain provenance even when compaction hides the assistant call.
+      if (typeof agent.session?.snapshotEvents === 'function') {
+        for (const event of agent.session.snapshotEvents(state.cursor)) {
+          rememberCalls(event);
+          if (Number.isInteger(event.seq)) state.cursor = Math.max(state.cursor, event.seq + 1);
+        }
+      } else nodes.forEach(({ event }) => rememberCalls(event));
+      // Map iteration visits inserted ancestors; has() also terminates cycles.
+      for (const [id, source] of state.calls) for (const parent of state.parents.get(id) ?? []) {
+        if (!state.calls.has(parent)) state.calls.set(parent, { ...source, kind: 'ptc' });
+      }
+    }
+    state.refreshCalls = refreshCalls;
     function cleanHistory() {
       const session = agent.session;
       if (typeof session?.eventAt !== 'function' || typeof session?.append !== 'function' || !Array.isArray(session?.surface?.nodes)) {
         throw new TypeError('persona hooks require the public session surface replacement API');
       }
       const nodes = session.surface.nodes.map(seq => ({ seq, event: session.eventAt(seq) }));
-      // A call can have moved out of the visible surface; its append-only event
-      // still identifies the exact qq_get_prompt result without guessing by JSON.
-      if (typeof session.snapshotEvents === 'function') {
-        for (const event of session.snapshotEvents(state.cursor)) {
-          rememberCalls(event);
-          if (Number.isInteger(event.seq)) state.cursor = Math.max(state.cursor, event.seq + 1);
-        }
-      } else nodes.forEach(({ event }) => rememberCalls(event));
+      refreshCalls(nodes);
       const systems = nodes.filter(({ event }) => event?.type === 'system/message');
       const latestSystem = systems.findLast(({ event }) => textOf(event.data.message) !== '')?.seq;
       let rewritten = 0;
@@ -167,8 +199,7 @@ export function installPersonaRequestHooks(ctx, { resolve, stripLegacyText, onUp
           const blocks = textOf(message).match(OWNED_BLOCK) ?? [];
           if (blocks.length === 1 && blocks[0] === state.persona.wrapped) continue;
         }
-        const callId = message?.toolCallId ?? message?.source?.callId;
-        const next = rewriteMessage(message, state.calls.get(callId) ?? '');
+        const next = rewriteMessage(message);
         if (next === message) continue;
         const data = event.type === 'user/message' ? next : { ...event.data, message: next };
         session.append(event.type, data, {
@@ -268,16 +299,38 @@ export function installPersonaRequestHooks(ctx, { resolve, stripLegacyText, onUp
     const [agent, state] = entry;
     if (!state.resolved) state.resolvePersona();
     if (!state.persona) return next();
-    try {
-      const messages = options.messages ?? [];
-      const system = [options.system ?? '', ...messages.filter(message => message.role === 'system').map(textOf)];
-      const blocks = system.flatMap(text => text.match(OWNED_BLOCK) ?? []);
-      const allText = [options.system ?? '', ...messages.map(textOf)].join('\n');
-      if (blocks.length !== 1 || blocks[0] !== state.persona.wrapped
-        || allText.split(PERSONA_START).length !== 2 || allText.split(PERSONA_END).length !== 2) {
-        throw new Error('current persona must appear exactly once in the final model request');
+    state.refreshCalls();
+    const messages = options.messages ?? [];
+    const system = [options.system ?? '', ...messages.filter(message => message.role === 'system').map(textOf)].join('\n');
+    const blocks = system.match(OWNED_BLOCK) ?? [];
+    const counts = { systemBlocks: blocks.length, matchingSystemBlocks: blocks.filter(block => block === state.persona.wrapped).length,
+      systemStarts: system.split(PERSONA_START).length - 1, systemEnds: system.split(PERSONA_END).length - 1, directToolCopies: 0, ptcToolCopies: 0 };
+    for (const message of messages) {
+      const source = state.calls.get(message.toolCallId ?? message.source?.callId);
+      if (message.role !== 'tool' || !source) continue;
+      for (const block of message.content ?? []) if (block.type === 'text') {
+        transformPromptOutput(block.text, text => {
+          counts[source.kind === 'ptc' ? 'ptcToolCopies' : 'directToolCopies'] += (text.match(OWNED_BLOCK) ?? []).filter(isCardBlock).length;
+          return text;
+        });
       }
-    } catch (error) { return failed(agent, error, true); }
+    }
+    // Conversation quotations and unowned tools are data, not prompt injections.
+    const reason = counts.systemBlocks > 1 ? 'duplicate'
+      : counts.systemStarts !== counts.systemBlocks || counts.systemEnds !== counts.systemBlocks ? 'incomplete'
+      : counts.systemBlocks === 0 ? 'missing'
+      : counts.matchingSystemBlocks !== 1 ? 'mismatch'
+      : counts.directToolCopies + counts.ptcToolCopies > 0 ? 'history-copy' : null;
+    if (reason) {
+      const [error, hint] = {
+        missing: ['模型请求缺少当前人格卡，本次请求已停止。', '请检查人格注入是否被完整提示词覆盖；恢复后重试本轮。'],
+        incomplete: ['模型请求中的人格区块不完整，本次请求已停止。', '请检查系统提示词的裁剪与拼接；恢复完整人格后重试本轮。'],
+        mismatch: ['模型请求中的人格卡与当前角色不一致，本次请求已停止。', '请刷新当前角色的人格注入后重试本轮。'],
+        duplicate: ['模型请求的系统提示词含多份人格卡，本次请求已停止。', '请清除重复的人格注入后重试本轮。'],
+        'history-copy': ['工具历史仍含重复人格卡，本次请求已停止。', '请检查工具结果的人格去重是否生效，再重试本轮。'],
+      }[reason];
+      return failed(agent, new Error(`${error} ${hint}`), { reason, counts, error, hint });
+    }
     return next();
   }
   try {
