@@ -281,7 +281,7 @@ export function createPetPurposeService({ chat, tokenBudget = null, pluginLog = 
     ];
     if (role.persona) {
       systemLines.push('【人格卡（你就是这个人）】');
-      systemLines.push(sliceHead(role.persona, 4200));
+      systemLines.push(role.persona);
       systemLines.push('');
     }
     if (memory) {

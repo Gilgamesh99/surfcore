@@ -34,6 +34,8 @@ const { apply } = await import('../lib/index.js');
 const routes = [];
 const effects = [];
 const ctx = {
+  agents: { list: () => [] },
+  on() { return () => {}; },
   webServer: { register(route) { routes.push(route); return () => {}; } },
   get(name) {
     if (name === 'connection') return { requestRejection: () => false };

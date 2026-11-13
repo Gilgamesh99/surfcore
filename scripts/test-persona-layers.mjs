@@ -81,7 +81,7 @@ assert.ok(duplicateToneMode.text.includes('同一段正文'), 'tone 模式仍要
 
 // 目的/主动搭话路径也必须带 tone，不能只读 core。
 const bridgeSource = fs.readFileSync('src/bridge.js', 'utf8');
-assert.match(bridgeSource, /function purposePersonaText\(\)[\s\S]*?readPersonaLayerText\('tone'\)/, 'purposePersonaText 没接语气层');
+assert.ok(/function purposePersonaText\(key = ''\)[\s\S]*?roleHintForMode\('v2', key, '', \{ personaOnly: true \}\)/.test(bridgeSource), '目的机制必须复用同一套 full/split 人格入口');
 
 // 回归（2026-10-31）：没拆分的旧角色 + 身份底座 → tone 模式也必须带上核心人设。
 const unsplitCompose = composePersonaLayers({

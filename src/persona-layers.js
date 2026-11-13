@@ -19,6 +19,12 @@
  */
 import { selectRoleText } from './role-card.js';
 
+export const FULL_PERSONA_MAX_CHARS = 10000;
+export function wrapPersonaBlock(text) {
+  const body = String(text ?? '').trim();
+  return body ? `<!-- surfcore-persona:start -->\n${body}\n<!-- surfcore-persona:end -->` : '';
+}
+
 export const PERSONA_SCENES = Object.freeze(['qq-group', 'qq-private', 'bili', 'pet']);
 
 export const PERSONA_SCENE_LABELS = Object.freeze({
@@ -51,14 +57,24 @@ function section(id, label, text) {
  * @param {string} [opts.identity] 身份底座（无论 tone/full 都带：我是谁、主人是谁）
  * @param {'full'|'tone'} [opts.personaMode] full=核心+语气+场景+日常；tone=语气+场景+日常
  * @param {'v1'|'v2'} [opts.mode] 仿真模式；每层分别过滤 〔一代〕/〔二代〕小节
+ * @param {boolean} [opts.verbatimCore] 整卡模式保留原文，不按一代/二代规则筛选或重排
  * @param {number} [opts.maxChars] 总预算；<=0 不限
  * @param {string} [opts.sceneId] 场景 ID（用于标题）
  */
 export function composePersonaLayers({
-  core = '', scene = '', daily = '', tone = '', identity = '', personaMode = 'full', mode = 'v2', maxChars = 6000, sceneId = '',
+  core = '', scene = '', daily = '', tone = '', identity = '', personaMode = 'full', mode = 'v2', maxChars = 6000, sceneId = '', verbatimCore = false,
 } = {}) {
   const budget = Math.max(0, Math.round(Number(maxChars) || 0));
-  const coreText = selectRoleText(core, mode);
+  const coreText = verbatimCore ? String(core ?? '').trim() : selectRoleText(core, mode);
+  // 整卡预算只计算卡片正文；身份/平台包装不挤掉末尾。超限明确报错，禁止静默丢字。
+  if (verbatimCore) {
+    if (budget > 0 && coreText.length > budget) {
+      throw new RangeError(`整张人格卡 ${coreText.length} 字符，超过配置预算 ${budget}；请提高预算或调整卡片。`);
+    }
+    const identityText = String(identity ?? '').trim();
+    const text = [identityText ? `【身份底座】\n${identityText}` : '', coreText].filter(Boolean).join('\n\n');
+    return { text, chars: text.length, layers: { identity: identityText.length, core: coreText.length, tone: 0, scene: 0, daily: 0 }, omitted: [], truncated: false, sceneId: sceneId || '' };
+  }
   const toneText = selectRoleText(tone, mode);
   const sceneText = selectRoleText(scene, mode);
   const dailyText = selectRoleText(daily, mode);

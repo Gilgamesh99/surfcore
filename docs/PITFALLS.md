@@ -1,5 +1,9 @@
 # 踩坑档案（PITFALLS）
 
+## 2026-11-13：整卡模式仍截断，以及in-history重复人格
+
+full不是绕过所有预算的开关：B站原硬上限6000、QQ旧代行过滤、目的与桌宠的二次slice会继续删正文。整卡必须统一完整性验证，超限报错；split才裁剪。历史system最新文本相同时，宿主startsRequestSeries也不会自动清掉更早副本；每步需要清理明确归属的人格块，并保留工具配对和其他system内容。真实user/message的data本身是Message，和system/tool的data.message不同，mock必须覆盖真实信封。跨插件目录的共享模块需revision更新，否则热重载仍可能使用旧代码。完整路径、选择、错误与验证见[case](cases/2026-11-13-full-persona-requests.md)。
+
 ## 2026-11-12：本地提交与远端更新不是二选一
 
 更新顶部的 pendingCount 是“待提醒数”，不能代表没有更新；受阻/失败/暂缓提醒必须从完整 results 展示。ahead 表示本地提交，不能按版本号或脏文件一律处理。只提交改动仍无法越过未来分叉的 ff-only；SurfCore 采用保留本地历史的普通合并，冲突就停止并恢复，其他组件默认仍只快进。Git 目标必须是检查时的固定 SHA，排队要记录 fromHead/分支/仓库身份，退出后再次核对；不能把 SHA 当 package version。fetch 失败不得使用缓存远端宣称“已是最新”。Git 更新不能使用 ZIP 文件覆盖式回滚。

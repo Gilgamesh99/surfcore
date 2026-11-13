@@ -17,6 +17,15 @@ if (process.platform !== 'win32') {
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'surfcore-pet-install-'));
 const stateDir = path.join(base, 'state');
 const appDir = path.join(base, 'app');
+async function waitInstall(pet) {
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const state = pet.status().installing;
+    if (state?.phase === '完成' || state?.phase === '失败') return state;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail('桌宠安装在 30 秒内没有进入完成/失败状态');
+}
 let failures = 0;
 const ok = (cond, label, extra = '') => {
   if (cond) console.log(`✅ ${label}`);
@@ -47,7 +56,7 @@ try {
   });
   fs.writeFileSync(path.join(stateDir, 'pet', 'config.json'), JSON.stringify({ appDir, source: wrappedZip, electronPath: '' }));
   const r1 = await pet.startInstall(wrappedZip);
-  await new Promise((r) => setTimeout(r, 2500));
+  await waitInstall(pet);
   const pkg = fs.existsSync(path.join(appDir, 'package.json'))
     ? JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf8')) : null;
   ok(r1.ok === true, '源码风格 zip：安装流程启动');
@@ -60,7 +69,7 @@ try {
     fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify({ name: 'surfcore', version: '0.6.16' }));
   });
   await pet.startInstall(coreZip);
-  await new Promise((r) => setTimeout(r, 2500));
+  await waitInstall(pet);
   const st2 = pet.status();
   ok(st2.installing?.phase === '失败', 'SurfCore 源码包：判为失败', JSON.stringify(st2.installing));
   ok(/SurfCore 的源码包/.test(String(st2.installing?.error ?? '')), '错误文案说明"这是源码包"', String(st2.installing?.error ?? ''));
@@ -72,7 +81,7 @@ try {
     fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify({ name: 'something-else', version: '1.0.0' }));
   });
   await pet.startInstall(junkZip);
-  await new Promise((r) => setTimeout(r, 2500));
+  await waitInstall(pet);
   const st3 = pet.status();
   ok(st3.installing?.phase === '失败', '任意非桌宠 zip：判为失败');
   ok(/不是桌宠安装包|没有桌宠程序|pet-pack/.test(String(st3.installing?.error ?? '')), '错误文案指出不是 pet-pack', String(st3.installing?.error ?? ''));

@@ -106,6 +106,8 @@ import { fileStamp, isStale } from '../../../src/config-stamps.js';
 import { createContextTelemetry } from '../../../src/context-telemetry.js';
 import { createBillingService } from './billing.js';
 import { createPersonaClassifier } from './persona-classify.js';
+import { installPersonaRequestHooks } from '../../../src/persona-request.js?rev=20261113-full-persona';
+import { createPersonaResolver, currentPersonaSnapshot, stripLegacyPersonaText } from './persona-runtime.js';
 
 // 版本号只有一个来源：仓库根 package.json（与 plugins/surfcore/package.json 必须一致，
 // 由 scripts/version.mjs check 与 test-version.mjs 把关）。
@@ -186,7 +188,7 @@ function QQ_STATE_DIR() {
 }
 
 export const name = 'surfcore';
-export const inject = ['webServer', 'connection', 'sessionController'];
+export const inject = ['webServer', 'connection', 'sessionController', 'agents', 'systemPrompt'];
 
 export function apply(ctx) {
   ensureDirs();
@@ -237,6 +239,11 @@ export function apply(ctx) {
     getQqConfig: () => readQqConfig().config,
     log: (message) => pluginLog(message),
   });
+  const personaRuntime = installPersonaRequestHooks(ctx, {
+    resolve: createPersonaResolver(ctx),
+    stripLegacyText: stripLegacyPersonaText,
+  });
+
   // 闸门事件中心：桥接负责写，插件负责展示/确认；同一份文件、同一套分级。
   const gateEvents = createGateEventStore({ dir: STATE_DIR, log: (message) => pluginLog(message) });
   // ── 桌宠（独立栏目，默认不安装；用户自己安装才生效）────────────────────
@@ -4167,6 +4174,20 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { ${writeOut('$
     if (pathname === `${API_PREFIX}/overview`) { json(res, 200, await overview()); return; }
     if (pathname === `${API_PREFIX}/config`) { await handleConfig(req, res); return; }
     if (pathname === `${API_PREFIX}/characters`) { await handleCharacters(req, res, url); return; }
+    if (pathname === `${API_PREFIX}/persona/runtime`) {
+      if (req.method !== 'GET') { json(res, 405, { ok: false, code: 'PERSONA_RUNTIME_METHOD', error: '仅支持读取人格运行状态', hint: '刷新人格页重新读取状态' }); return; }
+      const platforms = {};
+      for (const platform of ['qq', 'bili']) {
+        try {
+          const snapshot = currentPersonaSnapshot(platform);
+          if (!snapshot) { platforms[platform] = { enabled: false }; continue; }
+          const { text, ...summary } = snapshot;
+          platforms[platform] = { enabled: true, ...summary, injectedChars: text.length };
+        } catch (error) { platforms[platform] = { enabled: true, code: 'PERSONA_LOAD_FAILED', error: String(error?.message ?? error), hint: '检查当前角色的人格卡和全部参数中的人格预算；QQ 使用 role.maxInjectChars，B站使用 persona.compactChars（最高 10000）。保存后重新读取。' }; }
+      }
+      json(res, 200, { ok: true, runtime: personaRuntime.getStatus(), platforms });
+      return;
+    }
     if (pathname === `${API_PREFIX}/persona`) { await handlePersona(req, res); return; }
     if (pathname === `${API_PREFIX}/limit-mute`) { await handleLimitMute(req, res); return; }
     if (pathname === `${API_PREFIX}/persona/classify`) { await handlePersonaClassify(req, res); return; }
@@ -4362,6 +4383,7 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { ${writeOut('$
     try { sessionEventOff?.(); } catch {}
     try { billing.dispose(); } catch {}
     try { tokenBudget.dispose(); } catch {}
+    try { personaRuntime.dispose(); } catch {}
     try { memoryCardTimer?.stop?.(); } catch {}
     try { vectorMemoryTimer?.stop?.(); } catch {}
     try { closeAllQrLogins(); } catch {}

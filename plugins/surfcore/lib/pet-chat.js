@@ -25,7 +25,7 @@ import { resolvePersonaFile } from './persona.js';
 import { memoryCardPromptBlock } from './memory-card.js';
 import { activeMemoryPaths, readCurrentCharacter, readPersonaLayerText } from '../../../src/character-persona.js';
 import { buildPersonaIdentity, personaNameFromCard } from '../../../src/persona-identity.js';
-import { composePersonaLayers } from '../../../src/persona-layers.js';
+import { composePersonaLayers, FULL_PERSONA_MAX_CHARS } from '../../../src/persona-layers.js?rev=20261113-full-persona';
 import { adminFromSources } from '../../../src/admin-identity.js';
 import { appendMemoryInboxEvent } from '../../../src/memory-card.js?rev=20261025-pet-memory2';
 import { synthesizeToFile, wavDurationMs } from '../../../src/voice-tts.js';
@@ -267,6 +267,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     const fullPersona = split ? personaCore : (readPersonaLayerText('full') || personaCore);
     const persona = composePersonaLayers({
       core: fullPersona,
+      verbatimCore: !split,
       // 身份底座：桌宠也要知道“我是谁、主人是谁”，不依赖用户是否拆分人格。
       identity: buildPersonaIdentity({ name: personaNameFromCard(fullPersona, cur?.name || '这个角色'), owner: ownerInfo().name }),
       // 拆分模式才带语气/场景/日常；整卡模式只注入整卡。
@@ -275,7 +276,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
       daily: split ? readPersonaLayerText('daily') : '',
       personaMode: split ? 'tone' : 'full',
       mode: 'v2',
-      maxChars: 4200,
+      maxChars: split ? 4200 : FULL_PERSONA_MAX_CHARS,
       sceneId: 'pet',
     }).text || fullPersona;
     let name = String(cur?.name || '').trim();
@@ -696,7 +697,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     lines.push('');
     if (role.persona) {
       lines.push('【人格卡（你就是这个人）】');
-      lines.push(sliceHead(role.persona, 4200));
+      lines.push(role.persona);
       lines.push('');
     }
     if (memory) {
@@ -756,17 +757,16 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
 
     inFlight += 1;
     const startedAt = Date.now();
-    const history = readHistory();
-    const role = roleInfo();
-    const owner = ownerInfo();
-    const system = buildChatSystemPrompt({ role, owner, memory: memoryBlock(), purpose: purposeBackground(), modality: mode });
-    const user = [
-      history.messages.length ? '【最近聊天】' : '',
-      history.messages.length ? formatHistory(history, s.chat.historyTurns, say, owner.name) : say,
-      history.messages.length ? '' : `（${owner.name}在桌面上对你说）${say}`,
-    ].filter(Boolean).join('\n');
-
     try {
+      const history = readHistory();
+      const role = roleInfo();
+      const owner = ownerInfo();
+      const system = buildChatSystemPrompt({ role, owner, memory: memoryBlock(), purpose: purposeBackground(), modality: mode });
+      const user = [
+        history.messages.length ? '【最近聊天】' : '',
+        history.messages.length ? formatHistory(history, s.chat.historyTurns, say, owner.name) : say,
+        history.messages.length ? '' : `（${owner.name}在桌面上对你说）${say}`,
+      ].filter(Boolean).join('\n');
       const result = await complete({
         system,
         user,

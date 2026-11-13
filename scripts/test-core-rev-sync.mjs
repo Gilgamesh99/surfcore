@@ -9,8 +9,8 @@
 //      （记忆卡的默认值/缓存分裂，现象是"有时生效有时不生效"，极难查）。
 //   2. **漏挂后缀**：某个文件用裸 `'../../../src/memory-card.js'` → 同上，两份状态。
 //
-// 注意：`?rev=` 只挂在 `src/memory-card.js` 上，是历史遗留的局部绕法，**不是通用机制**。
-// 改其它 `src/*.js` 后仍然是"热重载不生效，要重启 DSH"——本测试会把清单打出来提醒。
+// 按模块核对 rev：人格与记忆模块可以各自升级，但同一个模块的引用必须一致。
+// 未挂 rev 的核心模块修改后仍需要重启 DSH；下面只打印真正没有版本标识的模块。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,7 +71,11 @@ console.log(`## 1. 插件引用的核心模块（共 ${coreImports.length} 条�
 
 console.log('## 2. 同一核心模块的 ?rev= 必须完全一致');
 {
-  ok(revs.size <= 1, `?rev= 取值只有一种（实际 ${revs.size} 种：${[...revs.keys()].join(' | ') || '无'}）`);
+  const names = [...new Set(coreImports.filter((item) => item.rev).map((item) => item.name))];
+  for (const name of names) {
+    const versions = new Set(coreImports.filter((item) => item.name === name).map((item) => item.rev));
+    ok(versions.size === 1, name + ' 的缓存标识一致（含裸引用检查）');
+  }
   for (const [rev, where] of revs) {
     console.log(`   rev=${rev} → ${where.join(', ')}`);
   }
@@ -86,7 +90,7 @@ console.log('## 3. 不允许「同一个核心模块，一处挂 rev、一处裸
 
 console.log('## 4. 提醒：其它核心模块改完后热重载不会生效');
 {
-  const others = [...new Set(coreImports.map((i) => i.name))].filter((n) => n !== 'memory-card.js');
+  const others = [...new Set(coreImports.filter((i) => !i.rev).map((i) => i.name))];
   console.log(`   未挂 ?rev= 的核心模块（改它们必须重启 DSH，热重载会继续用旧代码）：\n     ${others.join(', ') || '（无）'}`);
   ok(others.length >= 0, '清单已打印（供改动前自查）');
 }

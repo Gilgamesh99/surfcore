@@ -4637,6 +4637,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
     // 现在只有一个「角色」页：上面切角色，下面直接编辑当前角色的人格卡。
     function PersonaEditor({ busy, setBusy, toast, unified, setUnified }) {
       const [data, setData] = useState(null);
+      const [runtimeStatus, setRuntimeStatus] = useState(null);
       const [draft, setDraft] = useState({ full: "", core: "", tone: "", daily: "", scenes: {} });
       const [tab, setTab] = useState("full");
       const [split, setSplit] = useState(null);
@@ -4648,7 +4649,8 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         : data?.layers?.[key]?.path;
       const load = useCallback(async () => {
         try {
-          const r = await api("/persona");
+          const [r, status] = await Promise.all([api("/persona"), api("/persona/runtime")]);
+          setRuntimeStatus(status);
           const layers = r.layers ?? {};
           setData(r);
           setDraft({
@@ -4842,6 +4844,14 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           h("button", { className: "qbw-tab" + (tab === "full" ? " on" : ""), onClick: () => setTab("full") }, "整个人格卡注入"),
           h("button", { className: "qbw-tab" + (tab === "split" ? " on" : ""), onClick: () => setTab("split") }, "拆分人格卡（省 token）")),
         tab === "full" ? renderFullTab() : renderSplitTab(),
+        runtimeStatus ? h("div", { className: "qbw-card", style: { margin: "8px 0" } },
+          h("div", { className: "qbw-label" }, "人格加载检查"),
+          h("div", { className: "qbw-hint" }, "QQ / B站每次请求仅带一份当前人格。整卡超过预算会明确报错；B站仍会去除 QQ 号码等隐私信息。"),
+          Object.entries(runtimeStatus.platforms ?? {}).map(([key, value]) => h("div", { key, className: value.error ? "qbw-err" : "qbw-hint", style: { marginTop: "6px" } },
+            (key === "qq" ? "QQ：" : "B站：") + (value.error
+              ? `${value.code} · ${value.error} ${value.hint || ""}`
+              : value.enabled ? `已读取 ${value.sourceChars} 字，预算 ${value.maxChars} 字。` : "已关闭人格注入。"))),
+          runtimeStatus.runtime?.error ? h("div", { className: "qbw-err" }, `${runtimeStatus.runtime.error.code} · ${runtimeStatus.runtime.error.error} ${runtimeStatus.runtime.error.hint || ""}`) : null) : null,
         err ? h("div", { className: "qbw-err", style: { margin: "6px 0" } }, err) : null,
         data?.path ? h(Row, {
           label: "旧人格卡文件（仅兼容）",

@@ -32,6 +32,8 @@ const store = await import('../../../src/character-persona.js');
 
 const routes = [];
 const ctx = {
+  agents: { list: () => [] },
+  on() { return () => {}; },
   webServer: { register(route) { routes.push(route); return () => {}; } },
   get(name) { return name === 'connection' ? { requestRejection: () => false } : null; },
   effect(fn) { fn(); return () => {}; },
@@ -172,6 +174,22 @@ try {
   assert.equal(deleted.status, 200, JSON.stringify(deleted.data));
   const listAfterDelete = await invoke('GET', '/characters');
   assert.equal(listAfterDelete.data.characters.some((item) => item.id === createdA.data.character.id), false);
+
+  const runtime = await invoke('GET', '/persona/runtime');
+  assert.equal(runtime.status, 200);
+  assert.equal(runtime.data.platforms.qq.fullCardPresent, true);
+  assert.equal('text' in runtime.data.platforms.qq, false, '诊断接口不返回人格正文');
+  const method = await invoke('POST', '/persona/runtime', {});
+  assert.equal(method.status, 405);
+  assert.equal(method.data.code, 'PERSONA_RUNTIME_METHOD');
+  assert.ok(method.data.hint);
+  fs.writeFileSync(path.join(store.readCurrentCharacter().dir, 'persona.full.md'), '测试'.repeat(6000));
+  const overflow = await invoke('GET', '/persona/runtime');
+  for (const platform of ['qq', 'bili']) {
+    assert.equal(overflow.data.platforms[platform].code, 'PERSONA_LOAD_FAILED');
+    assert.match(overflow.data.platforms[platform].error, /超过配置预算/);
+    assert.ok(overflow.data.platforms[platform].hint);
+  }
 } finally {
   try { fs.rmSync(tempRoot, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(tempDsh, { recursive: true, force: true }); } catch {}

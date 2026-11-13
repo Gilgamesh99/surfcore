@@ -12647,20 +12647,8 @@ async function main() {
     });
   }
 
-  function purposePersonaText() {
-    let core = '';
-    const file = activePersonaFile();
-    if (file) {
-      try { core = fs.readFileSync(file, 'utf8').trim(); } catch {}
-    }
-    // 没有角色包时回退旧布局的人格卡读取（roleRawContent 是桥接已有的缓存实现）。
-    if (!core) {
-      try { core = String(roleRawContent() ?? '').trim(); } catch {}
-    }
-    const coreText = selectRoleText(core, 'v2');
-    const toneText = selectRoleText(readPersonaLayerText('tone'), 'v2');
-    // 目的/主动搭话也要带语气层；tone 与 core 相同则只留一份。
-    return [...new Set([coreText, toneText].filter(Boolean))].join('\n\n');
+  function purposePersonaText(key = '') {
+    return roleHintForMode('v2', key, '', { personaOnly: true });
   }
 
   function purposeContextBlocks(key = '') {
@@ -12668,7 +12656,7 @@ async function main() {
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）` : '';
     const identityLine = selfIdentityTextV2();
     const adminText = adminPromptLine(true);
-    const personaText = purposePersonaText();
+    const personaText = purposePersonaText(key);
     const biliBrief = cfg.biliBridge?.enabled !== false && cfg.biliBridge?.memory?.enabled !== false
       ? biliMemory.briefBlock()
       : '';
@@ -12676,7 +12664,7 @@ async function main() {
     return [
       roleLine,
       // 人格卡是动机的先验：她是什么样的人，决定她更容易被什么打动。
-      personaText ? `【人格卡（你是这样的人）】\n${personaText.slice(0, 2200)}` : '',
+      personaText ? `【人格卡（你是这样的人）】\n${personaText}` : '',
       identityLine,
       adminText,
       memoryCardText ? `【记忆卡】\n${memoryCardText.slice(0, 2400)}` : '',
@@ -13911,9 +13899,9 @@ async function main() {
     const tone = split ? readPersonaLayerText('tone') : '';
     const identity = personaIdentityText();
     const composed = composePersonaLayers({
-      core, scene, daily, tone, identity, personaMode: resolvedMode, mode, maxChars: roleInjectMaxChars, sceneId,
+      core, scene, daily, tone, identity, personaMode: resolvedMode, mode, maxChars: roleInjectMaxChars, sceneId, verbatimCore: !split,
     });
-    const base = composed.text || '';
+    const base = composed.text ? `<!-- surfcore-persona:start -->\n${composed.text}\n<!-- surfcore-persona:end -->` : '';
     // personaOnly：只要人格卡正文（唤醒提示词用）。管理员规则 / B站简报 / 记忆卡
     // 唤醒侧自己已经各拼过一遍，这里再拼会让同一段内容在一张纸条上出现两次。
     if (opts.personaOnly) return base;
@@ -14179,6 +14167,8 @@ async function main() {
     // 先按 〔二代〕/〔一代〕 标记筛小节；下面的逐行过滤只是给「没标记的老卡片」兜底。
     const raw = roleHintForMode('v2', key, personaMode);
     if (!raw) return '';
+    // 整卡模式逐字保留正文；平台工具协议由独立规则约束，不改写人格。
+    if (personaMode === 'full' || (!personaMode && personaInjectionMode() !== 'split')) return raw;
     // 一代仿真模式专用指令整行过滤，避免污染二代工具协议。
     // 用 role-card.js 导出的那份（文件顶部已 import）：这里原先又抄了一份同源正则，
     // 两份"哪行算一代指令"的安全相关过滤器一旦漂移，就会出现"selectRoleText 认为是二代内容、

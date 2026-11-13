@@ -46,6 +46,8 @@ const { QQ_ALIGNMENT_BRIEF, BILI_ALIGNMENT_FILE } = await import('../lib/paths.j
 const routes = [];
 const effects = [];
 const ctx = {
+  agents: { list: () => [] },
+  on() { return () => {}; },
   webServer: { register(route) { routes.push(route); return () => {}; } },
   get(name) { return name === 'connection' ? { requestRejection: () => false } : null; },
   effect(fn) { effects.push(fn); return () => {}; },

@@ -37,7 +37,7 @@ import { memoryCardPromptBlock } from './memory-card.js'
 import { buildSelfIdentityBlock, readQqSelfIdentity } from '../../../src/self-identity.js'
 import { adminFromSources, adminPromptBlock } from '../../../src/admin-identity.js'
 import { activeMemoryPaths, activePlatformStateDir, readPersonaLayerText } from '../../../src/character-persona.js'
-import { composePersonaLayers } from '../../../src/persona-layers.js'
+import { composePersonaLayers, FULL_PERSONA_MAX_CHARS, wrapPersonaBlock } from '../../../src/persona-layers.js?rev=20261113-full-persona'
 import { buildPersonaIdentity, personaNameFromCard } from '../../../src/persona-identity.js'
 import { isPeakAt, resolvePriceTable } from '../../../src/model-prices.js'
 import {
@@ -65,12 +65,15 @@ function readTextFile(file) {
 export function sanitizePersonaForBili(card) {
   const lines = String(card ?? '').split('\n');
   const kept = [];
-  let skipSection = false;
+  let privateDepth = 0;
   for (const line of lines) {
-    if (/^##\s/.test(line)) {
-      skipSection = /称呼|QQ\s*号|群友.*QQ|按\s*QQ/i.test(line);
+    const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (heading) {
+      const depth = heading[1].length;
+      if (privateDepth && depth <= privateDepth) privateDepth = 0;
+      if (!privateDepth && /称呼表|QQ\s*号|群友.*QQ|按\s*QQ/i.test(heading[2])) privateDepth = depth;
     }
-    if (skipSection) continue;
+    if (privateDepth) continue;
     kept.push(line);
   }
   return kept.join('\n')
@@ -78,8 +81,8 @@ export function sanitizePersonaForBili(card) {
     .replace(/\b\d{5,12}\b/g, '[号码已隐藏]');
 }
 
-/** 人设卡：取身份/性格/说话方式相关段落，别把整张卡塞进每一次唤醒。 */
-function personaCardBlock() {
+/** 当前人格；整卡保留原文，拆分模式才选择各层。每步运行时与唤醒共用。 */
+export function personaCardBlock() {
   const unified = readUnified().config
   if (unified.persona?.injectInBili === false) return ''
   const file = resolvePersonaFile()
@@ -94,9 +97,10 @@ function personaCardBlock() {
     if (p.selfClaim) bits.push(`自称「${p.selfClaim}」`)
     return bits.length ? `［身份］${bits.join('，')}。（以此为准，别用别的称呼 ✓）` : ''
   }
-  const max = Math.max(600, Math.min(6000, Number(unified.persona?.compactChars) || 2200))
+  const max = Math.max(600, Math.min(FULL_PERSONA_MAX_CHARS, Number(unified.persona?.compactChars) || 2200))
   const composed = composePersonaLayers({
     core: card,
+    verbatimCore: !split,
     // 身份底座：B站 也必须知道“我是谁、主人是谁”，不能只靠日常层里的那一行。
     identity: buildPersonaIdentity({
       name: personaNameFromCard(card),
@@ -189,7 +193,7 @@ function memoryCardBlockForBili() {
 /** 每次唤醒都放在最前面的合体上下文（顺序：人设 → 自我锚点 → 管理员 → 对齐 → QQ 记忆 → 记忆卡）。 */
 function identityContextLines() {
   return [
-    personaCardBlock(),
+    wrapPersonaBlock(personaCardBlock()),
     selfIdentityBlockForBili(),
     adminBlockForBili(),
     alignmentBlockForBili(),

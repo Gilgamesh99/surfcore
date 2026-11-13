@@ -27,4 +27,14 @@ assert.ok(safe.includes('B站'), '应保留 B站 身份');
 assert.ok(!/\b\d{5,12}\b/.test(safe), 'B站人设卡不得出现 QQ 号/mid');
 assert.ok(!safe.includes('怎么称呼群友'), 'B站人设卡不得带 QQ 称呼表');
 assert.ok(safe.length > 500 && safe.length <= card.length);
+const headings = sanitizePersonaForBili([
+  '# 角色', '## 称呼与语气', '正常称呼习惯必须保留',
+  '### 按 QQ 号称呼', '11111111 私人称呼', '#### 备注', '秘密备注',
+  '### 日常习惯', '保留后续习惯', '## QQ 号', '22222222 私密',
+  '# B站性格', '保留一级标题之后的内容',
+].join('\n'));
+assert.ok(headings.includes('正常称呼习惯必须保留'));
+assert.ok(headings.includes('保留后续习惯'));
+assert.ok(headings.includes('保留一级标题之后的内容'));
+assert.ok(!headings.includes('私人称呼') && !headings.includes('秘密备注') && !headings.includes('私密'));
 console.log('persona tests OK');
