@@ -100,6 +100,9 @@ import {
   cancelQrLogin, closeAllQrLogins, pollQrLogin, readFishAccount, readOwnerAccount, startQrLogin, verifyStoredCredentials,
 } from './bili-qr-login.mjs';
 import { fishGuardStateSummary } from '../tools/lib/fish-guard.mjs';
+import { createDmTaskStore } from '../tools/lib/dm-tasks.mjs';
+import { dmTaskStatus } from '../tools/lib/dm-task-status.mjs';
+import { commandResult } from '../tools/lib/dm-task-service.mjs';
 import { summarizeQqFishGuard } from './qq-fish-guard.js';
 import { applySessionPermission } from './scheduler.js';
 import { fileStamp, isStale } from '../../../src/config-stamps.js';
@@ -3640,6 +3643,19 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { ${writeOut('$
       let parsed = null;
       try { parsed = JSON.parse(result.out); } catch {}
       json(res, 200, { ok: parsed?.ok === true, ...(parsed ?? {}), raw: result.out.slice(0, 2000), err: result.err });
+      return;
+    }
+    if (req.method === 'GET' && pathname.endsWith('/dm-tasks')) {
+      const file = path.join(activePlatformStateDir(BILI_DIR), 'dm-tasks.json');
+      const result = dmTaskStatus(createDmTaskStore({ file }));
+      json(res, result.ok ? 200 : 500, result);
+      return;
+    }
+    if (req.method === 'POST' && pathname.endsWith('/dm-task-retry')) {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      if (!/^[a-f0-9]{32}$/.test(String(body.id || ''))) { json(res, 400, { ok: false, code: 'dm.task-id-invalid', error: '私信任务编号无效。', hint: '刷新任务列表后重试。' }); return; }
+      const result = commandResult(await runBili(['dm-task', 'retry', body.id, '--go', '--json'], 15000));
+      json(res, result.ok ? 200 : 409, result);
       return;
     }
     if (req.method === 'GET' && pathname.endsWith('/pending')) {

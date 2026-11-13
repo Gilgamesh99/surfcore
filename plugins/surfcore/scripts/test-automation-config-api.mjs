@@ -148,7 +148,26 @@ try {
   assert.equal(snap.data.qqShare.cardMode, 'off', '快照要带卡片样式，UI 才能显示对不对');
   assert.equal(snap.data.qqShare.card, false);
 
-  console.log('automation config API tests OK');
+  // DM tasks are visible through the real settings handler, including corrupt state.
+  const emptyTasks = await invoke('GET', '/bili/dm-tasks');
+  assert.equal(emptyTasks.status, 200); assert.equal(emptyTasks.data.ok, true); assert.deepEqual(emptyTasks.data.jobs, []);
+  const { createDmTaskStore } = await import('../tools/lib/dm-tasks.mjs');
+  const taskFile = path.join(tempState, 'bili', 'dm-tasks.json');
+  const taskStore = createDmTaskStore({ file: taskFile });
+  const [task] = taskStore.accept({ batchId: 'settings-fixture', items: [{ mid: '20002', messages: [{ seq: '90071992547409931', ts: 123, type: 1, text: 'PRIVATE_BODY_MUST_STAY_LOCAL' }] }] }, '20002');
+  taskStore.update(task.id, { status: 'failed', retryable: true, error: { code: 'dm.fixture', error: '未能排队', hint: '检查后重试' } });
+  const taskView = await invoke('GET', '/bili/dm-tasks');
+  assert.equal(taskView.status, 200); assert.equal(taskView.data.jobs[0].canRetry, true);
+  assert.equal(taskView.data.jobs[0].error.hint, '检查后重试');
+  assert.ok(!JSON.stringify(taskView.data).includes('PRIVATE_BODY_MUST_STAY_LOCAL'));
+  const badRetry = await invoke('POST', '/bili/dm-task-retry', { id: 'invalid' });
+  assert.equal(badRetry.status, 400); assert.equal(badRetry.data.ok, false); assert.ok(badRetry.data.code && badRetry.data.hint);
+  fs.writeFileSync(taskFile, '{broken');
+  const brokenTasks = await invoke('GET', '/bili/dm-tasks');
+  assert.equal(brokenTasks.status, 500); assert.equal(brokenTasks.data.ok, false);
+  assert.equal(brokenTasks.data.code, 'dm.tasks-unreadable'); assert.ok(brokenTasks.data.hint);
+
+  console.log('automation config and private-message status API tests OK');
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

@@ -84,6 +84,8 @@ const tests = [
   'test-bili-listen-error.mjs',
   // B站收件箱坐标：@ 一级评论补 root=source；resolveLatestReply 按 source rpid 找。
   'test-bili-reply-coordinates.mjs',
+  // Private-video handoff: exact allowed target, durable send latch and actual guarded bridge route.
+  'test-bili-dm-share.mjs', 'test-bili-dm-share-wiring.mjs',
   'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-qq-preset-contract.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',
   // 管理员身份（QQ ⇄ B站 同一个人）+「对管理员温柔 / 绝不回嘴」提示词：

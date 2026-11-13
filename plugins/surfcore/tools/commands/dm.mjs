@@ -31,6 +31,17 @@ for (let i = 0; i < argv.length; i += 1) {
     else { opt[argv[i].slice(2)] = v; i += 1 }
   }
 }
+// A final machine-readable result distinguishes a rejected preflight from a lost
+// response after POST. Existing identity, relation and quota gates remain in force.
+let sendAttempted = false;
+let machineResult = null;
+if (opt.json) process.on('exit', () => {
+  const result = machineResult ?? { ok: false, status: sendAttempted ? 'unknown' : 'failed', retryable: !sendAttempted,
+    code: sendAttempted ? 'dm.send-unknown' : 'dm.preflight-failed',
+    error: sendAttempted ? '私信发送结果无法确认。' : '私信未通过发送前检查。',
+    hint: sendAttempted ? '先查看 B站私信记录，不要自动重发。' : '核对登录、互相关注、互动开关和当天收信人后重试。' };
+  try { fs.writeSync(1, JSON.stringify(result) + '\n'); } catch {}
+});
 const SHARE = !!opt.share       // ④ 分享型：占「分享 3 条/天」额度（与评论区 @ 共用 ✓）
 // 分享型的 target 用正文里的 BV 号（"同一视频 7 天一次"才判得准 ✓）；没有就退回 dm:<mid>
 const BV = (String(opt.msg ?? "").match(/BV[0-9A-Za-z]{10}/) ?? [])[0] ?? "";
@@ -61,7 +72,11 @@ const H = {
   referer: 'https://www.bilibili.com/',
   cookie: `SESSDATA=${cred.sessdata}; bili_jct=${cred.bili_jct}; buvid3=${cred.buvid3}`,
 }
-const jget = async (u) => (await fetch(u, { headers: H })).json()
+const jget = async (u) => {
+  const r = await fetch(u, { headers: H, redirect: 'manual', signal: AbortSignal.timeout(8000) });
+  if (!r.ok || r.redirected) throw new Error('B站私信预检接口未返回成功响应。');
+  return r.json();
+}
 // 私信内容可能是 {"content":"…"} 或纯文本（与 dm-await.mjs 同一份实现）
 const parsed = (content) => {
   try { const j = JSON.parse(String(content)); return String(j.content ?? j.text ?? content) } catch { return String(content ?? '') }
@@ -108,13 +123,21 @@ async function send(toMid, text) {
   body.set('msg[dev_id]', 'WEB-' + crypto.randomUUID().toUpperCase())
   body.set('msg[content]', JSON.stringify({ content: text }))
   body.set('csrf', String(cred.bili_jct))
+  sendAttempted = true;
   const r = await fetch('https://api.vc.bilibili.com/web_im/v1/web_im/send_msg', {
     method: 'POST',
     headers: { ...H, 'content-type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
+    redirect: 'manual',
+    signal: AbortSignal.timeout(15000),
   })
   const j = await r.json().catch(() => ({}))
-  return { http: r.status, code: j.code, message: j.message, data: j.data }
+  const accepted = r.status >= 200 && r.status < 300 && j.code === 0;
+  machineResult = accepted
+    ? { ok: true, status: 'sent', receipt: { accepted: true, messageKey: String(j.data?.msg_key ?? j.data?.msg_seqno ?? ''), sentAt: new Date().toISOString() } }
+    : { ok: false, status: typeof j.code === 'number' && j.code !== 0 ? 'failed' : 'unknown', retryable: typeof j.code === 'number' && j.code !== 0,
+      code: 'dm.send-rejected', error: 'B站没有确认接受这条私信。', hint: '核对私信记录与登录状态后再处理，结果不明时不要重发。' };
+  return { http: r.status, code: accepted ? 0 : j.code === 0 ? -1 : j.code, message: j.message, data: j.data }
 }
 
 if (STATUS) {

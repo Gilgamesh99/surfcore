@@ -1,5 +1,7 @@
 # 路线图与路线守则（ROADMAP）
 
+> 2026-11-13 私信路线：按历史精确序号读取视频卡片和后续文字，先落盘任务再确认；指定群分享走独立的受限交接与真实回执，不把私聊塞进公共素材池。真实接口msg_seqno与旧msg_seq须区分；风控延后读取，unknown不自动重发。见[case](cases/2026-11-13-bili-dm-video-share.md)。
+
 > 本文件是「做什么、按什么顺序做、什么时候该放弃」的唯一权威。**改路线先改这里**，再动代码。
 > 配套：开工动线见 [`../AGENTS.md`](../AGENTS.md)，踩坑见 [`PITFALLS.md`](PITFALLS.md)，交接见 [`HANDOFF.md`](HANDOFF.md)。
 

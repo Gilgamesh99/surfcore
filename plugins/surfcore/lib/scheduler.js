@@ -36,7 +36,7 @@ import { readUnified } from './store.js'
 import { memoryCardPromptBlock } from './memory-card.js'
 import { buildSelfIdentityBlock, readQqSelfIdentity } from '../../../src/self-identity.js'
 import { adminFromSources, adminPromptBlock } from '../../../src/admin-identity.js'
-import { activeMemoryPaths, activePlatformStateDir, readPersonaLayerText } from '../../../src/character-persona.js'
+import { activeMemoryPaths, activePlatformStateDir, readCurrentCharacter, readPersonaLayerText } from '../../../src/character-persona.js'
 import { composePersonaLayers, FULL_PERSONA_MAX_CHARS, wrapPersonaBlock } from '../../../src/persona-layers.js?rev=20261113-full-persona'
 import { buildPersonaIdentity, personaNameFromCard } from '../../../src/persona-identity.js'
 import { isPeakAt, resolvePriceTable } from '../../../src/model-prices.js'
@@ -46,6 +46,10 @@ import {
 } from '../../../src/vector-memory.js'
 import { interactEnabled } from '../tools/lib/interact.mjs'
 import { biliSessionCreateParams } from './bili-workspace.js'
+import { callBridge } from './bridge.js'
+import { createBiliDmWorkflow } from './bili-dm-workflow.js'
+import { createDmTaskStore } from '../tools/lib/dm-tasks.mjs'
+import { createDmTaskService } from '../tools/lib/dm-task-service.mjs'
 
 // 当前角色的 B站 行为目录（角色系统未启用时回退旧目录）。
 function platformDir() {
@@ -906,64 +910,40 @@ export function startScheduler(ctx, opts) {
     const TOOL_CMD = `node "${biliMjs}"`
     const toolLine = () => `［工具］所有命令都用这一条：\`${TOOL_CMD} <子命令>\`（提示里写 "bili.mjs" 的都指它）—— 别去别处找 ✗`
 
-    async function dmTick() {
-      if (!interactEnabled()) return
-      if (dmBusy) return
-      if (peakBlockedNow('私信叫醒')) return
-      if (await budgetBlockedNow('私信叫醒')) return
-      let cfg
-      try { cfg = JSON.parse(fs.readFileSync(CFG_FILE_REF, "utf8")) } catch { cfg = {} }
-      const L = cfg.listen ?? {}
-      if (!L.dm) return
-      if (Date.now() - lastDmAt < 5_000) return   // 2026-10-19：原来 60s 和定时器叠成双层节流 → 最坏 2 分钟 ✗ 改成 5s
-      lastDmAt = Date.now()
-      dmBusy = true
-      try {
-        // 2026-10-20（用户定）：listen.dmScope = 'all' 时**谁找她都叫醒她**（不只主人）
-        const any = String(L.dmScope ?? "owner") === "all"
-        const r = await runBili(["dm-await", "--once", "--json", ...(any ? ["--any"] : [])])
-        const line = String(r.out ?? "").trim().split("\n").pop() ?? ""
-        let j = null
-        try { j = JSON.parse(line) } catch { j = null }
-        if (!j?.hit) return
-        const ownerMid = String(cfg.owner?.mid ?? "")
-        const items = any
-          ? (j.items ?? [])
-          : [{ mid: j.mid, name: j.name, text: j.text, ts: j.ts }]
-        if (!items.length) return
-        const block = items.slice(0, 5).map((it) => {
-          const mine = String(it.mid) === ownerMid
-          const who = `${it.name || "mid " + it.mid}（${it.mid}）`
-          return mine
-            ? `· 主人 ${who} 说：${String(it.text ?? "").slice(0, 300)}\n  → 直接回：\`dm --msg "…" --go\` ✓（不用审核）；而且要比平时更温柔：先回应关心、再答内容，不杠不顶嘴`
-            : `· ${who} 说：${String(it.text ?? "").slice(0, 300)}\n  → 回：\`dm --to ${it.mid} --msg "…" --dry\` → \`--go\`（≤200 字 · 一人一天 3 条 · 一天共 12 条 · **只能回不能主动发** ✓）`
-        })
+    let dmStopped = false
+    let dmRuntime = null
+    function privateMessageRuntime() {
+      const dir = platformDir()
+      const roleKey = () => { const c = readCurrentCharacter(); return JSON.stringify([c?.id || '', c?.epoch || 0, platformDir()]) }
+      const epoch = roleKey()
+      if (dmRuntime?.dir === dir && dmRuntime.epoch === epoch) return dmRuntime
+      const store = createDmTaskStore({ file: path.join(dir, 'dm-tasks.json') })
+      const isCurrent = () => !dmStopped && roleKey() === epoch
+      const service = createDmTaskService({ store, bridge: callBridge, runBili, getConfig: config, isCurrent })
+      const workflow = createBiliDmWorkflow({ store, service, runBili, getConfig: config, isCurrent, queue: async (job, text) => {
         await ensureSession()
-        await promptBili({
-          requestId: `bili-whale-dm-${Date.now()}`,
-          sessionId,
-          mode: "queue",
-          content: [{
-            type: "text",
-            text: [
-              ...identityContextLines(),
-              toolLine(),
-              any ? `【有 ${items.length} 条新私信】` : `【主人私信】${j.name}（mid ${j.mid}）刚给你发私信：`,
-              "",
-              ...block,
-              "",
-              "按 AGENTS.md「私信」做（不要等我说话，直接做）：",
-              "1) 主人 → **直接回，不用审核** ✓，要比平时更温柔（先回应关心，不顶嘴）；其他人 → `dm --to <mid>` 回复（**只回不主动发** ✓）",
-              "2) 一两句就够 —— 私信是聊天，不是评论区 ✗",
-              "3) 吵架 / 要隐私 / 要你代表主人承诺 / 明显是广告或引流 → **不回** ✗（直接不理，别解释）",
-              "4) 回完把对方说的写进日记「偏好校准」✓",
-            ].join("\n"),
-          }],
-        }, new AbortController().signal)   // 2026-10-19 修：prompt 的第二个参数是 signal ✗ 漏传会 TypeError
+        if (!isCurrent()) throw new Error('B站角色已切换')
+        await promptBili({ requestId: 'bili-dm-task-' + job.id + '-' + job.queueAttempts, sessionId, mode: 'queue',
+          content: [{ type: 'text', text: [...identityContextLines(), toolLine(), text].join('\n') }],
+        }, new AbortController().signal, '私信任务')
+      } })
+      dmRuntime = { dir, epoch, store, service, workflow }
+      return dmRuntime
+    }
+    async function dmTick() {
+      if (dmStopped || !interactEnabled() || dmBusy) return
+      const cfg = config(), L = cfg.listen ?? {}
+      if (!L.dm || Date.now() - lastDmAt < 5000) return
+      lastDmAt = Date.now(); dmBusy = true
+      try {
+        const peak = L.allDay !== true && peakBlockedNow('私信叫醒')
+        const budget = await budgetBlockedNow('私信叫醒')
+        const result = await privateMessageRuntime().workflow.tick({ canQueue: !peak && !budget,
+          gate: budget ? '今日 token 额度已到上限，消息已保留，恢复额度后继续。' : peak ? '峰时顺延，消息已保留，谷时继续。' : '' })
+        if (!result.ok) log('[bili-dm] ' + result.code + '：' + result.error + ' ' + result.hint)
       } catch (e) {
-        try { fs.appendFileSync(path.join(platformDir(), "dm-tick-err.log"), new Date().toISOString() + " " + (e?.stack ?? e) + "\n") } catch {}
-      }
-      finally { dmBusy = false }
+        log('[bili-dm] dm.workflow-failed：私信任务暂时无法处理，请到 B站设置查看状态。')
+      } finally { dmBusy = false }
     }
 
   async function listenTick() {
@@ -1367,13 +1347,14 @@ export function startScheduler(ctx, opts) {
       // ⭐ 直播间是**单独开关**：保存设置就立刻生效（点开就跑 ✓ 关掉就停 ✓），不等下一轮定时器
       liveTick().catch(() => {})
     },
-    stop() { clearInterval(timer); clearInterval(timer2); clearInterval(timer3); clearInterval(timerDyn); clearInterval(timerDm); for (const t of startupTimers) clearTimeout(t); try { liveProc?.kill() } catch {} try { permissionListenerOff?.() } catch {} },
+    stop() { dmStopped = true; clearInterval(timer); clearInterval(timer2); clearInterval(timer3); clearInterval(timerDyn); clearInterval(timerDm); for (const t of startupTimers) clearTimeout(t); try { liveProc?.kill() } catch {} try { permissionListenerOff?.() } catch {} },
     /** 切角色时用：停定时器 + 取消当前 DSH 会话的在途回合，避免旧人格继续跑。 */
     async retire() {
       this.stop();
       try { await ctx.sessionController?.cancel?.({ sessionId }) } catch (error) { log(`[bili-whale] 取消旧会话失败：${error?.message ?? error}`) }
     },
     tick,
+    dmTick,
     listenTick,
     liveTick,
   }

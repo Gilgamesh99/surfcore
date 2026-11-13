@@ -136,6 +136,16 @@ try {
   for (const name of ['exec', 'execFile', 'execSync', 'execFileSync', 'spawn', 'spawnSync', 'fork']) {
     patch(childProcess, name, () => forbidden(`child_process.${name}`));
   }
+  patch(childProcess, 'execFile', (_exe, args, _options, callback) => {
+    if (!fixture?.dmBatch || args[1] !== 'dm-await') return forbidden('unexpected DM child process');
+    fixture.dmCommands.push(args.slice(1));
+    if (args.includes('--ack')) {
+      const tasks = readJson(path.join(stateDir, 'dm-tasks.json'));
+      assert.ok(Object.keys(tasks.jobs).length, 'persist every message before inbox acknowledgement');
+      fixture.dmBatch = { ok: true, hit: false, items: [] };
+      callback(null, JSON.stringify({ ok: true }), '');
+    } else callback(null, JSON.stringify(fixture.dmBatch), '');
+  });
   for (const [object, name, label] of [
     [http, 'request', 'http.request'], [http, 'get', 'http.get'],
     [https, 'request', 'https.request'], [https, 'get', 'https.get'],
@@ -195,12 +205,14 @@ try {
 
   function begin(options = {}) {
     clock = peakTime;
+    fs.rmSync(path.join(stateDir, 'dm-tasks.json'), { force: true });
     writeConfig(options.config);
     writeUnified();
     const initialCursor = Math.floor(peakTime / 1000) - 120;
     fixture = {
       initialCursor, incomingTime: initialCursor + 60, fetches: [], prompts: [], inspections: [], budgetCalls: [], logs: [],
-      feeds: { reply: [], at: [] },
+      feeds: { reply: [], at: [] }, dmCommands: [],
+      dmBatch: options.dmBatch || null,
     };
     // One older reply and a duplicated @ entry exercise real filtering/deduplication.
     fixture.feeds.reply = [{ ...incomingAt(initialCursor - 1, 'older'), reply_time: initialCursor - 1 }];
@@ -359,6 +371,32 @@ try {
     assert.equal(readJson(nightFile).fired, true);
     assert.deepEqual(f.fetches, []);
     assert.equal(f.cursor(), f.initialCursor);
+  });
+
+  const dmBatch = () => ({ ok: true, hit: true, batchId: 'scheduler-dm-batch', items: [{ mid: '900002', isOwner: true, messages: [
+    { seq: '90071992547409931', ts: 1001, type: 7, text: '', video: { bvid: 'BV1xx411c7mD', title: '完整视频卡片', url: 'https://www.bilibili.com/video/BV1xx411c7mD' } },
+    { seq: '90071992547409932', ts: 1002, type: 1, text: '看看这个视频，告诉我你的想法。' },
+  ] }] });
+  await check('DM history card and following text reach the actual queued model prompt at peak with allDay enabled', async () => {
+    const f = begin({ config: { listen: { dm: true, allDay: true } }, dmBatch: dmBatch() });
+    await f.scheduler.dmTick();
+    assert.equal(f.prompts.length, 1);
+    const prompt = f.prompts[0].content.map((x) => x.text || '').join('\n');
+    assert.ok(prompt.includes('BV1xx411c7mD')); assert.ok(prompt.includes('告诉我你的想法'));
+    assert.ok(prompt.includes('dm-task reply')); assert.equal(f.dmCommands.length, 2);
+    assert.equal(Object.values(readJson(path.join(stateDir, 'dm-tasks.json')).jobs)[0].status, 'queued');
+  });
+  await check('DM token budget keeps all messages in durable pending tasks before ack, then queues after recovery', async () => {
+    let blocked = true;
+    const f = begin({ config: { listen: { dm: true, allDay: true } }, dmBatch: dmBatch(), budget: () => blocked });
+    await f.scheduler.dmTick(); assert.equal(f.prompts.length, 0); assert.equal(f.dmCommands.length, 2);
+    assert.equal(Object.values(readJson(path.join(stateDir, 'dm-tasks.json')).jobs)[0].status, 'pending');
+    blocked = false; clock += 6000; await f.scheduler.dmTick(); assert.equal(f.prompts.length, 1);
+  });
+  await check('DM API errors are visible and never acknowledged or passed to model', async () => {
+    const f = begin({ config: { listen: { dm: true } }, dmBatch: { ok: false, code: 'dm.login-required', error: '登录失效', hint: '重新登录' } });
+    await f.scheduler.dmTick(); assert.equal(f.prompts.length, 0); assert.equal(f.dmCommands.length, 1);
+    assert.equal(readJson(path.join(stateDir, 'dm-tasks.json')).lastPoll.code, 'dm.login-required');
   });
 
   assert.deepEqual(forbiddenCalls, []);

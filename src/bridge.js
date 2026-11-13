@@ -112,6 +112,7 @@ import { createBiliDynamicsSync } from './bili-dynamics.js';
 import { createBiliShareScheduler } from './bili-share-scheduler.js';
 import { createBiliCardSender, normalizeCardMode } from './bili-card.js';
 import { fetchVideoInfo } from './bili-api.js';
+import { createBiliDmShareStore, createBiliDmShareService, handleBiliDmShareRoute, dmShareError } from './bili-dm-share.js';
 import {
   loadSlang,
   saveSlang,
@@ -4586,6 +4587,93 @@ async function main() {
         log(`[image] 新图已发送 ${key}: ${imageId}`);
       },
     });
+    let biliDmShareService;
+    function getBiliDmShareService() {
+      if (biliDmShareService) return biliDmShareService;
+      biliDmShareService = createBiliDmShareService({
+        store: createBiliDmShareStore({ root: path.join(PLATFORM_STATE_DIR, 'bili-dm-share') }),
+        getOwnerMid() {
+          try {
+            const file = process.env.SURFCORE_BILI_CONFIG || path.join(SURFCORE_DIR, 'bili.config.json');
+            return JSON.parse(fs.readFileSync(file, 'utf8'))?.owner?.mid;
+          } catch { return ''; }
+        },
+        getAllowedGroups: () => cfg.allow?.groups,
+        getGroup: (id) => ensureGroupMeta(id),
+        authorize(payload, text) {
+          const key = 'group:' + payload.groupId;
+          const captured = captureSendGuard(key);
+          const epoch = sessionEpoch;
+          const check = () => {
+            if (socialV2.paused || cfg.socialV2?.enabled === false || shouldBlockSilentReply(key)) {
+              throw dmShareError('DM_SHARE_PAUSED', 'QQ 当前已暂停、关闭或静默。', '在 QQ 设置中恢复发送后，用同一请求重试。');
+            }
+            if (!v2ToolEnabled('sendGroup') || !v2ToolEnabled('sendMessage')) {
+              throw dmShareError('DM_SHARE_TOOL_DISABLED', 'QQ 群消息发送工具已关闭。', '在 QQ 工具设置中启用群消息和统一发送工具后重试。');
+            }
+            if (!modeAllowed(key, 'group', Number(payload.groupId), cfg, currentMode)) {
+              throw dmShareError('DM_SHARE_MODE_BLOCKED', '当前模式或黑白名单不允许向此群发送。', '确认 QQ 模式及目标群黑白名单后重试。');
+            }
+            try { captured(); if (epoch !== sessionEpoch) throw new Error('epoch changed'); }
+            catch { throw dmShareError('DM_SHARE_SESSION_CHANGED', '排队期间会话、模式或白名单已变化。', '确认当前会话设置后，用同一请求重试。'); }
+            if (text.length > Math.max(1, Number(cfg.socialV2?.send?.maxMessageChars) || 500)) {
+              throw dmShareError('DM_SHARE_TEXT_LIMIT', '合并消息超过 QQ 单条消息长度上限。', '请管理员检查 QQ 发送长度设置；原请求内容已固定，不会拆分发送。');
+            }
+            if (SENSITIVE_RE.test(text) || [...KNOWN_AGENT_TOKENS].some((token) => token && text.includes(token))) {
+              throw dmShareError('DM_SHARE_SENSITIVE_TEXT', '消息包含敏感内容，已在发送前拦截。', '核对请求内容，移除路径、凭据或令牌；需要修改时由主人重新发起。', false);
+            }
+          };
+          check();
+          return check;
+        },
+        enqueue(task) {
+          const result = sendChain.then(task);
+          sendChain = result.catch(() => {});
+          return result;
+        },
+        reserveSend(payload) {
+          const key = 'group:' + payload.groupId;
+          const st = getSocialV2State(key);
+          const turn = st.wakeConfig.wakeCount;
+          const used = Number(st.tokenTurnSent) || 0;
+          const block = fishGuardSendBlock(key, st)
+            || sendRateLimitInfo(key, st, cfg.socialV2?.send ?? {}, 1)
+            || tokenGuardSendBlock(key, st, 1);
+          if (block) {
+            reportLimitEvent(key, block);
+            throw dmShareError(block.code || 'DM_SHARE_SEND_LIMIT', block.error, block.hint || '检查 QQ 发送保护设置后重试。');
+          }
+          const reserved = Math.max(0, (Number(st.tokenTurnSent) || 0) - used);
+          const stamp = Date.now();
+          st.sendTimes.push(stamp);
+          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+          saveSocialV2State();
+          let rolledBack = false;
+          return () => {
+            if (rolledBack) return;
+            rolledBack = true;
+            const at = st.sendTimes.indexOf(stamp);
+            if (at >= 0) st.sendTimes.splice(at, 1);
+            if (st.wakeConfig.wakeCount === turn) st.tokenTurnSent = Math.max(0, (Number(st.tokenTurnSent) || 0) - reserved);
+            saveSocialV2State();
+          };
+        },
+        // A single plain-text message, real receipt; disable the unrelated auto-outbox.
+        transport: (id, text) => onebotSend('group', id, text, null, null, { fromOutbox: true }),
+        recordSent(payload, text, receipt) {
+          const key = 'group:' + payload.groupId;
+          recordSentMessagesV2(key, [text]);
+          const st = getSocialV2State(key);
+          Object.assign(st.recentMessages.at(-1), { messageId: receipt.messageId });
+          st.lastAiReplyAt = Date.now();
+          st.lastActionAt = Date.now();
+          st.wakeConfig.noActionCount = 0;
+          saveSocialV2State();
+          scheduleReplyCheckV2(key);
+        },
+      });
+      return biliDmShareService;
+    }
     // 语音包服务实例：按 config.json 的 mtime 缓存（既热生效，又保住安装进度）。
     // 必须放在请求回调**外面**：每次请求新建实例会把 activeInstalls（进度）随实例丢掉，
     // 前端就只看到"开始安装…"、永远没有进度条（2026-10-28 用户反馈）。
@@ -4620,6 +4708,10 @@ async function main() {
         'Referrer-Policy': 'no-referrer'
       };
       const sendJson = (obj, status = 200) => {
+        if (obj?.ok === false && url.pathname.startsWith('/api/bili/dm-share/')) {
+          obj = { status: 'failed', retryable: false, code: status === 401 ? 'DM_SHARE_UNAUTHORIZED' : 'DM_SHARE_ACCESS_DENIED',
+            hint: '使用控制台管理员认证并检查请求格式、来源与 QQ 发送设置。', ...obj };
+        }
         if (obj?.ok === false && ['/api/socialV2/generate-image', '/api/socialV2/image-result', '/api/socialV2/send-image'].includes(url.pathname)) {
           obj = { code: status === 403 ? 'IMAGE_ACCESS_DENIED' : 'IMAGE_REQUEST_FAILED',
             hint: '请检查当前会话令牌、QQ 桥接模式和图片设置，再查询原 imageId；不要重复生成。', ...obj };
@@ -4721,6 +4813,13 @@ async function main() {
         } else {
           sendJson({ ok: false, error: '未授权：请提供控制台访问令牌' }, 401);
         }
+        return;
+      }
+      // Dedicated admin handoff: scoped QQ callers cannot upgrade to console authority.
+      if (url.pathname.startsWith('/api/bili/dm-share/')
+          && (req.headers['x-agent-token'] !== undefined || req.headers['x-agent-call'] !== undefined)) {
+        sendJson({ ok: false, status: 'failed', retryable: false, code: 'DM_SHARE_CONSOLE_ONLY',
+          error: '此交接接口仅控制台管理员可用。', hint: '通过已认证的 B 站私信交接流程操作；QQ 会话令牌无权调用。' }, 403);
         return;
       }
       // 智能体调用隔离（集中关卡）。
@@ -4836,6 +4935,10 @@ async function main() {
             sendJson({ ok: false, code: 'CONSOLE_ONLY', error: '该接口仅控制台可用', hint: '请用设置页/控制台（x-console-token）；AI 请走对应的 v2 工具面' }, 403);
             return;
           }
+        }
+        if (url.pathname.startsWith('/api/bili/dm-share/')) {
+          await handleBiliDmShareRoute(getBiliDmShareService(), req, url, { readBody, sendJson });
+          return;
         }
         if (imageRoutes.matches(url)) {
           await imageRoutes.handle(req, url, { readBody, sendJson });

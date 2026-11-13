@@ -4461,6 +4461,41 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         }) : null);
     }
 
+    function BiliDmTasksCard({ busy, toast }) {
+      const [data, setData] = useState(null);
+      const [acting, setActing] = useState("");
+      const load = useCallback(async () => {
+        try { setData(await api("/bili/dm-tasks")); }
+        catch (e) { setData({ ok: false, error: e.message || "私信任务状态读取失败。", hint: e.hint || "检查插件状态后刷新。" }); }
+      }, []);
+      useEffect(() => { load(); const timer = setInterval(load, 15000); return () => clearInterval(timer); }, [load]);
+      const retry = async (id) => {
+        setActing(id);
+        try {
+          const r = await api("/bili/dm-task-retry", { method: "POST", body: { id } });
+          toast(r.ok ? "已保留重试任务，等待下一次处理。" : (r.error || "重试失败") + " " + (r.hint || ""));
+        } catch (e) { toast((e.message || "重试失败") + " " + (e.hint || "")); }
+        finally { setActing(""); await load(); }
+      };
+      const names = { pending: "等待处理", queueing: "正在交给模型", queued: "模型处理中", sending: "等待群消息回执", sent: "群分享已发送", needs_input: "需要补充信息", failed: "处理失败", unknown: "结果待核对", replying: "等待私信回执", completed: "私信已回复" };
+      const reports = { sent: "已私信回报", failed: "私信回报失败", sending: "等待私信回执", unknown: "私信回报结果待核对" };
+      const errorLine = (error) => error ? h("div", { className: "qbw-err" }, (error.error || "处理失败") + " " + (error.hint || "")) : null;
+      return h("div", { className: "qbw-card", style: { marginTop: "10px" } },
+        h("h4", null, "私信处理与指定群分享"),
+        h("p", { className: "qbw-hint" }, "主人可在 B站私信发送视频卡片，再指定一个 QQ 白名单群。这里显示接收、分享和私信回报的结果。"),
+        h(Btn, { kind: "qbw-btn2", onClick: load, disabled: !!busy || !!acting }, "刷新私信任务"),
+        data?.ok === false ? errorLine(data) : null,
+        data?.lastPoll?.ok === false ? errorLine(data.lastPoll) : null,
+        data?.lastPoll?.pending ? h("div", { className: "qbw-hint" }, data.lastPoll.gate || "任务已保留，等待允许处理的时间。") : null,
+        data?.ok && !data.jobs?.length ? h("p", { className: "qbw-hint" }, "还没有私信任务。首次启用从当前消息建立起点，不重放历史指令。") : null,
+        ...(data?.jobs || []).map((job) => h("div", { key: job.id, style: { marginTop: "8px", padding: "8px", border: "1px solid rgba(127,127,127,.2)", borderRadius: "8px" } },
+          h("div", { className: "qbw-label" }, job.title + (job.target ? " → " + job.target : "")),
+          h("div", { className: "qbw-hint" }, (names[job.status] || job.status) + (job.report ? " · " + (reports[job.report.status] || job.report.status) : "")),
+          errorLine(job.error), errorLine(job.report?.error),
+          job.status === "unknown" || job.status === "sending" || job.status === "replying" ? h("div", { className: "qbw-hint" }, "请先核对实际消息记录。结果不明时不会自动重发。") : null,
+          job.canRetry ? h(Btn, { kind: "qbw-btn2", disabled: !!busy || !!acting, onClick: () => retry(job.id) }, job.status === "sent" ? "重试私信回报" : "重试任务") : null)));
+    }
+
     function BiliTab({ cfg, set, qq, setQqPath, admin, setAdmin, unified, setUnified, qqPrivate, qqAllowAll, overview, busy, setBusy, toast, reload, onSave, onAdminDiscardContext, dirty }) {
       const [query, setQuery] = useState("");
       const [cookie, setCookie] = useState({ sessdata: "", bili_jct: "", buvid3: "" });
@@ -4577,6 +4612,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           h("div", { className: "qbw-actions", style: { borderTop: "none", marginTop: "6px", paddingTop: "0" } },
             h(Btn, { onClick: () => setQrFish(true), disabled: !!busy }, "扫码登录小肥鱼"))),
         h(QqShareSection, { qq, set: setQqPath, data: automation, busy, setBusy, toast }),
+        h(BiliDmTasksCard, { busy, toast }),
         h(Section, { title: "作息窗口", note: "C 模式：每个窗口至少 1 次；全天上限见「每天最多醒来」，剩余次数按该时段最近评分分配，相邻两次至少隔「最小间隔」", defaultOpen: true },
           h("div", { style: { padding: "6px 0" } }, h(WindowsEditor, { value: cfg?.night?.windows, onChange: (v) => set(["night", "windows"], v) }))),
         h(AdvancedSettings, { note: "凭据 / 鱼群状态 / 口味权重 / 待审核 / 全部 B站 参数：展开后同样可改" },
