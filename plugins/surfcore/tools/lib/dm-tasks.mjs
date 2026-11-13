@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { tasksForItem } from './dm-share-intent.mjs';
+import { tasksForItem, resolveWaitingVideo } from './dm-share-intent.mjs';
 
 const failure = (code, error, hint) => Object.assign(new Error(error), { code, error, hint });
 const clone = (value) => structuredClone(value);
@@ -55,14 +55,35 @@ export function createDmTaskStore({ file, now = Date.now, maxJobs = 2000 }) {
     get: (id) => clone(read().jobs[id] ?? null),
     accept(batch, ownerMid) {
       if (!batch?.batchId || !Array.isArray(batch.items) || !batch.items.length) throw failure('dm.batch-invalid', '私信读取结果缺少持久批次。', '保留游标并检查私信读取器。');
-      const jobs = batch.items.flatMap((item) => tasksForItem(item, batch.batchId, String(ownerMid)));
-      if (!jobs.length) throw failure('dm.batch-empty', '私信批次没有可保留的消息。', '保留游标并检查不支持的消息类型。');
       return transaction((state) => {
+        const at = now();
+        const jobs = batch.items.flatMap((item) => tasksForItem(item, batch.batchId, String(ownerMid), { existing: Object.values(state.jobs), now: at }));
+        if (!jobs.length) throw failure('dm.batch-empty', '私信批次没有可保留的消息。', '保留游标并检查不支持的消息类型。');
         const fresh = jobs.filter((j) => !state.jobs[j.id]);
         if (Object.keys(state.jobs).length + fresh.length > maxJobs) throw failure('dm.tasks-full', '私信任务记录已到容量上限。', '先备份并归档已完成任务；当前消息不会被确认消费。');
-        for (const job of fresh) state.jobs[job.id] = { ...job, createdAt: now(), updatedAt: now(), queueAttempts: 0, report: null };
-        state.lastPoll = { ok: true, at: now(), batchId: batch.batchId };
+        for (const job of jobs) {
+          const old = state.jobs[job.id];
+          if (!old) state.jobs[job.id] = { ...job, createdAt: at, updatedAt: at, queueAttempts: 0, report: null };
+          else if (old.status === 'waiting_video' && old.mid === String(ownerMid) && old.ownerMid === String(ownerMid)) state.jobs[job.id] = { ...job, updatedAt: at };
+        }
+        state.lastPoll = { ok: true, at, batchId: batch.batchId };
         return jobs.map((job) => state.jobs[job.id]);
+      });
+    },
+    // Call only after a complete successful inbox read; a failed/rate-limited read
+    // may still contain an in-window card once it recovers.
+    expireWaiting(ownerMid) {
+      const eligible = (job) => job.status === 'waiting_video' && job.mid === String(ownerMid) && job.ownerMid === String(ownerMid) && now() >= job.waitingUntil;
+      if (!Object.values(read().jobs).some(eligible)) return [];
+      return transaction((state) => {
+        const changed = [];
+        for (const job of Object.values(state.jobs)) {
+          if (!eligible(job)) continue;
+          const resolved = resolveWaitingVideo(job, [], now());
+          state.jobs[job.id] = { ...resolved, updatedAt: now() };
+          changed.push(state.jobs[job.id]);
+        }
+        return changed;
       });
     },
     update(id, change) {

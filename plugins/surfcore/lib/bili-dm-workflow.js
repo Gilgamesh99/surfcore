@@ -47,6 +47,7 @@ export function createBiliDmWorkflow({ store, service, runBili, queue, getConfig
             const ack = commandResult(await runBili(['dm-await', '--ack', batch.batchId, '--json']), 'dm.ack-failed');
             if (!ack.ok) { store.pollStatus({ ...problem(ack), ackPending: true, nextPollAt: now() + 60000 }); return ack; }
           }
+          store.expireWaiting(String(cfg.owner?.mid ?? ''));
           store.pollStatus({ ok: true, gate, pending: !canQueue, nextPollAt: 0 });
         }
       }

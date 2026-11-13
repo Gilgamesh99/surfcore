@@ -26,6 +26,12 @@ if (mode === 'post' && isGo && !assertInteractEnabled('发动态')) process.exit
 const text = args.get('text')
 const dynId = args.get('id')
 
+if (mode === 'check') {
+  const { runReadDynamic } = await import('../lib/read-dynamic-command.mjs')
+  process.exitCode = await runReadDynamic(['--id', String(dynId ?? ''), ...(args.has('json') ? ['--json'] : []), '--max-chars', String(args.get('max-chars') ?? '12000')])
+  process.exit(process.exitCode)
+}
+
 const credPath = accountBili('credentials.json')
 if (!fs.existsSync(credPath)) { console.error(`缺少凭据文件: ${credPath}`); process.exit(3) }
 const cred = JSON.parse(fs.readFileSync(credPath, 'utf8'))
@@ -124,31 +130,6 @@ try {
     console.log(`  https://t.bilibili.com/${id}`)
   } else {
     console.log(`  errmsg: ${out.data?.errmsg ?? '-'}`)
-  }
-  process.exit(0)
-}
-
-if (mode === 'check') {
-  if (!dynId) { console.error('check 需要 --id <dyn_id>'); process.exit(2) }
-  await whoami()
-  const qs = await wbi({ id: String(dynId) })
-  const r = await fetch(`https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?${qs}`, {
-    headers: { 'user-agent': UA, referer: `${REF}${dynId}`, cookie: cookieHeader },
-  })
-  const ct = r.headers.get('content-type') ?? ''
-  if (!ct.includes('json')) {
-    console.log(`  detail 端点返回 ${ct || '未知类型'}，无法用它判定（不代表动态不存在）`)
-    process.exit(0)
-  }
-  const d = await r.json()
-  console.log(`  detail code=${d.code} ${d.message ?? d.msg ?? ''}`)
-  if (d.code === 0) {
-    const it = d.data?.item ?? {}
-    console.log(`  存在 ✓  id=${it.id_str}  作者=${it.modules?.module_author?.name}  时间=${it.modules?.module_author?.pub_time}`)
-    const t = it.modules?.module_dynamic?.desc?.text
-    if (t) console.log(`  正文: ${t}`)
-  } else {
-    console.log('  未取到（删除后应当如此；若刚发完也没取到，多半是端点/权限问题）')
   }
   process.exit(0)
 }

@@ -23,6 +23,11 @@ fs.writeFileSync(path.join(stateDir, 'config.json'), `${JSON.stringify({
   platforms: { start: { qq: false, bili: false } },
 }, null, 2)}\n`, 'utf8');
 
+const qqRoot = path.join(tmp, 'qq');
+fs.mkdirSync(path.join(qqRoot, 'src'), { recursive: true });
+fs.writeFileSync(path.join(qqRoot, 'src', 'bridge.js'), '// inert fixture');
+fs.writeFileSync(path.join(qqRoot, 'config.json'), JSON.stringify({ ownerQQ: '', consolePort: 61791, allow: { groups: [], private: [] } }));
+process.env.SURFCORE_ROOT = qqRoot;
 process.env.DSH_HOME = tmp;
 process.env.USERPROFILE = tmp;
 process.env.SURFCORE_SKIP_AUTOSTART = '1';

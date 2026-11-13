@@ -9,6 +9,8 @@ import { createDmTaskService, commandResult } from '../tools/lib/dm-task-service
 import { createBiliDmWorkflow, dmTaskPrompt } from '../lib/bili-dm-workflow.js';
 import { dmTaskStatus } from '../tools/lib/dm-task-status.mjs';
 
+globalThis.fetch = async () => { throw new Error('Real network is forbidden in this offline suite'); };
+
 const owner = '10001';
 const video = { bvid: 'BV1xx411c7mD', aid: '170001', title: '命运2', url: 'https://www.bilibili.com/video/BV1xx411c7mD' };
 const text = '把这个视频分享到群聊命运糕手中，配上你自己的想法，不要说是我让你分享的，就说是你自己刷到的';
@@ -20,7 +22,7 @@ const failure = (code = 'OFFLINE', retryable = true) => ({ ok: false, status: 'f
 function fixture(t, options = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'surfcore-dm-flow-'));
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
-  let time = 2000000, poll = options.batch || batchOf(), role = true;
+  let time = options.now ?? 2000000, poll = options.batch || batchOf(), role = true;
   const cfg = { owner: { mid: owner }, interact: { enabled: true }, listen: { dm: true } };
   const store = createDmTaskStore({ file: path.join(tmp, 'dm-tasks.json'), now: () => time, ...(options.maxJobs ? { maxJobs: options.maxJobs } : {}) });
   const calls = [], prompts = [];
@@ -48,7 +50,7 @@ function fixture(t, options = {}) {
   const service = createDmTaskService({ store, bridge, runBili, getConfig: () => cfg, now: () => time, isCurrent: () => role });
   const workflow = createBiliDmWorkflow({ store, service, runBili, getConfig: () => cfg, now: () => time, isCurrent: () => role,
     queue: async (job, prompt) => { prompts.push({ job, prompt }); if (options.queueFails) throw new Error('host unavailable'); }, queueLeaseMs: 1000 });
-  return { tmp, store, service, workflow, calls, prompts, bridgeCalls, cfg, now: () => time, advance: (ms) => time += ms, changeRole: () => role = false };
+  return { tmp, store, service, workflow, calls, prompts, bridgeCalls, cfg, now: () => time, advance: (ms) => time += ms, setBatch: (batch) => poll = batch, changeRole: () => role = false };
 }
 
 test('screenshot instruction binds the preceding card and exact group without repeating private text', () => {
@@ -273,4 +275,203 @@ test('interrupted result reports leave successful QQ receipts intact and cannot 
   assert.equal(current.report.error.code, 'dm.report-unconfirmed'); assert.ok(current.report.error.hint);
   assert.equal(f.calls.filter((a) => a[0] === 'dm').length, 0);
   assert.equal(f.bridgeCalls.filter((x) => x.route.endsWith('/send')).length, 0);
+});
+
+const firstRequest = { ...instruction, seq: '90071992547409941', ts: 2000 };
+const followingCard = { ...card, seq: '90071992547409942', ts: 2001 };
+const laterCard = { ...followingCard, seq: '90071992547409943', ts: 2002, video: { ...video, bvid: 'BV1aa411c7mD', title: '另一个视频' } };
+const nextBatch = (messages, mid = owner) => ({ ...batchOf(messages, mid), batchId: 'batch-2' });
+const shareJob = (f) => f.store.list().find((job) => job.kind === 'share');
+
+test('text before video in one complete batch binds exact sequence once even when input is reversed', async (t) => {
+  const f = fixture(t, { batch: batchOf([followingCard, firstRequest]) });
+  await f.workflow.tick();
+  const job = shareJob(f);
+  assert.equal(f.store.list().length, 1); assert.equal(f.prompts.length, 1);
+  assert.equal(job.sourceSeq, firstRequest.seq); assert.equal(job.videoSourceSeq, followingCard.seq);
+  assert.deepEqual(job.messages.map((m) => m.seq), [firstRequest.seq, followingCard.seq]);
+  assert.equal(job.id, taskId(owner, firstRequest.seq, 'share'));
+  assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 0);
+  await f.service.send(job.id, '节奏不错。'); await f.service.send(job.id, '节奏不错。');
+  f.setBatch(batchOf([firstRequest, followingCard])); await f.workflow.tick();
+  assert.equal(f.store.list().length, 1); assert.equal(f.prompts.length, 1);
+  assert.equal(f.bridgeCalls.filter((r) => r.route.endsWith('/send')).length, 1);
+  assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 1);
+});
+
+test('a waiting request is durable before ack and a later poll completes the original task', async (t) => {
+  const f = fixture(t, { batch: batchOf([firstRequest]) });
+  await f.workflow.tick();
+  const waiting = shareJob(f);
+  assert.equal(waiting.status, 'waiting_video'); assert.equal(waiting.waitingUntil, 2120000);
+  assert.equal(f.prompts.length, 0); assert.equal(f.bridgeCalls.length, 0);
+  assert.equal(f.calls.filter((args) => args.includes('--ack')).length, 1);
+  assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 0);
+  assert.equal(dmTaskStatus(f.store).counts.waiting_video, 1);
+  f.advance(5000); f.setBatch(nextBatch([followingCard])); await f.workflow.tick();
+  const bound = shareJob(f);
+  assert.equal(bound.id, waiting.id); assert.equal(bound.sourceSeq, firstRequest.seq);
+  assert.equal(bound.batchId, waiting.batchId); assert.equal(bound.videoSourceSeq, followingCard.seq);
+  assert.equal(bound.status, 'queued'); assert.equal(f.store.list().length, 1);
+  assert.equal(f.prompts.length, 1); assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 0);
+});
+
+test('restart and repeated card-batch acceptance preserve wait identity without another reply task', (t) => {
+  const f = fixture(t, { maxJobs: 1 });
+  const [waiting] = f.store.accept(batchOf([firstRequest]), owner);
+  const reopened = createDmTaskStore({ file: f.store.file, now: () => f.now() + 3000, maxJobs: 1 });
+  assert.equal(reopened.get(waiting.id).status, 'waiting_video');
+  reopened.accept(nextBatch([followingCard]), owner);
+  reopened.accept(nextBatch([followingCard]), owner);
+  reopened.accept(batchOf([firstRequest]), owner);
+  const jobs = reopened.list();
+  assert.equal(jobs.length, 1); assert.equal(jobs[0].status, 'pending');
+  assert.equal(jobs[0].id, waiting.id); assert.equal(jobs[0].videoSourceSeq, followingCard.seq);
+  assert.equal(jobs[0].messages.length, 2); assert.equal(jobs[0].queueAttempts, 0);
+});
+
+test('a complete batch with several following cards fails visibly instead of choosing the first', async (t) => {
+  for (const split of [false, true]) {
+    const f = fixture(t, { batch: batchOf(split ? [firstRequest] : [firstRequest, followingCard, laterCard]) });
+    await f.workflow.tick();
+    if (split) { f.setBatch(nextBatch([followingCard, laterCard])); await f.workflow.tick(); }
+    const job = shareJob(f);
+    assert.equal(job.status, 'needs_input'); assert.equal(job.error.code, 'dm.video-ambiguous');
+    assert.ok(job.error.hint); assert.equal(f.store.list().length, 1);
+    assert.equal(f.prompts.length, 0); assert.equal(f.bridgeCalls.length, 0);
+    await f.workflow.tick(); assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 1);
+  }
+});
+
+test('an unsupported following card prevents fallback to another valid card', async (t) => {
+  const unreadable = { ...followingCard, video: undefined, error: failure('dm.unsupported-card') };
+  const f = fixture(t, { batch: batchOf([firstRequest, unreadable, laterCard]) });
+  await f.workflow.tick();
+  const job = shareJob(f);
+  assert.equal(job.status, 'needs_input'); assert.equal(job.error.code, 'dm.video-unreadable');
+  assert.ok(job.error.hint); assert.equal(job.video, null);
+  assert.equal(f.store.list().length, 1); assert.equal(f.prompts.length, 0); assert.equal(f.bridgeCalls.length, 0);
+});
+
+test('cancellation before a card or after a candidate in the same batch stops sharing', async (t) => {
+  for (const afterCard of [false, true]) {
+    const cancel = { ...instruction, seq: afterCard ? laterCard.seq : followingCard.seq, ts: 2002, text: '算了，别发了' };
+    const messages = afterCard ? [firstRequest, followingCard, cancel] : [firstRequest, cancel, { ...laterCard, ts: 2003 }];
+    const f = fixture(t, { batch: batchOf(messages) }); await f.workflow.tick();
+    const job = shareJob(f);
+    assert.equal(job.status, 'needs_input'); assert.equal(job.error.code, 'dm.share-cancelled');
+    assert.ok(job.error.hint); assert.equal(job.video, null);
+    assert.equal(f.prompts.filter((p) => p.job.kind === 'share').length, 0);
+    assert.equal(f.bridgeCalls.length, 0); assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 1);
+    assert.ok(!f.store.list().filter((j) => j.kind === 'conversation').some((j) => j.messages.some((m) => m.seq === cancel.seq)));
+  }
+});
+
+test('cancellation in a later poll persists and an even later card cannot revive it', async (t) => {
+  const f = fixture(t, { batch: batchOf([firstRequest]) }); await f.workflow.tick();
+  const id = shareJob(f).id;
+  f.setBatch(nextBatch([{ ...instruction, seq: followingCard.seq, ts: 2001, text: '取消分享' }])); await f.workflow.tick();
+  assert.equal(f.store.get(id).error.code, 'dm.share-cancelled');
+  f.setBatch({ ...nextBatch([laterCard]), batchId: 'batch-3' }); await f.workflow.tick();
+  assert.equal(f.store.get(id).status, 'needs_input'); assert.equal(f.store.get(id).video, null);
+  assert.equal(f.prompts.filter((p) => p.job.kind === 'share').length, 0);
+  assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 1);
+});
+
+test('unrelated text interrupts a waiting share and preserves subsequent cards for ordinary conversation', async (t) => {
+  const unrelated = { ...instruction, seq: followingCard.seq, ts: 2001, text: '今天你过得怎样？' };
+  const f = fixture(t, { batch: batchOf([firstRequest]) }); await f.workflow.tick();
+  f.setBatch(nextBatch([unrelated, laterCard])); await f.workflow.tick();
+  const job = shareJob(f);
+  assert.equal(job.status, 'needs_input'); assert.equal(job.error.code, 'dm.video-interrupted');
+  assert.ok(job.error.hint); assert.equal(job.video, null);
+  assert.equal(f.prompts.length, 1); assert.equal(f.prompts[0].job.kind, 'conversation');
+  assert.deepEqual(f.prompts[0].job.messages.map((m) => m.seq), [unrelated.seq, laterCard.seq]);
+  assert.equal(f.bridgeCalls.length, 0);
+});
+
+test('a newer share instruction closes the previous wait and owns the next card', async (t) => {
+  const newer = { ...instruction, seq: followingCard.seq, ts: 2001, text: '把这个视频分享到群聊「另一个群」' };
+  const f = fixture(t, { batch: batchOf([firstRequest, newer, laterCard]) }); await f.workflow.tick();
+  const jobs = f.store.list();
+  assert.equal(jobs.length, 2);
+  assert.equal(jobs.find((j) => j.sourceSeq === firstRequest.seq).error.code, 'dm.video-interrupted');
+  const bound = jobs.find((j) => j.sourceSeq === newer.seq);
+  assert.equal(bound.videoSourceSeq, laterCard.seq); assert.equal(bound.target, '另一个群');
+  assert.equal(f.prompts.length, 1); assert.equal(f.prompts[0].job.id, bound.id);
+});
+
+test('missing input expires after a successful poll and cannot be retried or revived by an old card', async (t) => {
+  const f = fixture(t, { batch: batchOf([firstRequest]) }); await f.workflow.tick();
+  const id = shareJob(f).id;
+  f.advance(119999); await f.workflow.tick(); assert.equal(f.store.get(id).status, 'waiting_video');
+  f.advance(1); await f.workflow.tick();
+  const expired = f.store.get(id);
+  assert.equal(expired.status, 'needs_input'); assert.equal(expired.error.code, 'dm.video-missing'); assert.ok(expired.error.hint);
+  assert.equal(f.service.retry(id).ok, false);
+  f.setBatch(nextBatch([followingCard])); await f.workflow.tick();
+  assert.equal(f.store.get(id).status, 'needs_input'); assert.equal(f.store.get(id).video, null);
+  assert.equal(f.prompts.filter((p) => p.job.kind === 'share').length, 0);
+  assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 1);
+});
+
+test('source timestamps allow delayed history and the exact 120-second edge, but reject 121 seconds', (t) => {
+  const f = fixture(t, { now: 3000000 });
+  for (const offset of [1, 120, 121]) {
+    const source = { ...firstRequest, seq: String(1000 + offset * 2) };
+    const next = { ...followingCard, seq: String(1001 + offset * 2), ts: source.ts + offset };
+    const jobs = f.store.accept({ ...batchOf([source, next]), batchId: 'delay-' + offset }, owner);
+    const job = jobs.find((j) => j.kind === 'share');
+    if (offset <= 120) { assert.equal(job.status, 'pending'); assert.equal(job.videoSourceSeq, next.seq); }
+    else { assert.equal(job.status, 'needs_input'); assert.equal(job.error.code, 'dm.video-missing'); assert.equal(job.video, null); }
+  }
+});
+
+test('failed or risk-limited intake does not expire a wait before in-window history can be read', async (t) => {
+  const options = { pollError: failure('dm.risk-control', false) };
+  const f = fixture(t, options); const [waiting] = f.store.accept(batchOf([firstRequest]), owner);
+  await f.workflow.tick(); f.advance(200000); await f.workflow.tick();
+  assert.equal(f.store.get(waiting.id).status, 'waiting_video');
+  options.pollError = null; f.setBatch(nextBatch([followingCard])); f.advance(700001);
+  await f.workflow.tick();
+  assert.equal(f.store.get(waiting.id).status, 'queued'); assert.equal(f.prompts.length, 1);
+  assert.equal(f.store.get(waiting.id).videoSourceSeq, followingCard.seq);
+});
+
+test('waiting video association requires the same current owner and conversation', (t) => {
+  const f = fixture(t); const [waiting] = f.store.accept(batchOf([firstRequest]), owner);
+  f.store.accept(nextBatch([followingCard], '20002'), owner);
+  assert.equal(f.store.get(waiting.id).status, 'waiting_video');
+  f.store.accept(nextBatch([followingCard]), '20002');
+  assert.equal(f.store.get(waiting.id).status, 'waiting_video');
+  assert.equal(f.store.get(waiting.id).video, null);
+  f.advance(200000); f.store.expireWaiting('20002');
+  assert.equal(f.store.get(waiting.id).status, 'waiting_video');
+});
+
+test('a later poll cannot replace a video already bound to an earlier share', async (t) => {
+  const f = fixture(t, { batch: batchOf([firstRequest, followingCard]) }); await f.workflow.tick();
+  const id = shareJob(f).id; await f.service.send(id, '一点想法。');
+  f.setBatch(nextBatch([laterCard])); await f.workflow.tick();
+  assert.equal(f.store.get(id).video.bvid, video.bvid);
+  assert.equal(f.store.get(id).videoSourceSeq, followingCard.seq);
+  assert.equal(f.store.get(id).status, 'sent');
+  assert.equal(f.bridgeCalls.filter((r) => r.route.endsWith('/send')).length, 1);
+  assert.equal(f.calls.filter((args) => args[0] === 'dm').length, 1);
+  assert.equal(f.prompts.filter((p) => p.job.kind === 'conversation').length, 1);
+});
+
+test('invalid or regressing message timestamps cannot create a guessed association', () => {
+  for (const pair of [[{ ...firstRequest, ts: 0 }, followingCard], [firstRequest, { ...followingCard, ts: 1999 }], [firstRequest, { ...followingCard, ts: undefined }]]) {
+    const job = tasksForItem(batchOf(pair).items[0], 'invalid-time', owner, { now: 2000000 }).find((j) => j.kind === 'share');
+    assert.equal(job.status, 'needs_input'); assert.equal(job.error.code, 'dm.video-time-invalid');
+    assert.ok(job.error.hint); assert.equal(job.video, null);
+  }
+});
+
+test('an explicit BV keeps its binding even with a subsequent different card', () => {
+  const explicit = { ...firstRequest, text: '把视频 ' + video.bvid + ' 分享到群聊命运糕手' };
+  const jobs = tasksForItem(batchOf([explicit, laterCard]).items[0], 'explicit', owner, { now: 2000000 });
+  assert.equal(jobs.find((j) => j.kind === 'share').video.bvid, video.bvid);
+  assert.equal(jobs.find((j) => j.kind === 'conversation').messages[0].seq, laterCard.seq);
 });

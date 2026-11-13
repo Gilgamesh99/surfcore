@@ -4477,12 +4477,12 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         } catch (e) { toast((e.message || "重试失败") + " " + (e.hint || "")); }
         finally { setActing(""); await load(); }
       };
-      const names = { pending: "等待处理", queueing: "正在交给模型", queued: "模型处理中", sending: "等待群消息回执", sent: "群分享已发送", needs_input: "需要补充信息", failed: "处理失败", unknown: "结果待核对", replying: "等待私信回执", completed: "私信已回复" };
+      const names = { waiting_video: "等待补发视频（两分钟内）", pending: "等待处理", queueing: "正在交给模型", queued: "模型处理中", sending: "等待群消息回执", sent: "群分享已发送", needs_input: "需要补充信息", failed: "处理失败", unknown: "结果待核对", replying: "等待私信回执", completed: "私信已回复" };
       const reports = { sent: "已私信回报", failed: "私信回报失败", sending: "等待私信回执", unknown: "私信回报结果待核对" };
       const errorLine = (error) => error ? h("div", { className: "qbw-err" }, (error.error || "处理失败") + " " + (error.hint || "")) : null;
       return h("div", { className: "qbw-card", style: { marginTop: "10px" } },
         h("h4", null, "私信处理与指定群分享"),
-        h("p", { className: "qbw-hint" }, "主人可在 B站私信发送视频卡片，再指定一个 QQ 白名单群。这里显示接收、分享和私信回报的结果。"),
+        h("p", { className: "qbw-hint" }, "主人可在 B站私信发送视频卡片并指定一个 QQ 白名单群；先发指令时，请在两分钟内补发视频。这里显示接收、分享和私信回报的结果。"),
         h(Btn, { kind: "qbw-btn2", onClick: load, disabled: !!busy || !!acting }, "刷新私信任务"),
         data?.ok === false ? errorLine(data) : null,
         data?.lastPoll?.ok === false ? errorLine(data.lastPoll) : null,

@@ -2,17 +2,51 @@
  * 宿主冒烟测试（不启动 DSH）：
  *   · 用 mock ctx 装配插件；
  *   · 验证路由注册、配置读取、隐私闸门、身份对齐、扩展清单；
- *   · 不写真实配置（只读），不启停桥接。
+ *   · 仅写临时夹具；阻止真实网络与子进程，不启停桥接。
  *
  * 运行：node scripts/test-host-smoke.mjs
  */
 import { EventEmitter } from 'node:events';
-// 冒烟测试不启动真实桥接（即使本机 unified 配置开了 autoStart）。
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import net from 'node:net';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'surfcore-smoke-isolated-'));
+const tempDsh = path.join(temp, 'dsh');
+const tempQq = path.join(temp, 'qq');
+fs.mkdirSync(path.join(tempDsh, 'surfcore'), { recursive: true });
+fs.mkdirSync(path.join(tempQq, 'src'), { recursive: true });
+fs.writeFileSync(path.join(tempQq, 'src', 'bridge.js'), '// inert fixture');
+fs.writeFileSync(path.join(tempQq, 'config.json'), JSON.stringify({ ownerQQ: '10001', consolePort: 61790, consoleToken: 'fixture-secret', snowluma: { accessToken: 'fixture-secret' }, allow: { groups: [], private: [] } }));
+fs.writeFileSync(path.join(tempDsh, 'surfcore', 'config.json'), JSON.stringify({ version: 1, platforms: { start: { qq: false, bili: false } } }));
+fs.writeFileSync(path.join(tempDsh, 'surfcore', 'bili.config.json'), JSON.stringify({ owner: { mid: '20002', name: '测试鱼' }, interact: { enabled: false } }));
+process.env.DSH_HOME = tempDsh;
+process.env.USERPROFILE = tempDsh;
+process.env.SURFCORE_ROOT = tempQq;
+const denied = () => Object.assign(new Error('Offline smoke fixture: external IO disabled'), { code: 'SMOKE_OFFLINE' });
+globalThis.fetch = async () => { throw denied(); };
+net.connect = net.createConnection = () => {
+  const socket = new EventEmitter();
+  socket.setTimeout = () => socket; socket.destroy = () => socket; socket.unref = () => socket;
+  queueMicrotask(() => socket.emit('error', denied()));
+  return socket;
+};
+childProcess.execFile = (...args) => { const callback = args.at(-1); if (typeof callback !== 'function') throw denied(); queueMicrotask(() => callback(denied(), '', '')); return { kill() {}, unref() {} }; };
+childProcess.spawn = childProcess.exec = childProcess.execSync = childProcess.execFileSync = childProcess.spawnSync = () => { throw denied(); };
+syncBuiltinESMExports();
+process.on('exit', () => fs.rmSync(temp, { recursive: true, force: true }));
+// 所有路径与 IO 在动态导入前替换，真实 ~/.dsh 和桥接永远不作为测试夹具。
 process.env.SURFCORE_SKIP_AUTOSTART = '1';
 process.env.SURFCORE_DISABLE_CHARACTER_MIGRATION = '1';
 // 不写真实记忆卡 / 不跑后台整理。
 process.env.SURFCORE_DISABLE_MEMORY_TIMER = '1';
-import { apply } from '../lib/index.js';
+const { apply } = await import('../lib/index.js');
+const { DSH_HOME, QQBOT_ROOT } = await import('../lib/paths.js');
+assert.equal(path.resolve(DSH_HOME), path.resolve(tempDsh));
+assert.equal(path.resolve(QQBOT_ROOT), path.resolve(tempQq));
 
 const routes = [];
 const effects = [];
@@ -181,9 +215,7 @@ if (blocked.ok) throw new Error('隐私闸门没有拦截 QQ号/手机号');
 const normal = sanitizeText('今天看了个视频 BV1xx411c7mD 很好笑');
 if (!normal.ok) throw new Error('正常内容被误杀');
 
-// 身份对齐：写入一条临时记录再删掉（会写真实 alignments.json，但会删除）。
-// 本机 workspace-write 沙箱不允许写 ~/.dsh（DSH 自己的 ACL 收紧），此时只跳过这一段，
-// 不把环境限制误报成插件回归；无沙箱终端仍会真的跑一遍 add/remove。
+// 身份对齐：只在临时 DSH_HOME 中写入和删除；权限错误也必须让测试失败。
 const { addLink, removeLink } = await import('../lib/align.js');
 try {
   const link = addLink({
@@ -198,13 +230,7 @@ try {
   });
   console.log('align add:', link.id);
   removeLink(link.id);
-} catch (error) {
-  if (error?.code === 'EPERM' || error?.code === 'EACCES') {
-    console.log('align add/remove: skipped（沙箱不允许写 ~/.dsh）');
-  } else {
-    throw error;
-  }
-}
+} catch (error) { throw error; }
 
 for (const fn of effects) {
   try {

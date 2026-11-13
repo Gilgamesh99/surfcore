@@ -10,12 +10,13 @@
 //    **正文一律回读楼层核实**（lib/msgfeed.mjs 的 resolveLatestReply）。
 //
 // 用法:
-//   node bili.mjs comment-digest [--hours 24] [--pages 2] [--only-unread] [--max-resolve 20] [--raw]
+//   node bili.mjs comment-digest [--hours 24] [--pages 2] [--only-unread] [--max-resolve 20] [--max-dynamics 8] [--raw]
 //     --raw          不核实正文，直接用收件箱字段（快，但可能不准）
 import { accountBili, biliState, biliStateDir } from '../lib/state-paths.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { makeHeaders, pullFeed, resolveLatestReply } from '../lib/msgfeed.mjs'
+import { notificationDynamicId, readInboxDynamics } from '../lib/inbox-dynamics.mjs'
 
 const args = process.argv.slice(2)
 const get = (k, d) => {
@@ -27,6 +28,7 @@ const PAGES = Math.max(1, Number(get('pages', '2')))
 const MAX_RESOLVE = Number(get('max-resolve', '20'))
 const ONLY_UNREAD = args.includes('--only-unread')
 const RAW = args.includes('--raw')
+const MAX_DYNAMICS = Number(get('max-dynamics', '8'))
 
 const cred = JSON.parse(fs.readFileSync(accountBili('credentials.json'), 'utf8'))
 const H = makeHeaders(cred)
@@ -51,6 +53,11 @@ const ats = all.filter((x) => x.kind === 'at')
 console.log(`【B 站 · 谁找过人家】最近 ${HOURS} 小时`)
 console.log(`共 ${all.length} 条 —— 回复 ${replies.length} · @ ${ats.length}${ONLY_UNREAD ? '（只看未读）' : ''}${RAW ? '（未核实正文）' : ''}`)
 if (!all.length) { console.log('\n安静得很，没人找。'); process.exit(0) }
+
+// 收件箱只含摘要；动态必须另取详情及转发原文。--raw 保持仅收件箱模式。
+const dynamicContext = await readInboxDynamics(all, { headers: H, raw: RAW, maxDynamics: MAX_DYNAMICS })
+const printedDynamics = new Set()
+if (dynamicContext.unreadNotice) console.log(dynamicContext.unreadNotice)
 
 // 回读楼层核实正文（同一楼同一人只查一次）
 const cache = new Map()
@@ -78,6 +85,12 @@ for (const x of all) {
   if (x.uri) console.log(`    位置：${x.uri}`)
   if (x.kind === 'reply') console.log(`    坐标：type=${x.business} oid=${x.oid} root=${x.root} parent=${real?.rpid || x.parent}`)
   else if (x.root || x.parent) console.log(`    坐标：type=${x.business} oid=${x.oid} root=${x.root} parent=${real?.rpid || x.parent}`)
+  const dynamicId = notificationDynamicId(x)
+  if (!RAW && dynamicId && !printedDynamics.has(dynamicId)) {
+    const entry = dynamicContext.contexts.get(dynamicId)
+    console.log(entry?.text || `    【未展开】达到本批阅读预算；运行 node bili.mjs read-dynamic ${dynamicId} 补读。`)
+    printedDynamics.add(dynamicId)
+  }
 }
 
 const byWho = new Map()
