@@ -42,7 +42,12 @@ GET /dsh-surfcore/api/persona/runtime 只返回 roleId、mode、正文长度、�
 - 修正两项测试夹具：pet安装测试等待终态，不用固定2.5秒；core rev 检查按模块核对单一实例，不要求无关模块共用一个版本字符串。
 - 首轮 audit 155/161：缺隔离配置、过度严格的rev检查、旧HEAD发布清单及两项Git测试超时。已分别修正夹具/环境，后续结果与加载证据写入本节。
 - 桥接回归16/17：R11旧Markdown恶意输入性能断言<500ms失败。相同未改源文件在生产基线849ms，候选1553ms；单独回归820ms，证明基线也失败。未放宽阈值或修改无关转换实现。其他16项通过。
-- 未执行真实付费LLM、生图、QQ/B站发送；测试不代表主观自然程度已被实测。
+- 最终人格专项与真实SDK测试15/15通过，插件完整40脚本链通过，安装清单777文件校验通过。复跑audit为157/161：旧R11性能断言失败，图片/两项Git夹具触发外层时限。图片夹具单独复跑67通过、1跳过、0失败；update-apply-result单独复跑通过；git-apply单独复跑21/21通过。最终剩余失败仅基线也失败的R11性能断言。
+- 生产 main 已快进到功能提交8584f1b和清单提交908fcdc。两个配置只变更role.maxInjectChars / persona.compactChars到10000；独立原始备份在 D:/ProgramData/DSH NEXT/Soul/backups/surfcore-full-persona-20261113。
+- 2026-11-13 16:26（Asia/Shanghai）真实GUI http://127.0.0.1:57328 的新/persona/runtime接口200，active=true/error=null；QQ/B站同为proplus/full/sourceChars=8656/maxChars=10000/fullCardPresent=true。QQ实际prompt包含整卡且仅一个拥有标记；生产B站构造器保留整卡，本卡未触发隐私脱敏。人格文件SHA256仍为617862b69be6ccb6045659034febee8ead673fa6e45c7fcafcff0d380e26357a。
+- 正规PluginManager disable/enable仍返回全profile restart-required/unmanaged-plugin及旧Workbuddy未激活依赖警告；SurfCore自身fiber=active、新路由存在且新钩子生效，故无宿主重启/其它插件改动。全局返回不是目标插件失败证据。
+- QQ桥接经既有restart API从PID26800切到28536，reserved2/dshReady=true/SnowLuma connected=true。当前GUI刷新后“角色→人格加载检查”实际显示QQ与B站各8656字、预算10000字；验收截图 D:/ProgramData/DSH NEXT/Soul/surfcore-full-persona-ui.png。首次UI检查早于配置加载完成；改为等待真实角色标签出现后通过，不改产品等待时间。
+- 未执行真实付费LLM、生图、QQ/B站发送；实时requests/rewrites计数在验收时为0，实际每次请求的投影/去重由15项真实SDK及离线模型边界用例验证。测试不代表主观自然程度已被实测。
 
 ## 回滚
 
@@ -53,4 +58,4 @@ GET /dsh-surfcore/api/persona/runtime 只返回 roleId、mode、正文长度、�
 - 改动：persona-layers / persona-request / persona-runtime，QQ桥接目的与角色构造，B站调度，桌宠聊天/目的，插件注册/API/UI，以及对应测试和本文档。
 - 版本建议：patch；本次保持0.8.9，本机定制，无tag/push/release。
 - 层级：插件与桥接，不改DSH。依赖当前公开事件/section/session surface能力；宿主升级须跑真实SDK兼容用例。
-- 逻辑/范围/失败/UI/hint/断言：见以上章节；加载与最终门禁结果待完成后追加，不以计划代替验收。
+- 逻辑/范围/失败/UI/hint/断言：见以上章节；实际加载、页面证据及最终门禁残余已记录。
