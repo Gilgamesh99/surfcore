@@ -30,15 +30,15 @@ QQ 二代仿真原有 qq-chat-v2 工具守卫拒绝所有 Windows 工具，主�
 
 ## 宿主兼容
 
-实际安装的 DSH 使用 startActivation 与独立 agentPreset，不支持开发依赖里旧式 start/toolFilter/persona 接口。插件通过正式 agentPresets 服务注册 owner-desktop（人格、native executor、默认拒绝的 boundary 三项）；先持久记录预留 childId，再创建真实父子关系，以返回的 messageId 绑定首条消息。默认拒绝的边界只接受当前宿主租约握手，冷恢复、额外输入、卸载和任何非 Windows 工具均不能获得权限。注册后还检查预设没有 broken 状态，无法加载时不降级。
+实际安装的 DSH 使用 startActivation 与独立 agentPreset，不支持开发依赖里旧式 start/toolFilter/persona 接口。插件通过正式 agentPresets 服务注册 owner-desktop（人格、native executor、默认拒绝的 boundary 三项）；先持久记录预留 childId，再创建真实父子关系，以返回的 messageId 绑定首条消息。默认拒绝的边界只接受当前宿主租约握手，冷恢复、额外输入、卸载和任何非 Windows 工具均不能获得权限。注册后还检查预设没有 broken 状态，无法加载时不降级。宿主服务通过正式 ctx.get 访问；验证精确的独立管理父会话后，才用 agentPresets.serviceFor(parent, "subagents") 获取其隔离服务。每次调用与心跳都复核服务和提供方的稳定身份，实际执行仍经过官方代理，替换或卸载立即撤权。
 
 ## 验证记录
 
 - 主人收件 broker 17项、真实桥接接线14项、来源/权限分类10项、正式预设注册7项、设置控制器7项均通过；真实管理 API 覆盖权限修改拒绝、配置代际和主人 A→B→A 撤权。
-- 适配当前宿主后的 runtime / native boundary 42组通过，包括实际 Session 的 snapshotEvents/isSeeded/inheritedEventCount、activation 首条消息编号、最终处置时序、冷恢复、卸载和额外消息拒绝。
+- 适配当前宿主后的 runtime / native boundary 50组通过（原42组及8组真实宿主服务作用域回归），包括实际 Session 的 snapshotEvents/isSeeded/inheritedEventCount、activation 首条消息编号、最终处置时序、冷恢复、卸载和额外消息拒绝。
 - 全仓审计单轮162/165；三项旧测试分别因 R11 936ms阈值和两个 Windows 子进程超时失败。随后协议回归17项、更新结果夹具、Git更新22项单独重跑全部通过，未放宽断言或改动旧实现。
-- 先前完整插件48脚本通过；加入实际宿主预设后最终49脚本回归进行中。
-- 当前管理会话的 Windows 截图工具已成功。现场加载尚未执行，完整真实 QQ 主人指令到桌面动作与回执尚未验证。
+- 加入实际宿主预设后的完整插件49脚本全部通过；服务绑定修复后重新执行运行时50组、预设7项、真实管理API与隔离宿主启动测试，均通过。
+- 当前管理会话的 Windows 截图工具已成功；生产已加载且 QQ 桥接以 reserved2 在线，现有 GUI 的“主人桌面授权”卡片已实际显示。首次启用因宿主服务访问方式不兼容而自动关闭入口；当前在补齐显式 tools 注入和父会话隔离 subagents 服务绑定后重新验收。完整真实 QQ 主人指令到桌面动作与回执尚未验证。
 
 ## 发布交接
 

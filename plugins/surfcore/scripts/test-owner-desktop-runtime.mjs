@@ -41,7 +41,7 @@ function fixture(options = {}) {
     sourceMessageId: 'message-123', sourceReceivedAt: clock, text: 'Open Calculator', expiresAt: clock + 300_000 };
   const control = { validate: { ok: true }, complete: { ok: true }, claim: null, pending: null, throws: false,
     inheritedEventCount: 0, local: true, registration: true, validateHook: null, postStepMessages: null, broker: null,
-    preset: { ok: true }, receiptMessageId: 'accepted-message-1' };
+    preset: { ok: true }, receiptMessageId: 'accepted-message-1', provider: null, parentSubagents: null, serviceForCalls: [] };
   let starts = 0;
   let disposals = 0;
   let child;
@@ -67,6 +67,7 @@ function fixture(options = {}) {
   }
   const provider = { inheritsParentContext: false, capabilities: { depthLimit: true, agentPreset: true, agentOptions: true, outputSchema: true },
     async prepareContinuable() { return {}; } };
+  control.provider = provider;
   const definitions = scope => (options.emptyCatalogue ? [] : catalogue)
     .filter(name => !scope || allowed.includes(name)).map(name => ({ name }));
   const native = { describe: tools => ({ schemas: tools.map(tool => ({ name: tool.name })) }) };
@@ -74,10 +75,14 @@ function fixture(options = {}) {
   const ctx = {
     on,
     agents: { get: id => agents.get(id) },
-    agentPresets: { composedPreset: scope => scope?.preset },
+    agentPresets: { composedPreset: scope => scope?.preset, serviceFor(actual, name) {
+      control.serviceForCalls.push({ agent: actual, name });
+      assert.equal(actual, parent, 'only the exactly validated parent may select a preset service');
+      return name === 'subagents' ? control.parentSubagents : undefined;
+    } },
     tools: { definitions, schemas: scope => definitions(scope), selectExecutor: scope => scope?.executor ?? code,
       guard(fn) { guards.push(fn); return () => { const index = guards.indexOf(fn); if (index >= 0) guards.splice(index, 1); }; } },
-    subagents: { getProvider: name => name === 'spawn' ? provider : undefined, async startActivation(input) {
+    subagents: { getProvider: name => name === 'spawn' ? control.provider : undefined, async startActivation(input) {
       starts++;
       request = input;
       assert.equal(input.provider, 'spawn');
@@ -129,6 +134,32 @@ function fixture(options = {}) {
     },
     guard(fn) { scopedGuards.push(exec => exec.agent?.ctx?.preset === 'owner-desktop' ? fn(exec) : undefined); return () => {}; },
   } });
+  const services = { agents: ctx.agents, agentPresets: ctx.agentPresets, tools: ctx.tools, subagents: ctx.subagents };
+  control.parentSubagents = options.isolatedSubagents ? services.subagents : undefined;
+  if (options.isolatedSubagents) services.subagents = undefined;
+  function trace(value) {
+    if (!options.traceServices || !value) return value;
+    const proxy = new Proxy(value, { get(target, key) {
+      if (key === Symbol.for('cordis.original')) return target;
+      const member = Reflect.get(target, key);
+      if (typeof member !== 'function') return member;
+      return function (...args) {
+        assert.equal(this, proxy, 'service calls retain the official scoped proxy');
+        const result = Reflect.apply(member, proxy, args);
+        return key === 'serviceFor' ? trace(result) : result;
+      };
+    } });
+    return proxy;
+  }
+  ctx.get = name => {
+    if (options.getThrows === name) throw new Error('private service details');
+    return trace(services[name]);
+  };
+  if (options.strictServices) {
+    for (const name of Object.keys(services)) Object.defineProperty(ctx, name, { get() { throw new Error(`cannot get property "${name}" without inject`); } });
+  }
+  if (options.missingRootToolService) services.tools = undefined;
+  if (options.missingServiceFor) delete services.agentPresets.serviceFor;
   async function bridge(path, opts = {}) {
     calls.push({ path, body: opts.body });
     if (control.throws) throw new Error('credential secret');
@@ -160,7 +191,7 @@ function fixture(options = {}) {
   const guard = value => { for (const row of [...guards, ...scopedGuards]) { const reason = row(value); if (reason) return reason; } return undefined; };
   async function execute(value) { const result = await prepare(value); return result.kind === 'allow' ? guard(value) : result.reason; }
   async function fire(ms) { const rows = [...timers.entries()].filter(([, timer]) => timer.ms === ms); for (const [id, timer] of rows) { timers.delete(id); await timer.fn(); } await flush(); }
-  return { runtime, ctx, config, owner, control, task, parent, provider, registered, agents, calls, guards, hooks, timers, emit, waterfall, begin, finish, exec, prepare, guard, execute, fire,
+  return { runtime, ctx, services, config, owner, control, task, parent, provider, registered, agents, calls, guards, hooks, timers, emit, waterfall, begin, finish, exec, prepare, guard, execute, fire,
     child: () => child, request: () => request, firstWireNames: () => firstWireNames, nativePresentations: () => nativePresentations, starts: () => starts, disposals: () => disposals, turnSignal: () => turnSignal, run: () => runPromise, advance: ms => { clock += ms; } };
 }
 
@@ -593,6 +624,104 @@ await check('parent session disposal revokes a completed turn before activation 
   await f.run(); assert.equal(f.runtime.status().lastResult.status, 'cancelled');
   assert.equal(f.runtime.status().lastError.code, 'owner-desktop.agent-disposed');
   assert.ok(f.runtime.status().lastError.hint); await f.runtime.stop();
+});
+
+await check('strict Cordis getters use the exact parent preset service and tolerate fresh tracing proxies', async () => {
+  const f = fixture({ strictServices: true, isolatedSubagents: true, traceServices: true, isManagedAgent: value => value?.id === 'qq-other' });
+  assert.throws(() => f.ctx.subagents, /without inject/);
+  assert.throws(() => f.ctx.tools, /without inject/);
+  assert.equal(f.ctx.get('subagents'), undefined);
+  const first = f.ctx.get('tools'); const second = f.ctx.get('tools');
+  assert.notEqual(first, second); assert.equal(first[Symbol.for('cordis.original')], second[Symbol.for('cordis.original')]);
+  assert.equal((await f.begin()).kind, 'enter');
+  assert.equal(await f.execute(f.exec()), undefined);
+  assert.ok(f.control.serviceForCalls.length > 1);
+  assert.ok(f.control.serviceForCalls.every(call => call.agent === f.parent && call.name === 'subagents'));
+  const social = agent('qq-other');
+  assert.match(await f.execute(f.exec('windows_desktop', social)), /owner-task-required/);
+  assert.equal(await f.execute(f.exec('qq_send_message', social)), undefined);
+  assert.equal((await f.finish()).lastResult.status, 'done'); await f.runtime.stop();
+});
+await check('strict root service access stays compatible without unnecessary preset lookup', async () => {
+  const f = fixture({ strictServices: true, traceServices: true });
+  assert.equal((await f.begin()).kind, 'enter'); assert.equal(await f.execute(f.exec()), undefined);
+  assert.equal(f.control.serviceForCalls.length, 0);
+  assert.equal((await f.finish()).lastResult.status, 'done'); await f.runtime.stop();
+});
+await check('missing services yield exact capability diagnostics without private getter errors', async () => {
+  for (const options of [
+    { missingRootToolService: true, expected: 'tools.guard' },
+    { getThrows: 'tools', expected: 'tools.definitions' },
+    { isolatedSubagents: true, missingServiceFor: true, expected: 'agentPresets.serviceFor' },
+    { getThrows: 'subagents', expected: 'subagents.startActivation' },
+  ]) {
+    const f = fixture({ ...options, strictServices: true, traceServices: true });
+    assert.equal((await f.begin()).kind, 'reject'); assert.equal(f.starts(), 0);
+    const error = f.runtime.status().lastError;
+    assert.equal(error.code, 'owner-desktop.host-unavailable'); assert.ok(error.error.includes(options.expected));
+    assert.ok(error.hint); assert.equal(JSON.stringify(error).includes('private service details'), false);
+    await f.runtime.stop();
+  }
+});
+await check('invalid or social parents are rejected before any isolated service lookup', async () => {
+  for (const mode of ['missing', 'child', 'subagent-origin', 'social']) {
+    const f = fixture({ strictServices: true, isolatedSubagents: true,
+      ...(mode === 'social' ? { isManagedAgent: value => value?.id === 'management' } : {}) });
+    if (mode === 'missing') f.agents.delete(f.parent.id);
+    if (mode === 'child') f.parent.session.header.parentSession = 'another-parent';
+    if (mode === 'subagent-origin') f.parent.session.header.origin = 'subagent';
+    assert.equal((await f.begin()).kind, 'reject'); assert.equal(f.starts(), 0);
+    assert.equal(f.control.serviceForCalls.length, 0);
+    assert.equal(f.runtime.status().lastError.code, 'owner-desktop.parent-unavailable');
+    assert.ok(f.runtime.status().lastError.hint); await f.runtime.stop();
+  }
+});
+await check('service or provider replacement revokes a prepared ticket and drains the exact activation', async () => {
+  for (const mode of ['root-service', 'preset-service', 'removed', 'route-changed', 'provider', 'provider-capability']) {
+    const f = fixture({ strictServices: true, traceServices: true, isolatedSubagents: mode !== 'root-service' });
+    await f.begin(); const call = f.exec(); assert.equal((await f.prepare(call)).kind, 'allow');
+    if (mode === 'root-service') f.services.subagents = { ...f.services.subagents };
+    if (mode === 'preset-service') f.control.parentSubagents = { ...f.control.parentSubagents };
+    if (mode === 'removed') f.control.parentSubagents = undefined;
+    if (mode === 'route-changed') f.services.subagents = f.control.parentSubagents;
+    if (mode === 'provider') f.control.provider = { ...f.provider };
+    if (mode === 'provider-capability') f.provider.capabilities.agentPreset = false;
+    const expected = mode.startsWith('provider') ? 'provider-changed' : 'service-changed';
+    assert.ok(f.guard(call).includes(expected), mode); await f.run();
+    assert.equal(f.runtime.status().lastError.code, 'owner-desktop.' + expected, mode);
+    assert.ok(f.runtime.status().lastError.hint); assert.equal(f.disposals(), 1);
+    assert.equal(f.runtime.status().lastResult.status, 'cancelled'); await f.runtime.stop();
+  }
+});
+await check('service replacement during broker validation cannot authorize the pending call', async () => {
+  for (const isolatedSubagents of [false, true]) {
+    const f = fixture({ strictServices: true, traceServices: true, isolatedSubagents }); await f.begin();
+    f.control.validateHook = () => {
+      if (isolatedSubagents) f.control.parentSubagents = { ...f.control.parentSubagents };
+      else f.services.subagents = { ...f.services.subagents };
+    };
+    assert.match(await f.execute(f.exec()), /service-changed/); await f.run();
+    assert.equal(f.runtime.status().lastResult.status, 'cancelled'); assert.equal(f.disposals(), 1); await f.runtime.stop();
+  }
+});
+await check('root guard registries cannot be replaced while an activation remains authorized', async () => {
+  for (const name of ['agents', 'agentPresets', 'tools']) {
+    const f = fixture({ strictServices: true, traceServices: true, isolatedSubagents: true }); await f.begin();
+    const call = f.exec(); await f.prepare(call); f.services[name] = { ...f.services[name] };
+    assert.match(f.guard(call), /service-changed/); await f.run();
+    assert.equal(f.runtime.status().lastError.code, 'owner-desktop.service-changed');
+    assert.ok(f.runtime.status().lastError.hint); assert.equal(f.disposals(), 1); await f.runtime.stop();
+  }
+});
+await check('idle workers also lose replaced preset services on heartbeat and before success reporting', async () => {
+  const heartbeat = fixture({ strictServices: true, traceServices: true, isolatedSubagents: true }); await heartbeat.begin();
+  heartbeat.control.parentSubagents = undefined; await heartbeat.fire(2000); await heartbeat.run();
+  assert.equal(heartbeat.runtime.status().lastError.code, 'owner-desktop.service-changed');
+  assert.equal(heartbeat.disposals(), 1); await heartbeat.runtime.stop();
+  const completion = fixture({ strictServices: true, traceServices: true, isolatedSubagents: true }); await completion.begin();
+  completion.control.parentSubagents = undefined; await completion.finish();
+  assert.equal(completion.runtime.status().lastResult.status, 'cancelled');
+  assert.equal(completion.runtime.status().lastError.code, 'owner-desktop.service-changed'); await completion.runtime.stop();
 });
 
 console.log(`Owner desktop runtime: ${passed} behavior groups passed (offline; no model, Windows, network or production writes).`);

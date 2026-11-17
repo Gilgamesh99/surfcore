@@ -196,7 +196,7 @@ function QQ_STATE_DIR() {
 }
 
 export const name = 'surfcore';
-export const inject = ['webServer', 'connection', 'sessionController', 'agents', 'systemPrompt', 'agentPresets'];
+export const inject = ['webServer', 'connection', 'sessionController', 'agents', 'systemPrompt', 'agentPresets', 'tools'];
 
 export function apply(ctx) {
   ensureDirs();

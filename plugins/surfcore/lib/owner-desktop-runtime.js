@@ -6,6 +6,12 @@ const MAX_TIMEOUT_MS = 600_000;
 const POLL_MS = 2_000;
 const WORKER_LABEL = 'SurfCore owner desktop task';
 const WORKER_PRESET = 'owner-desktop';
+// Cordis exports this symbol; each ctx.get/serviceFor read may return a new tracing proxy.
+const SERVICE_ORIGINAL = Symbol.for('cordis.original');
+function serviceIdentity(value) { return value?.[SERVICE_ORIGINAL] ?? value; }
+function safeService(ctx, name) {
+  try { return typeof ctx?.get === 'function' ? ctx.get(name) : undefined; } catch { return undefined; }
+}
 
 function failure(code, error, hint) { return { ok: false, code, error, hint }; }
 function deferred() {
@@ -49,6 +55,36 @@ export function installOwnerDesktopRuntime(ctx, {
   const ownedSessions = new Set();
   const listeners = [];
   let hooksReady = false;
+  const agentRegistry = safeService(ctx, 'agents');
+  const presetRegistry = safeService(ctx, 'agentPresets');
+  const toolRegistry = safeService(ctx, 'tools');
+
+  function rootServicesMatch() {
+    return [['agents', agentRegistry], ['agentPresets', presetRegistry], ['tools', toolRegistry]]
+      .every(([name, bound]) => bound && serviceIdentity(safeService(ctx, name)) === serviceIdentity(bound));
+  }
+  function validParent(parent, config) {
+    try {
+      return !!parent && agentRegistry.get(config.parentSessionId) === parent
+        && sessionId(parent) === config.parentSessionId && !parent.session?.header?.parentSession
+        && parent.session?.header?.origin !== 'subagent' && !isOtherManaged(parent);
+    } catch { return false; }
+  }
+  function subagentService(parent) {
+    // Only called after checking the exact live human management parent.
+    try {
+      const root = safeService(ctx, 'subagents');
+      return root ? { service: root, source: 'root' }
+        : { service: presetRegistry?.serviceFor?.(parent, 'subagents'), source: 'parent-preset' };
+    } catch { return { service: undefined, source: 'parent-preset' }; }
+  }
+  function supportedProvider(provider) {
+    return provider?.inheritsParentContext === false && typeof provider.prepareContinuable === 'function'
+      && ['depthLimit', 'agentPreset'].every(key => provider.capabilities?.[key] === true);
+  }
+  function missingCapabilities(missing) {
+    return failure('owner-desktop.host-unavailable', '宿主缺少受控桌面子代理接口：' + missing.join('、') + '。', '更新并重载 SurfCore 与 DSH 后重试。');
+  }
 
   function settings() {
     try {
@@ -61,39 +97,47 @@ export function installOwnerDesktopRuntime(ctx, {
     } catch { return { enabled: false, parentSessionId: '', authorizationEpoch: '', ownerQQ: '', timeoutMs: MAX_TIMEOUT_MS }; }
   }
   function toolNames() {
-    const schemas = ctx?.tools?.definitions?.();
+    const schemas = toolRegistry?.definitions?.();
     if (!Array.isArray(schemas)) return [];
     return [...new Set(schemas.map(schema => schema?.name).filter(isOwnerDesktopTool))];
   }
-  function hostIssue(config) {
-    if (!hooksReady || typeof ctx?.agents?.get !== 'function' || typeof ctx?.subagents?.startActivation !== 'function'
-      || typeof ctx?.subagents?.getProvider !== 'function' || typeof bridge !== 'function'
-      || typeof registerWorkerSession !== 'function' || typeof isWorkerSession !== 'function'
-      || typeof ctx?.tools?.definitions !== 'function' || typeof getPresetStatus !== 'function'
-      || typeof ctx?.agentPresets?.composedPreset !== 'function') {
-      return failure('owner-desktop.host-unavailable', '宿主缺少受控桌面子代理接口。', '更新并重载 SurfCore 与 DSH 后重试。');
-    }
+  function inspectHost(config) {
+    const missing = Object.entries({ hooks: hooksReady, 'context.get': typeof ctx?.get === 'function',
+      'agents.get': typeof agentRegistry?.get === 'function', bridge: typeof bridge === 'function',
+      registerWorkerSession: typeof registerWorkerSession === 'function', isWorkerSession: typeof isWorkerSession === 'function',
+      'tools.guard': typeof toolRegistry?.guard === 'function', 'tools.definitions': typeof toolRegistry?.definitions === 'function',
+      getPresetStatus: typeof getPresetStatus === 'function',
+      'agentPresets.composedPreset': typeof presetRegistry?.composedPreset === 'function',
+    }).filter(([, available]) => !available).map(([name]) => name);
+    if (missing.length) return { issue: missingCapabilities(missing) };
+    if (!rootServicesMatch()) return { issue: failure('owner-desktop.service-changed', '宿主服务已经关闭或替换。', '重载 SurfCore 后重新启用桌面任务。') };
     const preset = getPresetStatus();
-    if (preset?.ok !== true) return failure('owner-desktop.preset-unavailable', '隔离桌面预设尚未就绪。', preset?.hint || '重载 SurfCore 并确认主人桌面任务预设注册成功后重试。');
+    if (preset?.ok !== true) return { issue: failure('owner-desktop.preset-unavailable', '隔离桌面预设尚未就绪。', preset?.hint || '重载 SurfCore 并确认主人桌面任务预设注册成功后重试。') };
     if (!config.parentSessionId || !config.authorizationEpoch || !config.ownerQQ) {
-      return failure('owner-desktop.settings-incomplete', '主人桌面任务设置不完整。', '在设置页保存主人账号和已授权的管理会话。');
+      return { issue: failure('owner-desktop.settings-incomplete', '主人桌面任务设置不完整。', '在设置页保存主人账号和已授权的管理会话。') };
     }
-    const parent = ctx.agents.get(config.parentSessionId);
-    if (!parent || sessionId(parent) !== config.parentSessionId || parent.session?.header?.parentSession
-      || parent.session?.header?.origin === 'subagent' || isOtherManaged(parent)) {
-      return failure('owner-desktop.parent-unavailable', '已授权的管理会话当前不可用。', '打开独立管理会话，手动开启 Computer Use 后重新保存该会话。');
+    const parent = agentRegistry.get(config.parentSessionId);
+    if (!validParent(parent, config)) {
+      return { issue: failure('owner-desktop.parent-unavailable', '已授权的管理会话当前不可用。', '打开独立管理会话，手动开启 Computer Use 后重新保存该会话。') };
     }
-    const provider = ctx.subagents.getProvider('spawn');
-    if (!provider || provider.inheritsParentContext !== false || typeof provider.prepareContinuable !== 'function'
-      || !['depthLimit', 'agentPreset'].every(key => provider.capabilities?.[key] === true)) {
-      return failure('owner-desktop.provider-unavailable', '宿主不支持隔离的本地子代理。', '启用支持 startActivation 与独立 agentPreset 的 DSH spawn 提供方。');
+    const selected = subagentService(parent);
+    const unavailable = Object.entries({
+      'subagents.startActivation': typeof selected.service?.startActivation === 'function',
+      'subagents.getProvider': typeof selected.service?.getProvider === 'function',
+      ...(selected.source === 'parent-preset' ? { 'agentPresets.serviceFor': typeof presetRegistry?.serviceFor === 'function' } : {}),
+    }).filter(([, available]) => !available).map(([name]) => name);
+    if (unavailable.length) return { issue: missingCapabilities(unavailable) };
+    const provider = selected.service.getProvider('spawn');
+    if (!supportedProvider(provider)) {
+      return { issue: failure('owner-desktop.provider-unavailable', '宿主不支持隔离的本地子代理。', '启用支持 startActivation 与独立 agentPreset 的 DSH spawn 提供方。') };
     }
     const names = toolNames();
     if (!names.includes('windows_desktop') || !names.some(name => name.startsWith('mcp__windows__'))) {
-      return failure('owner-desktop.tools-unavailable', '宿主尚未注册可用的 Windows 桌面工具。', '启用 Windows MCP 并等候工具注册后重新发送指令。');
+      return { issue: failure('owner-desktop.tools-unavailable', '宿主尚未注册可用的 Windows 桌面工具。', '启用 Windows MCP 并等候工具注册后重新发送指令。') };
     }
-    return null;
+    return { parent, subagents: selected.service, serviceSource: selected.source, provider };
   }
+  function hostIssue(config) { return inspectHost(config).issue ?? null; }
   function status() {
     const config = settings();
     let issue = lastError;
@@ -124,7 +168,7 @@ export function installOwnerDesktopRuntime(ctx, {
     if (!lease || lease.published || !lease.parent || !agent || sessionId(agent) !== lease.childId) return null;
     if (agent.session?.header?.origin !== 'subagent'
       || agent.session?.header?.parentSession !== sessionId(lease.parent)
-      || ctx.agents.get(sessionId(agent)) !== agent) return null;
+      || agentRegistry.get(sessionId(agent)) !== agent) return null;
     if (!lease.candidates.has(agent)) lease.candidates.set(agent, { initial: null, turn: null, invalid: false, inserted: null });
     return lease.candidates.get(agent);
   }
@@ -150,7 +194,7 @@ export function installOwnerDesktopRuntime(ctx, {
         for (const descendant of seen) remember(descendant);
         return true;
       }
-      cursor = ctx?.agents?.get?.(header.parentSession);
+      cursor = agentRegistry?.get?.(header.parentSession);
     }
     return false;
   }
@@ -178,13 +222,25 @@ export function installOwnerDesktopRuntime(ctx, {
     if (!configMatches(lease)) return failure('owner-desktop.settings-changed', '桌面任务设置或主人身份已经变化。', '确认设置后由主人重新发送指令。');
     if (now() >= lease.deadline || now() >= lease.task?.expiresAt)
       return failure('owner-desktop.expired', '桌面任务已超时或指令已过期。', '检查当前桌面状态后重新发送指令。');
-    if (ctx.agents.get(lease.config.parentSessionId) !== lease.parent)
+    if (!rootServicesMatch())
+      return failure('owner-desktop.service-changed', '宿主服务已经关闭或替换。', '重载 SurfCore 后重新启用桌面任务。');
+    if (!validParent(lease.parent, lease.config))
       return failure('owner-desktop.parent-unavailable', '管理会话已经关闭或替换。', '重新打开并授权管理会话后再发送指令。');
+    try {
+      const current = subagentService(lease.parent);
+      if (current.source !== lease.serviceSource || serviceIdentity(current.service) !== lease.subagentIdentity)
+        return failure('owner-desktop.service-changed', '管理会话的子代理服务已经关闭或替换。', '确认管理会话服务后重新发送指令。');
+      const provider = current.service?.getProvider?.('spawn');
+      if (serviceIdentity(provider) !== lease.providerIdentity || !supportedProvider(provider))
+        return failure('owner-desktop.provider-changed', '桌面任务的 spawn 提供方已经关闭或替换。', '确认本地 spawn 提供方后重新发送指令。');
+    } catch {
+      return failure('owner-desktop.service-changed', '无法重新校验管理会话的子代理服务。', '重载 SurfCore 后重新发送指令。');
+    }
     if (getPresetStatus?.()?.ok !== true)
       return failure('owner-desktop.preset-unavailable', '隔离桌面预设已卸载。', '重载 SurfCore 后重新发送指令。');
-    if (agent && (agent !== lease.child || ctx.agents.get(sessionId(agent)) !== agent))
+    if (agent && (agent !== lease.child || agentRegistry.get(sessionId(agent)) !== agent))
       return failure('owner-desktop.agent-mismatch', '工具调用不属于当前桌面任务。', '只允许当前受控任务子代理执行。');
-    if (agent && (!lease.boundary?.isActive() || ctx.agentPresets.composedPreset(agent.ctx) !== WORKER_PRESET))
+    if (agent && (!lease.boundary?.isActive() || presetRegistry.composedPreset(agent.ctx) !== WORKER_PRESET))
       return failure('owner-desktop.boundary-unavailable', '隔离桌面执行边界已失效。', '重载桌面任务预设后重试。');
     if (agent && (!lease.record?.initial || !Number.isSafeInteger(lease.record.turn) || !lease.stepAccepted || lease.record.invalid || lease.ended))
       return failure('owner-desktop.turn-mismatch', '当前消息或轮次没有桌面授权。', '由主人重新发送单条桌面指令。');
@@ -333,8 +389,8 @@ export function installOwnerDesktopRuntime(ctx, {
   function listen(name, fn) { const off = ctx.on(name, fn); if (typeof off === 'function') listeners.push(off); }
 
   try {
-    if (typeof ctx?.on === 'function' && typeof ctx?.tools?.guard === 'function') {
-      const off = ctx.tools.guard(guard);
+    if (typeof ctx?.on === 'function' && typeof toolRegistry?.guard === 'function') {
+      const off = toolRegistry.guard(guard);
       if (typeof off === 'function') listeners.push(off);
       listen('tools/pre-execute', preExecute);
       listen('agent/created', created);
@@ -389,9 +445,13 @@ export function installOwnerDesktopRuntime(ctx, {
         completion = failure('owner-desktop.invalid-task', '桥接任务缺少可信消息来源。', '由主人重新发送实时桌面指令。');
         return;
       }
-      const issue = hostIssue(config);
-      if (issue) { completion = issue; return; }
-      lease.parent = ctx.agents.get(config.parentSessionId);
+      const host = inspectHost(config);
+      if (host.issue) { completion = host.issue; return; }
+      lease.parent = host.parent;
+      lease.subagents = host.subagents;
+      lease.serviceSource = host.serviceSource;
+      lease.subagentIdentity = serviceIdentity(host.subagents);
+      lease.providerIdentity = serviceIdentity(host.provider);
       const invalid = leaseIssue(lease);
       if (invalid) { completion = invalid; return; }
       const validated = await call('validate', { taskId, leaseId: lease.leaseId });
@@ -401,7 +461,7 @@ export function installOwnerDesktopRuntime(ctx, {
       timeout = setTimer(() => revoke(lease, failure('owner-desktop.timeout', '桌面任务已达到时间上限。', '先确认当前桌面状态，再发送新的指令。')), Math.max(1, Math.min(lease.deadline, lease.task.expiresAt) - now()));
       timeout?.unref?.();
       watch();
-      if (typeof lease.childId !== 'string' || !lease.childId || ctx.agents.get(lease.childId) || isWorkerSession(lease.childId)) {
+      if (typeof lease.childId !== 'string' || !lease.childId || agentRegistry.get(lease.childId) || isWorkerSession(lease.childId)) {
         completion = failure('owner-desktop.child-id-unavailable', '无法预留全新的桌面任务身份。', '重新发送指令以生成新的独立任务。');
         return;
       }
@@ -416,15 +476,15 @@ export function installOwnerDesktopRuntime(ctx, {
       if (cancelled) { completion = cancelled; return; }
       lease.phase = 'starting';
       lease.prompt = lease.task.text;
-      run = await ctx.subagents.startActivation({ provider: 'spawn', parent: lease.parent, childId: lease.childId,
+      run = await lease.subagents.startActivation({ provider: 'spawn', parent: lease.parent, childId: lease.childId,
         prompt: [{ type: 'text', text: lease.prompt }], label: WORKER_LABEL, delivery: 'caller',
         signal: lease.controller.signal, agentPreset: WORKER_PRESET, maxDepth: 1 });
-      const child = ctx.agents.get(lease.childId);
+      const child = agentRegistry.get(lease.childId);
       if (!child || !run?.result || typeof run.dispose !== 'function' || run.childId !== sessionId(child)
         || run.childId !== lease.childId || typeof run.messageId !== 'string' || !run.messageId
         || child.session?.header?.parentSession !== sessionId(lease.parent) || child.session?.header?.origin !== 'subagent'
         || child.session?.header?.isSeeded !== false || child.session?.inheritedEventCount !== 0
-        || ctx.agentPresets.composedPreset(child.ctx) !== WORKER_PRESET) {
+        || presetRegistry.composedPreset(child.ctx) !== WORKER_PRESET) {
         completion = failure('owner-desktop.nonlocal-provider', '提供方没有返回可验证的独立本地子代理。', '启用支持独立预设和本地 startActivation 的 spawn 后重试。');
         revoke(lease, completion, 'failed');
         return;
@@ -450,6 +510,8 @@ export function installOwnerDesktopRuntime(ctx, {
       lease.ready.resolve();
       publish();
       const result = await run.result;
+      const finishedIssue = leaseIssue(lease);
+      if (finishedIssue && !lease.revoked) revoke(lease, finishedIssue);
       lease.settled = true;
       lease.ended = true;
       lease.tickets.clear();
