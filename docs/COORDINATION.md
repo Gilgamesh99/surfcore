@@ -18,6 +18,7 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **Fork dev 与原作者更新（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-fork-dev` | `feat/fork-dev-upstream`（基线f80a5a2） | 双远程、本地dev推送、独立upstream/main更新；Lead管Git/配置，队友仅更新器源码与测试 | 原始Git配置和全部历史已备份；两边历史已无冲突合并，兼容实现与验证中 |
 | **B站双分支本机集成（2026-11-13 夜）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-bili-integration` | `feat/bili-integration-20261113`（基线c9b8dbe） | 合并阅读/私信分享，修正消息顺序与测试隔离，保留远端更新 | 已快进生产并重载；新路由/GUI/群匹配/完整人格验收通过；审计残项复验通过，插件44/45（唯一旧基线同样失败）；备份保留，未发布或发送测试消息 |
 | **B站私聊视频分享（2026-11-13 晚）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-bili-dm-share` | `feat/bili-dm-share`（基线 `c9b8dbe`；本机无 dev） | 连续私信/视频卡片、指定QQ群投递与回报、持久化确认和失败可见；Lead 与队友按文件隔离 | 已随本机双分支集成加载；保留真实只读字段修复，收件与群定位在线验收完成；真实群投递未测试、未发布 |
 | **QQ 人格请求回归（2026-11-13 晚）** | `D:/Project/surfcore-persona-request-fix` | `fix/persona-request-regression`（基线 `f3fff44`） | 复现并修复最终模型请求人格单例校验误报，保留完整人格与远程更新能力；Lead 串行生产变更 | 修复与真实206事件离线重放通过；插件全套通过，审计160/161（旧R11耗时不稳定）；本机加载另存验收，未发布 |

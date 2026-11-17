@@ -302,8 +302,14 @@ export function apply(ctx) {
     components: () => {
       const list = [];
       const updCfg = readUnified().config?.updates ?? {};
-      // 1) SurfCore 本体：源码树，走 git
-      list.push({ id: 'surfcore', name: 'SurfCore 本体', dir: QQBOT_ROOT, kind: 'git', branch: 'main', versionRepo: 'Mieksido/surfcore' });
+      // 1) SurfCore 本体：本地分支保护与 Git 更新来源分开配置；ZIP 仍读原作者发布。
+      const coreCfg = updCfg.surfcore ?? {};
+      const coreBranch = String(coreCfg.branch ?? 'main').trim() || 'main';
+      list.push({
+        id: 'surfcore', name: 'SurfCore 本体', dir: QQBOT_ROOT, kind: 'git', branch: coreBranch,
+        remote: coreCfg.remote ?? 'origin', remoteBranch: coreCfg.remoteBranch ?? coreBranch,
+        versionRepo: 'Mieksido/surfcore',
+      });
       // 2) 语音包**不进入自动更新列表**：它是离线运行时/模型/vendor 包，
       //    不是 SurfCore 那种代码 zip；统一 updateFromZip 会按 surfcore-* + package.json
       //    解析而必然失败（2026-10-30 用户反馈）。需要新包时在「语音」页重新导入离线包，
@@ -333,6 +339,7 @@ export function apply(ctx) {
               dir: String(item.dir),
               kind: ['git', 'release', 'auto'].includes(item.kind) ? item.kind : 'auto',
               branch: item.branch ? String(item.branch).slice(0, 60) : undefined,
+              remote: item.remote, remoteBranch: item.remoteBranch,
               versionUrl: item.versionUrl ? String(item.versionUrl) : '',
             });
           }

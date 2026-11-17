@@ -1,5 +1,7 @@
 # 案例索引（每次修 bug 都要在这里留一条）
 
+- [2026-11-17 Fork dev 与原作者更新分离](2026-11-17-fork-dev-upstream-updates.md)：推送 fork/dev，独立读取 upstream/main，正常合并保留两边历史。
+
 - [2026-11-13 B站阅读与私信分享本机集成](2026-11-13-bili-local-integration.md)：双分支合并、消息顺序、宿主测试隔离、运行加载与更新保护。
 
 > 规矩：**修完一个 bug，必须写一份 case 记录并在此登记**（模板见 [`_TEMPLATE.md`](_TEMPLATE.md)）。

@@ -680,15 +680,32 @@ export async function inspectGitComponent(component, { fetch = true } = {}) {
   const branch = current.stdout.trim();
   const expected = String(component?.branch ?? '').trim();
   if (expected && branch !== expected) return fail('git.branch-mismatch', '当前分支 ' + branch + ' 与配置分支 ' + expected + ' 不一致', { branch });
-  const remoteUrl = await git('remote', 'get-url', 'origin');
-  if (!remoteUrl.ok) return fail('no-origin', '没有可读取的 origin remote', { branch });
+  // Local branch protection is independent of the named remote and its source branch.
+  const remoteName = component?.remote ?? 'origin';
+  const remoteBranch = component?.remoteBranch ?? (expected || branch);
+  const safeName = (value) => typeof value === 'string' && value.length > 0
+    && !value.startsWith('-') && !/[\x00-\x20\x7f\\]/.test(value);
+  if (!safeName(remoteName) || !(await git('check-ref-format', 'refs/remotes/' + remoteName + '/HEAD')).ok) {
+    return fail('git.invalid-remote', 'Git 更新远端名称无效', { branch,
+      hint: '将 remote 配置为已登记的 Git 远端名称（如 origin 或 upstream），不要填写 URL 或命令参数' });
+  }
+  if (!safeName(remoteBranch) || !(await git('check-ref-format', 'refs/heads/' + remoteBranch)).ok) {
+    return fail('git.invalid-remote-branch', 'Git 更新远端分支无效', { branch,
+      hint: '将 remoteBranch 配置为远端实际分支名称（如 main），不要填写 refspec 或命令参数' });
+  }
+  Object.assign(base, { remoteName, remoteBranch });
+  const remoteRef = 'refs/remotes/' + remoteName + '/' + remoteBranch;
+  const remoteUrl = await git('remote', 'get-url', '--', remoteName);
+  if (!remoteUrl.ok) return fail(remoteName === 'origin' ? 'no-origin' : 'git.remote-missing', '没有可读取的 ' + remoteName + ' remote', { branch,
+    hint: '先在此仓库配置指定的 ' + remoteName + ' 远端，再检查更新；不会自动改用其他远端' });
   if (fetch) {
-    const fetched = await git('fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/' + branch + ':refs/remotes/origin/' + branch);
-    if (!fetched.ok) return fail('git.fetch-failed', 'git fetch 失败；不能把缓存的远端提交当成最新', { branch, fetchError: 'fetch failed' });
+    const fetched = await git('fetch', '--quiet', '--no-tags', '--', remoteName, '+refs/heads/' + remoteBranch + ':' + remoteRef);
+    if (!fetched.ok) return fail('git.fetch-failed', 'git fetch ' + remoteName + '/' + remoteBranch + ' 失败；不能把缓存的远端提交当成最新', { branch,
+      fetchError: 'fetch failed', hint: '检查指定远端的地址、网络及 ' + remoteBranch + ' 分支是否存在，再重试；不会自动改用其他远端' });
   }
   const local = await git('rev-parse', '--verify', 'HEAD^{commit}');
-  const remote = await git('rev-parse', '--verify', 'refs/remotes/origin/' + branch + '^{commit}');
-  if (!local.ok || !remote.ok) return fail('remote-unreachable', '无法读取本地或 origin/' + branch + ' 的提交', { branch });
+  const remote = await git('rev-parse', '--verify', remoteRef + '^{commit}');
+  if (!local.ok || !remote.ok) return fail('remote-unreachable', '无法读取本地或 ' + remoteName + '/' + remoteBranch + ' 的提交', { branch });
   const fromHead = local.stdout.trim(), targetSha = remote.stdout.trim();
   const dirtyOut = await git('status', '--porcelain=v1', '--untracked-files=all');
   const counts = await git('rev-list', '--left-right', '--count', fromHead + '...' + targetSha);
@@ -1833,6 +1850,7 @@ export function createUpdatesService({ stateDir, components, blockedReason = () 
             kind: 'git', component: String(item.id), target: report.dir,
             repoRoot: report.repoRoot, gitDir: report.gitDir, expectedBranch: report.branch,
             fromHead: report.local, targetSha: report.remote, policy: report.policy,
+            remoteName: report.remoteName, remoteBranch: report.remoteBranch,
             from: report.installedVersion, to: report.latestVersion, txn: randomUUID(),
           });
           if (!staged.ok) { results.push({ id: item.id, ...staged }); continue; }

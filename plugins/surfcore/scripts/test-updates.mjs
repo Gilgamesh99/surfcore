@@ -19,7 +19,17 @@ const ok = (cond, label) => {
   else { failures += 1; console.error(`❌ ${label}`); }
 };
 
-const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+// Apply isolation to the inspector's Git children as well as fixture commands.
+const gitOverrides = { GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_ALLOW_PROTOCOL: 'file' };
+const gitKeys = new Set([...Object.keys(gitOverrides), 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+  ...Object.keys(process.env).filter((key) => /^GIT_(AUTHOR|COMMITTER)_|^GIT_CONFIG_(COUNT|KEY_|VALUE_)/.test(key))]);
+const originalGitEnv = new Map([...gitKeys].map((key) => [key, process.env[key]]));
+for (const key of gitKeys) delete process.env[key];
+Object.assign(process.env, gitOverrides);
+const GIT_ENV = { ...process.env };
+const originalFetch = global.fetch;
+let networkCalls = 0;
+global.fetch = async () => { networkCalls++; throw new Error('Unexpected HTTP fetch in offline update test'); };
 function git(args, cwd) {
   return execFileSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.com', ...args], {
     cwd, encoding: 'utf8', env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'],
@@ -219,6 +229,73 @@ try {
     ok(blockedApply.ok === false && /正在运行/.test(blockedApply.results[0].error), '运行中的组件被拒绝更新');
   }
 
+  console.log('## 6. fork dev 与原作者 main：独立来源、失败不回退、固定提交排队');
+  {
+    const forkRemote = path.join(base, 'fork.git'), forkWork = path.join(base, 'fork-work'), forkWriter = path.join(base, 'fork-writer');
+    git(['-c', 'init.defaultBranch=dev', 'init', '--bare', forkRemote], base);
+    git(['clone', remote, forkWork], base);
+    git(['switch', '-c', 'dev'], forkWork);
+    git(['remote', 'rename', 'origin', 'upstream'], forkWork);
+    git(['remote', 'add', 'origin', forkRemote], forkWork);
+    fs.writeFileSync(path.join(forkWork, 'local-fork.txt'), 'keep local history\n');
+    git(['add', '--', 'local-fork.txt'], forkWork); git(['commit', '-m', 'local fork change'], forkWork);
+    git(['push', '-u', 'origin', 'dev'], forkWork);
+    git(['clone', forkRemote, forkWriter], base);
+    fs.writeFileSync(path.join(forkWriter, 'fork-only.txt'), 'fork remote only\n');
+    git(['add', '--', 'fork-only.txt'], forkWriter); git(['commit', '-m', 'fork remote change'], forkWriter);
+    git(['push', 'origin', 'dev'], forkWriter);
+    const forkTarget = git(['rev-parse', 'HEAD'], forkWriter);
+    fs.writeFileSync(path.join(other, 'author-only.txt'), 'original author only\n');
+    git(['add', '--', 'author-only.txt'], other); git(['commit', '-m', 'original author change'], other);
+    git(['push', 'origin', 'main'], other);
+    const authorTarget = git(['rev-parse', 'HEAD'], other);
+    const component = { id: 'surfcore', name: '本体', dir: forkWork, kind: 'git', branch: 'dev', remote: 'upstream', remoteBranch: 'main', versionRepo: 'never/request-http' };
+    const before = { head: git(['rev-parse', 'HEAD'], forkWork), index: git(['ls-files', '--stage'], forkWork), config: git(['config', '--local', '--list'], forkWork) };
+    const selected = await inspectComponent(component, { fetch: true });
+    ok(selected.available && selected.branch === 'dev' && selected.remoteName === 'upstream' && selected.remoteBranch === 'main', '本地 dev 独立读取 upstream/main 并暴露来源');
+    ok(selected.remote === authorTarget && selected.remote !== forkTarget && selected.ahead === 1 && selected.behind === 1, '目标 SHA 与提交差异来自原作者，保留本地领先历史');
+    ok(selected.policy === 'preserve-local' && !selected.blocked && selected.changelog.some((line) => line.includes('original author change')) && !selected.changelog.some((line) => line.includes('fork remote change')), '原作者 changelog 与 preserve-local 策略一致');
+    ok(git(['rev-parse', 'origin/dev'], forkWork) === before.head, 'upstream 检查不会顺便抓取 origin');
+    ok(git(['rev-parse', 'HEAD'], forkWork) === before.head && git(['branch', '--show-current'], forkWork) === 'dev'
+      && git(['ls-files', '--stage'], forkWork) === before.index && git(['config', '--local', '--list'], forkWork) === before.config
+      && git(['status', '--porcelain'], forkWork) === '' && !fs.existsSync(path.join(forkWork, 'author-only.txt')), '检查不切分支、不写工作树/索引内容、不改仓库配置');
+    const defaults = await inspectComponent({ id: 'surfcore', dir: forkWork, branch: 'dev' }, { fetch: true });
+    ok(defaults.remoteName === 'origin' && defaults.remoteBranch === 'dev' && defaults.remote === forkTarget, '未配置来源仍检查 origin/本地分支');
+    const mismatch = await inspectComponent({ ...component, branch: 'main' }, { fetch: true });
+    ok(mismatch.code === 'git.branch-mismatch' && mismatch.hint, '独立来源不会绕过本地分支保护');
+    const missingBranch = await inspectComponent({ ...component, remoteBranch: undefined }, { fetch: true });
+    ok(!missingBranch.available && missingBranch.code === 'git.fetch-failed' && missingBranch.remoteBranch === 'dev' && missingBranch.hint, '未配置 remoteBranch 时沿用本地分支；远端不存在就报错');
+    const missingRemote = await inspectComponent({ ...component, remote: 'missing-upstream' }, { fetch: true });
+    ok(!missingRemote.available && missingRemote.code === 'git.remote-missing' && missingRemote.hint && missingRemote.remoteName === 'missing-upstream', '显式远端缺失不会回退 origin 或 HTTP');
+    for (const value of ['--upload-pack=unexpected', '../outside', 'https://example.test/unused.git', 'upstream\0hidden', 17]) {
+      const invalid = await inspectComponent({ ...component, remote: value }, { fetch: true });
+      ok(!invalid.available && invalid.code === 'git.invalid-remote' && invalid.error && invalid.hint, '非法 remote 被结构化拒绝');
+    }
+    for (const value of ['--all', 'main:refs/heads/dev', '../main', 'main\0hidden', {}]) {
+      const invalid = await inspectComponent({ ...component, remoteBranch: value }, { fetch: true });
+      ok(!invalid.available && invalid.code === 'git.invalid-remote-branch' && invalid.error && invalid.hint, '非法 remoteBranch 被结构化拒绝');
+    }
+    git(['remote', 'set-url', 'upstream', path.join(base, 'missing-upstream.git')], forkWork);
+    const failedSvc = createUpdatesService({ stateDir: path.join(base, 'failed-upstream'), components: () => [component] });
+    const failed = await failedSvc.check({ fetch: true });
+    ok(failed.results[0].code === 'git.fetch-failed' && failed.results[0].hint && failed.results[0].remoteName === 'upstream'
+      && failed.unknownCount === 1 && failed.availableUpdateCount === 0, 'upstream fetch 失败不使用已有缓存或可用的 origin');
+    git(['remote', 'set-url', 'upstream', remote], forkWork);
+    const forkState = path.join(base, 'fork-state');
+    const svc = createUpdatesService({ stateDir: forkState, components: () => [component] });
+    process.env.SURFCORE_UPDATE_NO_SPAWN = '1';
+    let staged;
+    try { staged = await svc.apply(['surfcore']); } finally { delete process.env.SURFCORE_UPDATE_NO_SPAWN; }
+    ok(staged.ok && staged.pendingRestart === 1 && staged.updated === 0, 'dev 上的上游更新只排队，不在宿主内应用');
+    const queued = JSON.parse(fs.readFileSync(path.join(forkState, 'updates-pending.json'), 'utf8'));
+    ok(queued.expectedBranch === 'dev' && queued.fromHead === before.head && queued.targetSha === authorTarget
+      && queued.policy === 'preserve-local' && queued.remoteName === 'upstream' && queued.remoteBranch === 'main' && queued.txn, 'dev 排队固定原作者 SHA、本地 HEAD/分支、策略和来源');
+    ok(git(['rev-parse', 'HEAD'], forkWork) === before.head && git(['status', '--porcelain'], forkWork) === ''
+      && fs.readFileSync(path.join(forkWork, 'local-fork.txt'), 'utf8') === 'keep local history\n'
+      && !fs.existsSync(path.join(forkWork, 'author-only.txt')) && !fs.existsSync(path.join(forkWork, 'fork-only.txt')), '排队后本地文件和提交保持不变');
+    ok(networkCalls === 0, 'Git 来源失败没有发起任何 HTTP fallback');
+  }
+
   console.log('## 7. 版本号比较（semver，不是字符串比较）');
   {
     ok(compareVersions('0.10.0', '0.9.0') === 1, '0.10.0 > 0.9.0');
@@ -330,6 +407,8 @@ try {
       '进度条保留下载统计、有百分比时不再跑马灯，staged 后弹重启提示');
   }
 } finally {
+  global.fetch = originalFetch;
+  for (const [key, value] of originalGitEnv) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   try { fs.rmSync(base, { recursive: true, force: true }); } catch {}
 }
 

@@ -1,5 +1,9 @@
 # 路线图与路线守则（ROADMAP）
 
+## 2026-11-17：Fork 开发与原作者更新
+
+用户自己的 origin/dev 用于保存本机修改，upstream/main 用于检测原作者更新。选择显式更新来源，不自动猜 upstream，也不把 Git 失败降为 ZIP 覆盖；正常合并与固定 SHA 执行保持。验证和回滚见[case](cases/2026-11-17-fork-dev-upstream-updates.md)。
+
 ## 2026-11-13 B站功能本机集成
 
 保留双分支祖先关系后快进当前main，保留preserve-local更新；集成时补齐两分钟内文字后接视频的持久配对，并将宿主测试完全隔离在动态导入之前。不能用只禁用自动启动代替路径/网络隔离。执行与回滚见[集成记录](cases/2026-11-13-bili-local-integration.md)。

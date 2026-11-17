@@ -1,5 +1,9 @@
 # 交接状态（HANDOFF）
 
+## 2026-11-17：Fork dev 与原作者更新
+
+用户授权双远程和推送已有功能。隔离工作树 surfcore-fork-dev 从 f80a5a2 合并 fork/dev 的 383f171，保留原有 sync-fork 工作流；独立 remote/remoteBranch 配置使本地 dev 仍从原作者 main 更新。配置与历史已备份，正式验证和运行状态见[case](cases/2026-11-17-fork-dev-upstream-updates.md)。
+
 ## 2026-11-13：两条B站功能集成与保留本地更新
 
 按用户要求将动态阅读ad3282b与私信分享8b73d7d合入c9b8dbe基线，保留人格与preserve-local更新，已快进生产main并重载插件/QQ桥接。集成补齐先文字后卡片的两分钟持久等待，并修复宿主测试写真实配置的隔离问题。现有GUI新面板、私信成功轮询、指定群“命运糕手”唯一匹配、DSH/SnowLuma在线及8656字符完整人格均已核验。审计159/163后四项分别复验通过；插件累计44/45，唯一helper启动夹具在旧基线也失败。详细证据、更新检查与边界见[集成case](cases/2026-11-13-bili-local-integration.md)；下方两个功能分支状态是集成前历史。

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
+import { createUpdatesService } from '../plugins/surfcore/lib/updates.js';
 
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'surfcore-git-apply-'));
 const helper = fileURLToPath(new URL('./apply-update.mjs', import.meta.url));
@@ -60,7 +61,7 @@ function verify(f, result) {
   assert.equal(git(f.repo, 'rev-parse', result.backupRef), f.job.fromHead);
   git(f.repo, 'merge-base', '--is-ancestor', f.job.fromHead, result.resultHead);
   git(f.repo, 'merge-base', '--is-ancestor', f.job.targetSha, result.resultHead);
-  assert.equal(git(f.repo, 'branch', '--show-current'), 'main'); clean(f.repo);
+  assert.equal(git(f.repo, 'branch', '--show-current'), f.job.expectedBranch); clean(f.repo);
   assert.equal(fs.existsSync(path.join(f.repo, '.installed-meta.json')), false);
   assert.equal(fs.existsSync(path.join(f.job.gitDir, 'surfcore-updater.lock')), false);
 }
@@ -105,6 +106,43 @@ try {
     const before = head(f.repo), status = git(f.repo, 'status', '--porcelain=v1', '--untracked-files=all');
     const result = await apply(f); assert.equal(result.code, codes[kind]); assert.equal(head(f.repo), before);
     assert.equal(git(f.repo, 'status', '--porcelain=v1', '--untracked-files=all'), status);
+  });
+  await test('queued dev update preserves local history and pins upstream/main after both remotes move', async () => {
+    const f = fixture('dev-upstream', true), fork = path.join(base, 'dev-fork.git'), writer = path.join(base, 'dev-fork-writer');
+    git(base, '-c', 'init.defaultBranch=dev', 'init', '--bare', fork);
+    git(f.repo, 'switch', '-c', 'dev'); git(f.repo, 'remote', 'rename', 'origin', 'upstream');
+    git(f.repo, 'remote', 'add', 'origin', fork); git(f.repo, 'push', '-u', 'origin', 'dev');
+    git(base, 'clone', fork, writer);
+    const forkSha = commit(writer, 'fork-only.txt', 'fork update is not the selected source\n'); git(writer, 'push', 'origin', 'dev');
+    const component = { id: 'surfcore', dir: f.repo, kind: 'git', branch: 'dev', remote: 'upstream', remoteBranch: 'main' };
+    const svc = createUpdatesService({ stateDir: f.state, components: () => [component] });
+    const overrides = { GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_SYSTEM: emptyConfig, GIT_CONFIG_NOSYSTEM: '1', GIT_ALLOW_PROTOCOL: 'file', SURFCORE_UPDATE_NO_SPAWN: '1' };
+    const keys = new Set([...Object.keys(overrides), 'SURFCORE_UPDATE_HELPER', ...Object.keys(process.env).filter((key) => key.startsWith('GIT_'))]);
+    const saved = new Map([...keys].map((key) => [key, process.env[key]]));
+    let staged;
+    try {
+      for (const key of keys) delete process.env[key];
+      Object.assign(process.env, overrides);
+      staged = await svc.apply(['surfcore']);
+    } finally {
+      for (const [key, value] of saved) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    }
+    assert.equal(staged.ok, true); assert.equal(staged.pendingRestart, 1); assert.equal(staged.updated, 0);
+    const queued = read(f.pending);
+    assert.equal(queued.expectedBranch, 'dev'); assert.equal(queued.fromHead, f.job.fromHead); assert.equal(queued.targetSha, targetSha);
+    assert.equal(queued.remoteName, 'upstream'); assert.equal(queued.remoteBranch, 'main'); assert.equal(queued.policy, 'preserve-local');
+    assert.equal(head(f.repo), queued.fromHead); assert.equal(git(f.repo, 'branch', '--show-current'), 'dev'); clean(f.repo);
+    assert.equal(fs.existsSync(path.join(f.repo, 'remote.txt')), false);
+    f.job = { ...queued, waitPid: 0 }; // The test owns the helper lifecycle, so no host wait is needed.
+    const laterSha = commit(seed, 'dev-later.txt', 'not part of the queued update\n'); git(seed, 'push', 'origin', 'main');
+    git(f.repo, 'fetch', 'upstream'); git(f.repo, 'fetch', 'origin');
+    assert.equal(git(f.repo, 'rev-parse', 'upstream/main'), laterSha); assert.equal(git(f.repo, 'rev-parse', 'origin/dev'), forkSha);
+    git(f.repo, 'remote', 'remove', 'upstream'); // A queued job does not need to re-resolve the source.
+    const result = await apply(f); verify(f, result);
+    assert.equal(git(f.repo, 'show', '-s', '--format=%P', 'HEAD'), queued.fromHead + ' ' + targetSha);
+    assert.equal(fs.readFileSync(path.join(f.repo, 'local.txt'), 'utf8'), 'precious local commit\n');
+    assert.equal(fs.readFileSync(path.join(f.repo, 'remote.txt'), 'utf8'), 'upstream change same version\n');
+    assert.equal(fs.existsSync(path.join(f.repo, 'fork-only.txt')), false); assert.equal(fs.existsSync(path.join(f.repo, 'dev-later.txt')), false);
   });
   await test('pinned SHA ignores subsequent movement of origin/main', async () => {
     const f = fixture('pinned'); const next = commit(seed, 'later.txt', 'not queued\n'); git(seed, 'push', 'origin', 'main'); git(f.repo, 'fetch', 'origin');
