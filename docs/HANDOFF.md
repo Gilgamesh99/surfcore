@@ -2,7 +2,7 @@
 
 ## 2026-11-17：Fork dev 与原作者更新
 
-用户授权双远程和推送已有功能。隔离工作树 surfcore-fork-dev 从 f80a5a2 合并 fork/dev 的 383f171，保留原有 sync-fork 工作流；独立 remote/remoteBranch 配置使本地 dev 仍从原作者 main 更新。配置与历史已备份，正式验证和运行状态见[case](cases/2026-11-17-fork-dev-upstream-updates.md)。
+按用户授权将生产切到 dev/跟踪 origin/dev：origin 为 Gilgamesh99/surfcore（HTTPS获取、现有SSH身份推送），upstream 为 Mieksido/surfcore。正常合并保留 f80a5a2 本机14项独有提交与 fork/dev 的383f171工作流；真实检查已确认更新仍从 upstream/main 拉取、preserve-local、工作区干净，插件已重载且其余运行配置保留。全仓审计163/163与更新专项通过，清单802文件问题0。只向 fork/dev 推送，原 fork/main工作流和版本号未改变；最终远端SHA、运行证据及备份/回滚见[case](cases/2026-11-17-fork-dev-upstream-updates.md)。
 
 ## 2026-11-13：两条B站功能集成与保留本地更新
 

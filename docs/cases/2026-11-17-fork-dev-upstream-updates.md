@@ -18,7 +18,7 @@
 
 ## 配置与维护
 
-- origin： https://github.com/Gilgamesh99/surfcore.git；本地 dev 追踪 origin/dev。
+- origin 获取地址：https://github.com/Gilgamesh99/surfcore.git；推送地址：git@github.com:Gilgamesh99/surfcore.git；本地 dev 追踪 origin/dev，pushRemote=origin。HTTPS 无现成登录凭据，已验证本机现有 SSH 身份具有该 fork 的推送权限；无需新增或复制凭据。
 - upstream： https://github.com/Mieksido/surfcore.git；内置更新读取 upstream/main。
 - 本机统一配置仅增加 updates.surfcore 的 branch、remote、remoteBranch；已有更新通道及其余设置保持。
 - 现有延迟更新任务继续固定 expectedBranch/fromHead/targetSha；执行时不重新按 remote 解析目标。
@@ -27,7 +27,10 @@
 
 ## 验证记录
 
-专项已通过：test-updates.mjs 的双远端选择、明确失败、固定 SHA 排队；test-update-git-apply.mjs 全部22个实际助手离线用例；另7个版本/待执行任务/语音更新/UI/宿主/API/客户端兼容脚本通过。4个改动源文件语法与 diff --check 通过。Windows 实际 helper 专项约425.6秒，完整审计原有240秒限制可能触发环境超时，结果须区分记录。全仓审计正在执行；生产 main、原始远程和运行配置尚未调整，推送和运行时证据将在交付前补齐。
+- 完整 `npm run test:audit`：163/163 脚本通过（本次同一完整运行），原有超时阈值与断言未放宽。专项 `test-updates.mjs`、实际 Git 延迟助手22例、另7个版本/待执行任务/语音更新/UI/宿主/API/客户端兼容脚本均通过。4个改动源文件语法与 diff --check 通过。
+- Git 对象安装清单：802个跟踪文件，`--verify-ref HEAD` 问题0；版本保持0.8.9。两边原始基线均为合并结果的祖先，fork/main 不是推送目标。
+- 2026-11-17 17:24（上海）真实验收：生产已切 dev，追踪 origin/dev，插件 enabled=true/fiberPhase=active；更新检查 checkedWithFetch=true，remoteName=upstream、remoteBranch=main、policy=preserve-local、dirty=0，原作者 SHA 为0ce8580048d3dddb21860114edb8b115d5d79d1e，behind=0。加载的代码为d74ca29；后续仅交接文档和清单提交，不改变运行代码。统一配置无关字段、QQ/B站配置与当前角色哈希均保持。
+- 推送限定 `refs/heads/dev:refs/heads/dev`，不使用 force；服务端验收通过 `git ls-remote origin refs/heads/dev refs/heads/main`，不只依赖本地缓存。最终 HEAD、服务端分支、实时更新来源与复核时间记录于脱敏的 D:/ProgramData/DSH NEXT/Soul/surfcore-fork-dev-verification-20261117.json。
 
 ## 可转发发布交接块
 
