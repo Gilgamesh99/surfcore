@@ -38,11 +38,12 @@ QQ 二代仿真原有 qq-chat-v2 工具守卫拒绝所有 Windows 工具，主�
 - 适配当前宿主后的 runtime / native boundary 50组通过（原42组及8组真实宿主服务作用域回归），包括实际 Session 的 snapshotEvents/isSeeded/inheritedEventCount、activation 首条消息编号、最终处置时序、冷恢复、卸载和额外消息拒绝。
 - 全仓审计单轮162/165；三项旧测试分别因 R11 936ms阈值和两个 Windows 子进程超时失败。随后协议回归17项、更新结果夹具、Git更新22项单独重跑全部通过，未放宽断言或改动旧实现。
 - 加入实际宿主预设后的完整插件49脚本全部通过；服务绑定修复后重新执行运行时50组、预设7项、真实管理API与隔离宿主启动测试，均通过。
-- 当前管理会话的 Windows 截图工具已成功；生产已加载且 QQ 桥接以 reserved2 在线，现有 GUI 的“主人桌面授权”卡片已实际显示。首次启用因宿主服务访问方式不兼容而自动关闭入口；当前在补齐显式 tools 注入和父会话隔离 subagents 服务绑定后重新验收。完整真实 QQ 主人指令到桌面动作与回执尚未验证。
+- 本机现场验收通过：生产 dev 已加载宿主兼容修复，SurfCore enabled/active，owner-desktop 预设无 broken；主人入口 enabled=true，runtime=idle、lastError=null，并绑定当前已由主人开启 Computer Use 的独立管理会话。QQ 桥接 PID30368 保持 reserved2，DSH/SnowLuma 在线。现有 GUI 已刷新并显示勾选的“主人桌面授权”卡片。配置对照只允许 ownerDesktop 改变，其余六份备份中的配置均保留。当前管理会话的 Windows 截图工具此前已成功；完整真实 QQ 主人指令到桌面动作与回执尚未实发验证。
+- 更新检查实际 fetch 成功：仍为 dev / origin/dev，读取 upstream/main 并使用 preserve-local，工作区干净、behind=0。没有推送此次功能、修改版本或发布 Release。最终提交与现场证据记录在工作区 surfcore-owner-computer-use-verification-20261117.json；界面截图为 surfcore-owner-computer-use-ui.png。
 
 ## 发布交接
 
 - 文件：src/owner-desktop-{broker,config}.js，src/bridge.js，插件 owner-desktop-{runtime,policy,settings,preset}.js，独立 dsh/agent-presets/owner-desktop 三项声明与边界，index.js/client.js，专项测试及测试登记、文档。
 - 层级：新增向后兼容的管理 API、默认关闭配置和严格受限执行路径；旧 QQ/B站权限保持。建议 minor，不改当前 0.8.9 版本、不打标签、不创建 Release。
 - 失败路径：管理卡片与原会话给出阶段、原因、下一步；在途结果不明时不重放任务；密钥和会话令牌不进入回执。完整逻辑、预算与撤权边界见上文。
-- 尚未验证：完整真实 QQ 输入到桌面动作与回执；最终宿主兼容性以集成后的状态检查为准。
+- 尚未验证：完整真实 QQ 输入到桌面动作与回执。实际宿主接口、预设加载、启用状态、原仿真连接与更新来源已现场确认；关闭管理会话或其 Windows Computer Use 开关后，需要重新选择有效授权来源才能继续。
