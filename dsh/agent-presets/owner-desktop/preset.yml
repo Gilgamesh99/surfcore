@@ -1,0 +1,3 @@
+name: 主人隔离桌面任务
+description: 仅由可信主人消息启动，原生 Windows 工具、独立单轮租约、默认拒绝续聊。
+order: 90

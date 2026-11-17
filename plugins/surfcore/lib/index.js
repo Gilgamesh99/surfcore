@@ -66,6 +66,11 @@ import { PlatformRegistry } from './platforms.js';
 import { ExtensionHost } from './extensions.js';
 import { isLoopbackReq, json, readBody, sameOrigin } from './http-guard.js';
 import { startScheduler } from './scheduler.js';
+import { readOwnerDesktopSettings, desktopConfigError } from '../../../src/owner-desktop-config.js';
+import { createOwnerDesktopPolicy } from './owner-desktop-policy.js';
+import { installOwnerDesktopRuntime } from './owner-desktop-runtime.js';
+import { installOwnerDesktopPreset } from './owner-desktop-preset.js';
+import { createOwnerDesktopSettings } from './owner-desktop-settings.js';
 import { createTokenBudgetService } from './token-budget.js';
 import { scanPluginCompatibility } from './compat.js';
 import { createGateEventStore } from '../../../src/gate-events.js';
@@ -191,7 +196,7 @@ function QQ_STATE_DIR() {
 }
 
 export const name = 'surfcore';
-export const inject = ['webServer', 'connection', 'sessionController', 'agents', 'systemPrompt'];
+export const inject = ['webServer', 'connection', 'sessionController', 'agents', 'systemPrompt', 'agentPresets'];
 
 export function apply(ctx) {
   ensureDirs();
@@ -245,6 +250,27 @@ export function apply(ctx) {
   const personaRuntime = installPersonaRequestHooks(ctx, {
     resolve: createPersonaResolver(ctx),
     stripLegacyText: stripLegacyPersonaText,
+  });
+
+  const ownerDesktopPolicy = createOwnerDesktopPolicy({ ledgerFile: path.join(STATE_DIR, 'owner-desktop-sessions.json'), qqStateDir: QQ_STATE_DIR(), biliWorkspace: biliWorkspacePath(DSH_HOME), agents: ctx.agents });
+  const ownerDesktopPreset = installOwnerDesktopPreset(ctx);
+  const ownerDesktopRuntime = installOwnerDesktopRuntime(ctx, {
+    getPresetStatus: ownerDesktopPreset.status,
+    getSettings: () => readOwnerDesktopSettings(UNIFIED_FILE), getOwnerQQ: () => readQqConfig().config?.ownerQQ || '',
+    bridge: callBridge, isManagedAgent: ownerDesktopPolicy.isManagedAgent,
+    registerWorkerSession: ownerDesktopPolicy.registerWorkerSession, isWorkerSession: ownerDesktopPolicy.isWorkerSession,
+  });
+  const ownerDesktopSettings = createOwnerDesktopSettings({
+    runtime: ownerDesktopRuntime, policy: ownerDesktopPolicy, bridge: callBridge,
+    getSettings: () => readOwnerDesktopSettings(UNIFIED_FILE), getOwnerQQ: () => readQqConfig().config?.ownerQQ || '',
+    saveSettings: (next, expectedEpoch) => {
+      if (readOwnerDesktopSettings(UNIFIED_FILE).authorizationEpoch !== expectedEpoch) throw desktopConfigError('owner-desktop.settings-stale', '桌面授权在保存期间发生变化。', '刷新设置后重新保存。');
+      let raw;
+      try { raw = JSON.parse(fs.readFileSync(UNIFIED_FILE, 'utf8')); }
+      catch (error) { if (error?.code === 'ENOENT') raw = {}; else throw error; }
+      backupFile(UNIFIED_FILE, 'owner-desktop-before-save');
+      writeJsonAtomic(UNIFIED_FILE, { ...raw, ownerDesktop: next });
+    },
   });
 
   // 闸门事件中心：桥接负责写，插件负责展示/确认；同一份文件、同一套分级。
@@ -870,6 +896,14 @@ export function apply(ctx) {
         return;
       }
     }
+    // Desktop task authorization uses a dedicated revoke-before-save endpoint.
+    if (body?.unified && Object.hasOwn(body.unified, 'ownerDesktop')) {
+      const current = readJson(UNIFIED_FILE, {}).ownerDesktop;
+      if (JSON.stringify(body.unified.ownerDesktop) !== JSON.stringify(current)) {
+        json(res, 409, { ok: false, code: 'owner-desktop.dedicated-settings', error: '主人桌面授权不能通过普通配置保存修改。', hint: '使用 QQ 页的「主人桌面授权」卡片保存，以先撤销旧任务。' }); return;
+      }
+      delete body.unified.ownerDesktop;
+    }
     const result = { ok: true, saved: {}, warnings: [], notes: [] };
     // ── 管理员：QQ ⇄ B站 默认是同一个人 ────────────────────────────────────
     // 合体层 admin 是唯一真相；旧格式（qq.ownerQQ / bili.owner）是投影。
@@ -903,6 +937,13 @@ export function apply(ctx) {
     body.qq = planned.qq;
     body.bili = planned.bili;
     body.unified = planned.unified;
+    // Owner changes revoke before either identity file is written; A→B→A can never revive an old lease.
+    if (String(body.qq?.ownerQQ ?? currentQq?.ownerQQ ?? '') !== String(currentQq?.ownerQQ ?? '')) {
+      const desktop = readOwnerDesktopSettings(UNIFIED_FILE);
+      const revoked = await ownerDesktopSettings.configure({ enabled: false, expectedEpoch: desktop.authorizationEpoch });
+      if (!revoked.ok) { json(res, 409, revoked); return; }
+      result.notes.push('主人已更改：桌面任务已撤销并关闭；重启桥接后，需要在主人桌面授权卡片重新开启。');
+    }
     if (body.qq && typeof body.qq === 'object') {
       if (body.qq.allow && typeof body.qq.allow === 'object') {
         const ownerForAllow = planned.unified?.admin?.qq || readQqConfig().config?.ownerQQ || '';
@@ -4196,6 +4237,17 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { ${writeOut('$
     const pathname = url.pathname;
     if (pathname === `${API_PREFIX}/overview`) { json(res, 200, await overview()); return; }
     if (pathname === `${API_PREFIX}/config`) { await handleConfig(req, res); return; }
+    if (pathname === API_PREFIX + '/owner-desktop') {
+      if (req.headers['x-agent-token'] !== undefined || req.headers['x-agent-call'] !== undefined) { json(res, 403, { ok: false, code: 'owner-desktop.admin-only', error: '桌面授权只能由管理页面操作。', hint: '在 SurfCore 设置中修改主人桌面授权。' }); return; }
+      if (req.method === 'GET') { const result = await ownerDesktopSettings.status(); json(res, result.ok ? 200 : 503, result); return; }
+      if (req.method !== 'POST') { json(res, 405, { ok: false, code: 'owner-desktop.method', error: '仅支持读取和保存桌面授权。', hint: '刷新设置页后操作。' }); return; }
+      const auth = ctx.get('connection')?.browserAuth;
+      if (!auth?.isAuthenticated?.(req)) { json(res, 401, { ok: false, code: 'owner-desktop.browser-required', error: '桌面授权设置需要已登录的 DSH 管理窗口。', hint: '在 DSH 窗口打开 QQ 设置后保存。' }); return; }
+      let body;
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch { json(res, 400, { ok: false, code: 'owner-desktop.body', error: '设置内容不是有效 JSON。', hint: '刷新页面后重新保存。' }); return; }
+      const result = await ownerDesktopSettings.configure(body);
+      json(res, result.ok ? 200 : 409, result); return;
+    }
     if (pathname === `${API_PREFIX}/characters`) { await handleCharacters(req, res, url); return; }
     if (pathname === `${API_PREFIX}/persona/runtime`) {
       if (req.method !== 'GET') { json(res, 405, { ok: false, code: 'PERSONA_RUNTIME_METHOD', error: '仅支持读取人格运行状态', hint: '刷新人格页重新读取状态' }); return; }
@@ -4407,6 +4459,7 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { ${writeOut('$
     try { billing.dispose(); } catch {}
     try { tokenBudget.dispose(); } catch {}
     try { personaRuntime.dispose(); } catch {}
+    void ownerDesktopRuntime.stop().then(() => ownerDesktopPreset.stop()).catch(error => pluginLog('[owner-desktop] 停止失败：', String(error?.message ?? error)));
     try { memoryCardTimer?.stop?.(); } catch {}
     try { vectorMemoryTimer?.stop?.(); } catch {}
     try { closeAllQrLogins(); } catch {}

@@ -51,7 +51,7 @@ const ctx = {
   agents: { list: () => [] },
   on() { return () => {}; },
   webServer: { register(route) { routes.push(route); return () => {}; } },
-  get(name) { return name === 'connection' ? { requestRejection: () => false } : null; },
+  get(name) { return name === 'connection' ? { requestRejection: () => false, browserAuth: { isAuthenticated: (req) => req.headers['x-test-browser'] === 'owner' } } : null; },
   effect(fn) { effects.push(fn); return () => {}; },
   sessionController: {
     inspect: async () => ({ events: [] }),
@@ -84,10 +84,12 @@ function fakeReq(method, url, body) {
   }
   return req;
 }
-async function invoke(method, p, body) {
+async function invoke(method, p, body, headers = {}) {
   const route = routes.find((r) => r.path === '/dsh-surfcore/api');
   const res = fakeRes();
-  await route.handler(fakeReq(method, `/dsh-surfcore/api${p}`, body), res);
+  const req = fakeReq(method, `/dsh-surfcore/api${p}`, body);
+  Object.assign(req.headers, headers);
+  await route.handler(req, res);
   return { status: res.statusCode, data: JSON.parse(res.body || '{}') };
 }
 
@@ -167,7 +169,36 @@ try {
   assert.equal(brokenTasks.status, 500); assert.equal(brokenTasks.data.ok, false);
   assert.equal(brokenTasks.data.code, 'dm.tasks-unreadable'); assert.ok(brokenTasks.data.hint);
 
-  console.log('automation config and private-message status API tests OK');
+  const desktop = await invoke('GET', '/owner-desktop');
+  assert.equal(desktop.status, 200); assert.equal(desktop.data.settings.enabled, false);
+  const agentAttempt = await invoke('POST', '/owner-desktop', { enabled: true }, { 'x-agent-token': 'fake' });
+  assert.equal(agentAttempt.status, 403); assert.equal(agentAttempt.data.code, 'owner-desktop.admin-only'); assert.ok(agentAttempt.data.hint);
+  const unsigned = await invoke('POST', '/owner-desktop', { enabled: false, expectedEpoch: '' });
+  assert.equal(unsigned.status, 401); assert.equal(unsigned.data.code, 'owner-desktop.browser-required');
+  const dedicatedOnly = await invoke('POST', '/config', { unified: { ownerDesktop: { enabled: true } } });
+  assert.equal(dedicatedOnly.status, 409); assert.equal(dedicatedOnly.data.code, 'owner-desktop.dedicated-settings');
+  const disabled = await invoke('POST', '/owner-desktop', { enabled: false, expectedEpoch: '' }, { 'x-test-browser': 'owner' });
+  assert.equal(disabled.status, 200, JSON.stringify(disabled.data)); assert.equal(disabled.data.settings.enabled, false); assert.ok(disabled.data.settings.authorizationEpoch);
+  const diskDesktop = readJson(path.join(tempState, 'config.json')).ownerDesktop;
+  assert.equal(diskDesktop.authorizationEpoch, disabled.data.settings.authorizationEpoch);
+  // Exercise the real generic owner-save route twice without any worker heartbeat in between.
+  const unifiedFile = path.join(tempState, 'config.json');
+  const priorOwner = String(readJson(qqFile).ownerQQ);
+  const priorConfig = readJson(unifiedFile);
+  priorConfig.ownerDesktop = { enabled: true, parentSessionId: 'human-root', timeoutMs: 600000, authorizationEpoch: 'lease-A' };
+  fs.writeFileSync(unifiedFile, JSON.stringify(priorConfig));
+  const changedOwner = await invoke('POST', '/config', { unified: { admin: { qq: '10009' } } });
+  assert.equal(changedOwner.status, 200, JSON.stringify(changedOwner.data));
+  const epochB = readJson(unifiedFile).ownerDesktop;
+  assert.equal(epochB.enabled, false); assert.notEqual(epochB.authorizationEpoch, 'lease-A');
+  assert.equal(String(readJson(qqFile).ownerQQ), '10009');
+  const restoredOwner = await invoke('POST', '/config', { unified: { admin: { qq: priorOwner } } });
+  assert.equal(restoredOwner.status, 200, JSON.stringify(restoredOwner.data));
+  const epochA2 = readJson(unifiedFile).ownerDesktop;
+  assert.equal(epochA2.enabled, false); assert.notEqual(epochA2.authorizationEpoch, 'lease-A');
+  assert.notEqual(epochA2.authorizationEpoch, epochB.authorizationEpoch);
+  assert.equal(String(readJson(qqFile).ownerQQ), priorOwner);
+  console.log('automation config, private-message status and owner desktop API tests OK');
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

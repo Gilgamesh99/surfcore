@@ -1,5 +1,9 @@
 # 路线图与路线守则（ROADMAP）
 
+## 2026-11-17：主人桌面操作独立授权
+
+保持仿真与原 QQ 工具限制，选择真实主人事件到独立一次性子代理的路径；不让共享群历史或永久会话权限承载桌面授权。使用正式 spawn/原生工具接口，Windows 人类开关不由模型或插件开启。边界与验证见[case](cases/2026-11-17-owner-computer-use.md)。
+
 ## 2026-11-17：Fork 开发与原作者更新
 
 用户自己的 origin/dev 用于保存本机修改，upstream/main 用于检测原作者更新。选择显式更新来源，不自动猜 upstream，也不把 Git 失败降为 ZIP 覆盖；正常合并与固定 SHA 执行保持。验证和回滚见[case](cases/2026-11-17-fork-dev-upstream-updates.md)。

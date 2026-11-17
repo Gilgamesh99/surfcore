@@ -73,6 +73,8 @@ import {
 } from './admin-identity.js';
 import { isOwnerOnlyFrame, canConsumePending, buildQuestionAnswers } from './question-answers.js';
 import { createOwnerAudit } from './owner-audit.js';
+import { createOwnerDesktopBroker, handleOwnerDesktopRoute } from './owner-desktop-broker.js';
+import { readOwnerDesktopSettings, recordQqSessionSources } from './owner-desktop-config.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
   buildHandoffBlock, handoffIsUseful, normalizeRolloverConfig, shouldRollSession,
@@ -1862,6 +1864,68 @@ async function main() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   acquireLock();
   loadState();
+  const qqSourceFile = path.join(STATE_DIR, 'qq-session-sources.json');
+  const rememberQqSessions = (ids, initialize = false) => recordQqSessionSources(qqSourceFile, ids, {
+    initialize, cwd: cfg.sessionCwd ? String(cfg.sessionCwd) : path.join(STATE_DIR, 'agents'),
+  });
+  // Seed before deduplication/follow or retirement can remove the only current mapping.
+  if (!stateWritable) throw new Error('QQ 会话映射无法读取，不能初始化来源记录；请先修复映射再启动桥接。');
+  rememberQqSessions(Object.values(state.sessions), true);
+  const rememberQqLearners = ids => recordQqSessionSources(qqSourceFile, ids, { cwd: path.join(STATE_DIR, 'slang-agent') });
+  const savedLearnerSource = readJsonSafe(SLANG_SESSION_FILE, null);
+  rememberQqLearners(savedLearnerSource?.sessionId ? [savedLearnerSource.sessionId] : []);
+
+  // Desktop authority is minted only by these two live transport callbacks, never by
+  // a prompt, shared unread snapshot, history import, or console request body.
+  const ownerDesktopLiveSource = Symbol('owner-desktop-live');
+  const ownerDesktopStartedAt = Date.now();
+  let ownerDesktopLiveSince = ownerDesktopStartedAt;
+  let ownerDesktopBroker = null;
+  let ownerDesktopEpoch = 0;
+  function revokeOwnerDesktop(reason, key = '') {
+    // Advance even after task completion: queued result receipts must not survive off/on.
+    ownerDesktopEpoch++;
+    return ownerDesktopBroker?.revoke(reason, key);
+  }
+  function ownerDesktopRuntime(key) {
+    return { ownerQQ: cfg.ownerQQ, selfUserId, mode: currentMode, epoch: sessionEpoch + ':' + ownerDesktopEpoch,
+      enabled: cfg.socialV2?.enabled !== false, allowed: isSessionAllowedInCurrentMode(key),
+      blocked: senderBlocked(cfg.ownerQQ, cfg.deny?.users), paused: socialV2.paused,
+      silent: readRoleState().mode === 'silent', liveSince: ownerDesktopLiveSince,
+      connected: snowlumaHealth.connected === true, ready: dshReady };
+  }
+  function getOwnerDesktopBroker() {
+    if (ownerDesktopBroker) return ownerDesktopBroker;
+    const ledgerFile = path.join(STATE_DIR, 'owner-desktop-consumed.json');
+    ownerDesktopBroker = createOwnerDesktopBroker({
+      startedAt: ownerDesktopStartedAt,
+      getSettings: readOwnerDesktopSettings,
+      getRuntime: ownerDesktopRuntime,
+      readLedger: () => {
+        try { return JSON.parse(fs.readFileSync(ledgerFile, 'utf8')); }
+        catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
+      },
+      writeLedger: rows => atomicWriteJson(ledgerFile, rows),
+      notify: async (key, message, authority) => {
+        const assertCurrent = () => {
+          const runtime = ownerDesktopRuntime(key);
+          const settings = readOwnerDesktopSettings();
+          if (String(runtime.ownerQQ ?? '') !== authority.ownerQQ || String(runtime.selfUserId ?? '') !== authority.selfUserId
+              || runtime.epoch !== authority.epoch || settings.authorizationEpoch !== authority.authorizationEpoch
+              || !runtime.allowed || runtime.blocked || runtime.paused || runtime.silent || !runtime.connected || runtime.mode !== 'reserved2') {
+            throw new Error('电脑任务回执授权已失效');
+          }
+        };
+        assertCurrent();
+        if (SENSITIVE_RE.test(message) || [...KNOWN_AGENT_TOKENS].some(token => token && message.includes(token))) {
+          message = '电脑任务已有结果，但回执包含敏感信息，已阻止发送；请在已授权的桌面会话查看结果。';
+        }
+        await sendToQQ(key, message, assertCurrent);
+        return { ok: lastSendSucceeded(key) };
+      },
+    });
+    return ownerDesktopBroker;
+  }
 
   // 闸门事件中心：只记录“发生了什么 + 级别”；具体 UI 通知由插件读同一份文件。
   const gateEvents = createGateEventStore({ dir: SURFCORE_DIR, log: (...args) => log(...args) });
@@ -2878,9 +2942,11 @@ async function main() {
     const preset = resolvePresetName(cfg.slang?.learnerPreset || cfg.agentPreset, { strict: true });
     if (!preset) throw new Error('黑话学习缺少已验证的安全 preset，拒绝创建或复用会话');
     const saved = readJsonSafe(SLANG_SESSION_FILE, null);
+    rememberQqLearners(saved?.sessionId ? [String(saved.sessionId)] : []);
     // 旧记录没有 preset 元数据，无法证明其权限，必须重新创建。
     if (saved?.preset !== preset) invalidateSlangLearnerSession();
     if (slangLearnerSessionId) {
+      rememberQqLearners([slangLearnerSessionId]);
       learnerSessions.add(slangLearnerSessionId);
       api.events.follow(slangLearnerSessionId);
       return slangLearnerSessionId;
@@ -2912,6 +2978,7 @@ async function main() {
     const params = { workspaceId: wsValue.workspace.workspaceId };
     params.agentPreset = preset;
     const value = unwrap(await api.sessions.create(params), 'slang session.create');
+    rememberQqLearners([value.sessionId]);
     slangLearnerSessionId = value.sessionId;
     learnerSessions.add(slangLearnerSessionId);
     api.events.follow(slangLearnerSessionId);
@@ -2926,6 +2993,8 @@ async function main() {
     // 如果在途任务仍在使用旧会话，先保留 learnerSessions 以便事件继续被消费；
     // 没有等待/收集中的旧会话才从集合移除。
     const oldId = slangLearnerSessionId;
+    const savedId = readJsonSafe(SLANG_SESSION_FILE, null)?.sessionId;
+    rememberQqLearners([oldId, savedId].filter(Boolean).map(String));
     slangLearnerSessionId = null;
     if (oldId && !learnerWaiters.has(oldId) && !learnerCollectors.has(oldId)) {
       learnerSessions.delete(oldId);
@@ -3603,6 +3672,7 @@ async function main() {
       // 只读 value 会让控制台切的模式被 5 秒轮询改回去（issue #22）。
       const fromDsh = normalizeModeInput(settingFromDshNamespace(ns, 'mode'));
       if (fromDsh) {
+        if (currentMode !== fromDsh) revokeOwnerDesktop('桥接模式已变化。');
         currentMode = fromDsh;
         // DSH 设置页也可配置管理员 QQ；**留空表示不覆盖 config.json**
         // （见 plugins/qq-mode-console 的 schema 描述）。这里必须显式判断空串：
@@ -3615,7 +3685,9 @@ async function main() {
           const rawOwner = String(rawOwnerValue ?? '').trim();
           if (rawOwner) {
             try {
-              cfg.ownerQQ = normalizeOwnerQQ(rawOwner);
+              const nextOwner = normalizeOwnerQQ(rawOwner);
+              if (String(cfg.ownerQQ) !== String(nextOwner)) revokeOwnerDesktop('主人身份已变化。');
+              cfg.ownerQQ = nextOwner;
             } catch (error) {
               log(`DSH settings ownerQQ 无效，已忽略: ${error?.message ?? error}`);
             }
@@ -3633,7 +3705,10 @@ async function main() {
     } catch {}
     const local = readJsonSafe(path.join(STATE_DIR, 'mode.json'), null);
     const fromLocal = local ? normalizeModeInput(local.mode) : null;
-    if (fromLocal) currentMode = fromLocal;
+    if (fromLocal) {
+      if (currentMode !== fromLocal) revokeOwnerDesktop('桥接模式已变化。');
+      currentMode = fromLocal;
+    }
     if (typeof local?.closedAgentPreset === 'string' && local.closedAgentPreset) {
       closedAgentPreset = local.closedAgentPreset;
     }
@@ -3794,7 +3869,9 @@ async function main() {
   }
 
   function retireSession(key) {
+    revokeOwnerDesktop('来源 QQ 会话已退役。', key);
     const sessionId = state.sessions[key];
+    if (sessionId) rememberQqSessions([sessionId]);
     delete state.sessions[key];
     delete state.sessionPolicies[key];
     // 按 key 记账的内存态在**有映射和无映射时都要清**：一条被移出白名单、
@@ -3984,6 +4061,7 @@ async function main() {
         lastMode = currentMode;
       }
     } else if (dshReady) {
+      revokeOwnerDesktop('DSH 连接已断开。');
       dshReady = false;
       log('⚠️ DSH 不可用（重启中？），QQ 消息将入队等待');
     }
@@ -4708,6 +4786,10 @@ async function main() {
         'Referrer-Policy': 'no-referrer'
       };
       const sendJson = (obj, status = 200) => {
+        if (obj?.ok === false && url.pathname.startsWith('/api/owner-desktop/')) {
+          obj = { code: status === 401 ? 'OWNER_DESKTOP_UNAUTHORIZED' : 'OWNER_DESKTOP_ACCESS_DENIED',
+            hint: '请使用本机管理端认证，并检查请求格式与桌面任务设置。', ...obj };
+        }
         if (obj?.ok === false && url.pathname.startsWith('/api/bili/dm-share/')) {
           obj = { status: 'failed', retryable: false, code: status === 401 ? 'DM_SHARE_UNAUTHORIZED' : 'DM_SHARE_ACCESS_DENIED',
             hint: '使用控制台管理员认证并检查请求格式、来源与 QQ 发送设置。', ...obj };
@@ -4813,6 +4895,12 @@ async function main() {
         } else {
           sendJson({ ok: false, error: '未授权：请提供控制台访问令牌' }, 401);
         }
+        return;
+      }
+      if (url.pathname.startsWith('/api/owner-desktop/')
+          && (req.headers['x-agent-token'] !== undefined || req.headers['x-agent-call'] !== undefined)) {
+        sendJson({ ok: false, code: 'OWNER_DESKTOP_CONSOLE_ONLY', error: '电脑任务接口仅管理端可用。',
+          hint: 'QQ 模型无权创建、领取或授权桌面任务。' }, 403);
         return;
       }
       // Dedicated admin handoff: scoped QQ callers cannot upgrade to console authority.
@@ -4935,6 +5023,10 @@ async function main() {
             sendJson({ ok: false, code: 'CONSOLE_ONLY', error: '该接口仅控制台可用', hint: '请用设置页/控制台（x-console-token）；AI 请走对应的 v2 工具面' }, 403);
             return;
           }
+        }
+        if (url.pathname.startsWith('/api/owner-desktop/')) {
+          await handleOwnerDesktopRoute(getOwnerDesktopBroker(), req, url, { readBody, sendJson });
+          return;
         }
         if (url.pathname.startsWith('/api/bili/dm-share/')) {
           await handleBiliDmShareRoute(getBiliDmShareService(), req, url, { readBody, sendJson });
@@ -5124,6 +5216,7 @@ async function main() {
               ? { closedAgentPreset: String(body.closedAgentPreset ?? '') }
               : { closedAgentPreset: String(existing.closedAgentPreset ?? '') })
           };
+          if (currentMode !== requestedMode) revokeOwnerDesktop('桥接模式已变化。');
           atomicWriteJson(path.join(STATE_DIR, 'mode.json'), next);
           // 用字符串判断而非真值判断：空串是「显式清空 preset」，也要生效。
           closedAgentPreset = next.closedAgentPreset;
@@ -5188,6 +5281,7 @@ async function main() {
           const body = await readBody();
           const rs = readRoleState();
           const mode = body.mode === 'silent' ? 'silent' : 'active';
+          if (mode !== rs.mode) revokeOwnerDesktop('静默状态已变化。');
           writeRoleState(rs.role, mode);
           log(`控制台：静默模式 ${mode === 'silent' ? '开启' : '关闭'}`);
           sendJson({ ok: true, roleMode: mode });
@@ -5731,6 +5825,7 @@ async function main() {
           file.deny = deny;
           file.ownerQQ = ownerQQ;
           atomicWriteJson(configFile, file);
+          revokeOwnerDesktop('主人身份或 QQ 访问规则已更新。');
           cfg.allow = { private: allow.private, groups: allow.groups };
           cfg.deny = { users: deny.users, private: deny.private, groups: deny.groups };
           cfg.ownerQQ = ownerQQ;
@@ -6495,6 +6590,9 @@ async function main() {
           if (merged.agentPreset !== undefined) merged.agentPreset = String(merged.agentPreset ?? '');
           file.socialV2 = merged;
           atomicWriteJson(configFile, file);
+          if (merged.enabled !== undefined && (cfg.socialV2?.enabled !== false) !== (merged.enabled !== false)) {
+            revokeOwnerDesktop('二代模式总开关已变化。');
+          }
           cfg.socialV2 = { ...(cfg.socialV2 ?? {}), ...merged };
           // 仅当“会影响默认唤醒配置”的字段变化时，才同步到仍使用默认配置的现有会话。
           // 避免只改发送/等待/工具开关时，意外重置正在等待的潜水/唤醒计划。
@@ -6546,6 +6644,7 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/socialV2/activity') {
           const body = await readBody();
           const paused = body.paused === true;
+          if (paused !== socialV2.paused) revokeOwnerDesktop('AI 暂停状态已变化。');
           socialV2.paused = paused;
           if (paused) {
             clearAllSocialV2Timers();
@@ -6562,6 +6661,7 @@ async function main() {
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/reset') {
+          revokeOwnerDesktop('QQ 会话已重置。');
           sessionEpoch++;
           sessionPromises.clear();
           clearAllSocialV2Timers();
@@ -6569,6 +6669,7 @@ async function main() {
           for (const key of [...socialV2.conversations.keys()]) {
             const sid = state.sessions[key];
             if (sid) {
+              rememberQqSessions([sid]);
               delete state.sessions[key];
               // 与 retireSession / session-reset / workspace-reset 一致：先让 DSH 停下这个会话的活。
               // 少了这一步，DSH 会继续跑完在途/排队的 turn（token 照烧、副作用照做），
@@ -9649,8 +9750,10 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '');
           if (!key || !state.sessions[key]) { sendJson({ ok: false, error: '会话不存在' }, 404); return; }
+          revokeOwnerDesktop('QQ 会话已重置。');
           sessionEpoch++;
           const oldSessionId = state.sessions[key];
+          rememberQqSessions([oldSessionId]);
           delete state.sessions[key];
           modelAppliedSessions.delete(oldSessionId);
           modelAppliedKeys.delete(oldSessionId);
@@ -9703,6 +9806,8 @@ async function main() {
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/workspace/reset') {
+          rememberQqSessions(Object.values(state.sessions));
+          revokeOwnerDesktop('QQ 会话已重置。');
           sessionEpoch++;
           let archivedCount = 0;
           let stoppedCount = 0;
@@ -9864,7 +9969,7 @@ async function main() {
   const fishGroupNames = new Map(); // groupId -> group_name（'' = 查不到）
   const fishChatWindows = new Map(); // groupId -> [{sender,userId,time,isSelf,isOwner,fish}]
 
-  function sendToQQ(key, msg) {
+  function sendToQQ(key, msg, assertCurrent = null) {
     const assertSendAllowed = captureSendGuard(key);
     const safeMsg = redactKnownTokensOnly(msg);
     const [kind, id] = key.split(':');
@@ -9875,6 +9980,7 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
+          assertCurrent?.();
           if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           noteSendSuccess(key);
@@ -9884,7 +9990,7 @@ async function main() {
           lastSendFailed.set(key, true);
           noteSendFailure(key, error);
           log(`QQ 发送失败 (${key}):`, error?.message ?? error);
-          if (isConnectionSendError(error) && outbox.push(kind, id, part)) {
+          if (!assertCurrent && isConnectionSendError(error) && outbox.push(kind, id, part)) {
             log(`[outbox] 暂存待补发 1 条（${key}），累计 ${outbox.stats().count} 条`);
           }
         })
@@ -10997,8 +11103,10 @@ async function main() {
     const epoch = sessionEpoch;
     const policy = sessionPolicy(key);
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
+    rememberQqSessions([]); // Reserve the current cwd and fail before creating a host session.
     const existing = state.sessions[key];
     if (existing) {
+      rememberQqSessions([existing]);
       // reset/清空工作区期间旧映射可能尚未清理；发现代际不匹配必须丢弃旧会话，防止复活。
       if (!isCurrentSession(key, existing)) {
         retireSession(key);
@@ -11059,6 +11167,8 @@ async function main() {
       if (!sessionId) {
         throw new Error(`无法为 ${key} 创建 DSH 会话（模式 ${currentMode}，preset ${preset ?? '无'}）：${lastError?.message ?? '未知原因'}。已拒绝退化为 DSH 默认 preset 会话——那会把本地工具暴露给 QQ 群。`);
       }
+      // Persist denial provenance before mapping, prompt, follow or reset can expose this session.
+      rememberQqSessions([sessionId]);
       // 新版 DSH 事件流需要显式 follow 该会话，否则收不到 turn 事件。
       api.events.follow(sessionId);
       // reset/清空工作区期间创建完成：丢弃，防止旧会话复活
@@ -16306,7 +16416,7 @@ async function main() {
   }
 
   // QQ 消息 → DSH prompt
-  async function handleIncoming(kind, id, event, cfg) {
+  async function handleIncoming(kind, id, event, cfg, source = null) {
     const key = convKey(kind, id);
     // 群画像：成员数缓存用于小群/大群分层；失败不影响消息处理。
     if (kind === 'group') void ensureGroupMeta(id);
@@ -16320,6 +16430,10 @@ async function main() {
       appendActivity(`${key} [黑名单] 忽略 ${String(event.user_id)} 的消息（deny.users）`);
       log(`[黑名单] 忽略 ${key} 来自 ${event.user_id} 的消息（deny.users）`);
       return;
+    }
+    if (source === ownerDesktopLiveSource) {
+      const intake = await getOwnerDesktopBroker().ingest({ source: 'onebot-live', kind, id, event });
+      if (intake.handled) return;
     }
     const resolveAtName = async (qq) => {
       // 只有群聊才需要把 @QQ号 解析成群名片/昵称；私聊没有群成员概念
@@ -16449,8 +16563,10 @@ async function main() {
         return;
       }
       if (plainContent === '/reset' || plainContent === '/new') {
+        const cancelledDesktop = revokeOwnerDesktop('QQ 会话已重置。');
         const old = state.sessions[key];
         if (old) {
+          rememberQqSessions([old]);
           sessionEpoch++;
           delete state.sessions[key];
           modelAppliedSessions.delete(old);
@@ -16499,6 +16615,8 @@ async function main() {
           catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
           try { await withTimeout(api.workspace.archiveSession({ sessionId: old }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); } catch {}
           await sendToQQ(key, '已重置会话，下次消息将开新上下文');
+        } else if (cancelledDesktop?.cancelled) {
+          await sendToQQ(key, '已取消电脑任务；后续动作已禁止。');
         }
         return;
       }
@@ -16536,6 +16654,7 @@ async function main() {
         return;
       }
       if (plainContent === '/silent' || plainContent === '/quiet') {
+        revokeOwnerDesktop('AI 已进入静默状态。');
         writeRoleState(roleState.role, 'silent');
         await sendToQQ(key, '已进入静默模式：群友消息不再回复，仅管理员可对话。');
         return;
@@ -17728,12 +17847,12 @@ async function main() {
     // 统一按字符串比较：网关可能把 id 序列化成 number/string 混用，
     // 用 `===` 漏掉自己发的消息会进入正常处理（reserved2 下 AI 会回答自己 / chat 下可能回复循环）。
     if (String(event?.user_id ?? '') === String(event?.self_id ?? '')) return;
-    try { await handleIncoming('private', event.user_id, event, cfg); } catch (error) { log('处理私聊消息出错:', error?.message ?? error); }
+    try { await handleIncoming('private', event.user_id, event, cfg, ownerDesktopLiveSource); } catch (error) { log('处理私聊消息出错:', error?.message ?? error); }
   });
   bot.onGroupMessage(async (event) => {
     if (String(event?.sender?.user_id ?? '') === String(event?.self_id ?? '')
       || String(event?.user_id ?? '') === String(event?.self_id ?? '')) return;
-    try { await handleIncoming('group', event.group_id, event, cfg); } catch (error) { log('处理群消息出错:', error?.message ?? error); }
+    try { await handleIncoming('group', event.group_id, event, cfg, ownerDesktopLiveSource); } catch (error) { log('处理群消息出错:', error?.message ?? error); }
   });
   bot.onNotice('notify', async (event) => {
     try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
@@ -17784,6 +17903,8 @@ async function main() {
   }
 
   bot.on('open', () => {
+    ownerDesktopLiveSince = Date.now();
+    revokeOwnerDesktop('QQ 连接已重新建立，旧任务不会恢复。');
     // 用实际连接地址（自愈后可能与 config 里的初值不同，别打印过期的那个）
     const connectedUrl = bot.url ?? cfg.snowluma.wsUrl;
     snowlumaHealth.connected = true;
@@ -17801,6 +17922,7 @@ async function main() {
         log(`机器人昵称: ${login.nickname}`);
       }
       if (login?.user_id != null) {
+        if (selfUserId !== String(login.user_id)) revokeOwnerDesktop('机器人登录身份已变化。');
         selfUserId = String(login.user_id);
         reconcileAllowlist('login');
       }
@@ -17913,6 +18035,7 @@ async function main() {
   }
 
   bot.on('close', (info) => {
+    revokeOwnerDesktop('QQ 连接已断开。');
     snowlumaHealth.connected = false;
     log(`SnowLuma 连接断开（code=${info?.code ?? '?'}），重连中…`);
     // 1006 在每次启动/短暂抖动都会出现，重连通常几百毫秒；先给 15 秒观察窗口，

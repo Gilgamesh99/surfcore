@@ -10,6 +10,7 @@ const tests = [
   'test-audit-setup.mjs', 'test-audit-setup-guards.mjs',
   // QQ scoped 工具：晚注册的全局危险工具也要补装 Schema 限制。
   'test-qq-tool-restrict-events.mjs',
+  'test-owner-desktop-broker.mjs', 'test-owner-desktop-wiring.mjs',
   // Controlled generation, safe owned artifacts, MCP adapter and mocked OneBot delivery.
   'test-generated-images.mjs', 'test-magpie-image-backend.mjs', 'test-generated-image-flow.mjs',
   // DSH Desktop 安装目录里的 node 解析；bridge/scheduler/setup 共用同一个入口。

@@ -1,5 +1,9 @@
 # 交接状态（HANDOFF）
 
+## 2026-11-17：主人专用桌面任务（验证中）
+
+隔离分支 feat/owner-computer-use，基线 dev 6d25f3a。保留二代仿真，只有真实主人私聊或群内主人明确 @ 的新桌面指令可创建一次性独立任务；每次工具执行重验当前租约，原 Windows 人类开关保留。新增管理卡片、失效撤权与冷恢复拒绝记录；不改远程与更新源。验证及激活状态见[case](cases/2026-11-17-owner-computer-use.md)。
+
 ## 2026-11-17：Fork dev 与原作者更新
 
 按用户授权将生产切到 dev/跟踪 origin/dev：origin 为 Gilgamesh99/surfcore（HTTPS获取、现有SSH身份推送），upstream 为 Mieksido/surfcore。正常合并保留 f80a5a2 本机14项独有提交与 fork/dev 的383f171工作流；真实检查已确认更新仍从 upstream/main 拉取、preserve-local、工作区干净，插件已重载且其余运行配置保留。全仓审计163/163与更新专项通过，清单802文件问题0。只向 fork/dev 推送，原 fork/main工作流和版本号未改变；最终远端SHA、运行证据及备份/回滚见[case](cases/2026-11-17-fork-dev-upstream-updates.md)。

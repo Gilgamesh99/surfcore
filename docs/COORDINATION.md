@@ -18,6 +18,7 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **主人专用 Computer Use（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-computer-use` | `feat/owner-computer-use`（基线6d25f3a） | 保留仿真模式，真实主人私聊/群@受控桌面任务；Lead整合，队友只读权限与身份审查 | 身份/重放/退役来源/主人ABA检查已完成；正在适配本机新子代理接口并执行最终回归，生产尚未切换 |
 | **Fork dev 与原作者更新（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-fork-dev` | `feat/fork-dev-upstream`（基线f80a5a2） | 双远程、本地dev推送、独立upstream/main更新；Lead管Git/配置，队友仅更新器源码与测试 | 两边历史完整保留；生产dev双远程已生效，原作者更新真实回读通过；审计163/163、专项与清单通过；仅fork/dev推送，服务端最终SHA见case所列验收记录 |
 | **B站双分支本机集成（2026-11-13 夜）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-bili-integration` | `feat/bili-integration-20261113`（基线c9b8dbe） | 合并阅读/私信分享，修正消息顺序与测试隔离，保留远端更新 | 已快进生产并重载；新路由/GUI/群匹配/完整人格验收通过；审计残项复验通过，插件44/45（唯一旧基线同样失败）；备份保留，未发布或发送测试消息 |
 | **B站私聊视频分享（2026-11-13 晚）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-bili-dm-share` | `feat/bili-dm-share`（基线 `c9b8dbe`；本机无 dev） | 连续私信/视频卡片、指定QQ群投递与回报、持久化确认和失败可见；Lead 与队友按文件隔离 | 已随本机双分支集成加载；保留真实只读字段修复，收件与群定位在线验收完成；真实群投递未测试、未发布 |

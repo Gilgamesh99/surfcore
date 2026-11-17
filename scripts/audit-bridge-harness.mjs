@@ -35,6 +35,7 @@ import * as commandSpam from '../src/command-spam.js';
 import * as adminIdentity from '../src/admin-identity.js';
 import * as questionAnswers from '../src/question-answers.js';
 import * as ownerAudit from '../src/owner-audit.js';
+import { recordQqSessionSources } from '../src/owner-desktop-config.js';
 import * as roleCard from '../src/role-card.js';
 import * as personaLayers from '../src/persona-layers.js';
 import * as wakePolicy from '../src/wake-policy.js';
@@ -284,7 +285,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     synthesizeToFile,
     ...tokenBudget,
     ...adminIdentity, ...roleCard, ...personaLayers, ...wakePolicy, ...groupPolicy, ...actionPlanner, ...sessionMap, ...contextTelemetry, ...memoryCard, ...vectorMemory, ...biliCard, ...characterStore, ...historyCatchup,
-    ...questionAnswers, ...ownerAudit, ...turnGuard, ...gateEvents,
+    ...questionAnswers, ...ownerAudit, ...turnGuard, ...gateEvents, recordQqSessionSources,
     ...purposeEngine,
     ...conversationClosure, ...conversationContinuation,
     ...sessionRollover,
