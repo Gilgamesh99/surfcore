@@ -13,9 +13,9 @@ const callbacks = source.slice(source.indexOf('  bot.onPrivateMessage(async (eve
 const leaseId = 'bridge-fixture-lease-12345';
 let passed = 0;
 let nextMessage = 1;
-async function harness({ config = {}, savedState, files = {} } = {}) {
+async function harness({ config = {}, savedState, files = {}, globals = {} } = {}) {
   const liveSource = Symbol('fixture-live-source');
-  const settings = { enabled: true, parentSessionId: 'fixture-parent', authorizationEpoch: 'fixture-epoch', timeoutMs: 600000 };
+  const settings = { enabled: true, authorizationEpoch: 'fixture-epoch', timeoutMs: 600000 };
   let handler;
   const server = new EventEmitter();
   server.address = () => ({ port: 41234 });
@@ -24,7 +24,7 @@ async function harness({ config = {}, savedState, files = {} } = {}) {
   function FixtureSymbol(description) { return description === 'owner-desktop-live' ? liveSource : Symbol(description); }
   Object.setPrototypeOf(FixtureSymbol, Symbol);
   const h = await bridgeHarness({ config: { sendDelayMs: 0, ...config }, savedState, files, globals: {
-    Symbol: FixtureSymbol, createOwnerDesktopBroker, handleOwnerDesktopRoute,
+    ...globals, Symbol: FixtureSymbol, createOwnerDesktopBroker, handleOwnerDesktopRoute,
     readOwnerDesktopSettings: () => ({ ...settings }), http: { createServer: callback => { handler = callback; return server; } },
   } });
   h.cfg.sendDelayMs = 0; h.setMode('reserved2'); h.setSelfIdentity('fixture bot', '999');
@@ -52,8 +52,8 @@ async function harness({ config = {}, savedState, files = {} } = {}) {
   }
   return { ...h, settings, live, event, request, close: async () => { server.close(); await h.close(); } };
 }
-async function test(name, run) {
-  const h = await harness();
+async function test(name, run, options = {}) {
+  const h = await harness(options);
   try { await run(h); passed++; console.log('PASS', name); }
   finally { await h.close(); }
 }
@@ -66,17 +66,33 @@ async function claim(h, kind = 'private') {
   assert.equal(claimed.status, 200); assert.equal(claimed.data.task.text, '电脑：打开浏览器查看天气');
   return taskId;
 }
+async function bind(h, taskId, turnId = 'desktop-fixture-turn') {
+  const prepared = await h.request('prepare', { method: 'POST', body: { taskId, leaseId } });
+  assert.equal(prepared.status, 200, JSON.stringify(prepared.data));
+  const messageId = 'fixture-host-message-' + taskId;
+  const desktopSessionId = 'desktop-child-' + prepared.data.sourceSessionId;
+  const bound = await h.request('bind', { method: 'POST', body: { taskId, leaseId, preparedId: prepared.data.preparedId, sessionId: desktopSessionId, messageId } });
+  assert.equal(bound.status, 200, JSON.stringify(bound.data));
+  const started = await h.request('started', { method: 'POST', body: { taskId, leaseId, messageId, turnId } });
+  assert.equal(started.status, 200, JSON.stringify(started.data));
+  return { ...prepared.data, desktopSessionId, task: started.data.task };
+}
 function failed(response, status) {
   if (status) assert.equal(response.status, status);
   assert.equal(response.data.ok, false); assert.ok(response.data.code); assert.ok(response.data.error); assert.ok(response.data.hint);
 }
 
-await test('real private/group transport callbacks alone mint isolated tasks before QQ batching', async h => {
+await test('real private/group callbacks derive the source then bind a distinct desktop child', async h => {
   for (const kind of ['private', 'group']) {
     const id = await claim(h, kind);
-    assert.equal(h.calls.prompts.length, 0, 'desktop command must not reach shared QQ model');
+    const prepared = await bind(h, id);
+    assert.equal(prepared.sourceSessionId, h.state.sessions[kind === 'private' ? 'private:123' : 'group:456']);
+    assert.notEqual(prepared.desktopSessionId, prepared.sourceSessionId);
+    assert.equal(prepared.task.sessionId, prepared.desktopSessionId); assert.equal(prepared.task.continuationRequested, false);
+    assert.equal(h.calls.prompts.length, 0, 'host sends into the separate child through its official API');
+    assert.ok(h.getSocialV2State(kind === 'private' ? 'private:123' : 'group:456').recentMessages.some(m => m.ownerDesktop && m.text.includes('打开浏览器')));
     assert.equal(h.getSocialV2State(kind === 'private' ? 'private:123' : 'group:456').unread.length, 0);
-    const complete = await h.request('complete', { method: 'POST', body: { taskId: id, leaseId, status: 'done', output: '任务完成' } });
+    const complete = await h.request('complete', { method: 'POST', body: { taskId: id, leaseId, status: 'done', output: '任务完成', executionStopped: true } });
     assert.equal(complete.status, 200); assert.equal(h.calls.sent.at(-1).kind, kind);
     assert.equal(h.calls.sent.at(-1).id, kind === 'private' ? 123 : 456);
   }
@@ -85,7 +101,7 @@ await test('real private/group transport callbacks alone mint isolated tasks bef
   const ledger = JSON.parse(fs.readFileSync(path.join(h.temp, 'state/owner-desktop-consumed.json'), 'utf8'));
   assert.equal(ledger.length, 2); assert.deepEqual(Object.keys(ledger[0]).sort(), ['digest', 'until']);
 });
-await test('original Windows-MCP owner request enters the isolated task from real private/group callbacks', async h => {
+await test('natural Windows-MCP owner request prepares exact source text for a separate desktop session', async h => {
   const text = '你使用Windows-MCP控制我的电脑，打开b站刷一会';
   h.settings.timeoutMs = 0;
   for (const kind of ['private', 'group']) {
@@ -94,7 +110,7 @@ await test('original Windows-MCP owner request enters the isolated task from rea
     await h.live[kind](event);
     const pending = await h.request('pending');
     assert.equal(pending.data.tasks.length, 1, kind + ': natural owner command must reach desktop intake');
-    assert.equal(h.calls.prompts.length, 0, 'desktop command must not enter the shared QQ model');
+    assert.equal(h.calls.prompts.length, 0, 'desktop command is reserved for exact host insertion');
     assert.equal(h.getSocialV2State(kind === 'private' ? 'private:123' : 'group:456').unread.length, 0);
     const taskId = pending.data.tasks[0].id;
     const claimed = await h.request('claim', { method: 'POST', body: { taskId, leaseId } });
@@ -103,7 +119,10 @@ await test('original Windows-MCP owner request enters the isolated task from rea
     assert.equal(claimed.data.task.timeoutMs, 0);
     assert.equal(claimed.data.task.expiresAt, null);
     assert.equal(claimed.data.task.conversationKey, kind === 'private' ? 'private:123' : 'group:456');
-    assert.equal((await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done', output: 'fixture complete' } })).status, 200);
+    const prepared = await bind(h, taskId);
+    assert.ok(prepared.prompt.endsWith(text));
+    assert.equal(prepared.sourceSessionId, h.state.sessions[claimed.data.task.conversationKey]);
+    assert.equal((await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done', output: 'fixture complete', executionStopped: true } })).status, 200);
   }
 });
 await test('direct/history-shaped handleIncoming cannot create a task; ordinary owner chat still queues QQ unread', async h => {
@@ -149,7 +168,8 @@ await test('owner and settings epochs are rechecked at validate and completion',
   h.settings.authorizationEpoch = 'fixture-epoch-next';
   failed(await h.request('validate', { method: 'POST', body: { taskId, leaseId } }), 409);
   h.settings.authorizationEpoch = 'fixture-epoch';
-  failed(await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done' } }), 409);
+  const late = await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done', executionStopped: true } });
+  assert.equal(late.status, 200); assert.equal(late.data.late, true); assert.equal(late.data.task.status, 'cancelled');
   const second = await claim(h);
   h.cfg.ownerQQ = 321;
   failed(await h.request('validate', { method: 'POST', body: { taskId: second, leaseId } }), 409);
@@ -163,14 +183,14 @@ await test('reset and retireSession cancel leases even without an existing QQ se
   h.resetEpoch();
   failed(await h.request('validate', { method: 'POST', body: { taskId, leaseId } }), 409);
 });
-await test('owner reset command revokes an isolated task without a shared QQ mapping', async h => {
+await test('owner reset command revokes a pending desktop task before source preparation', async h => {
   const taskId = await claim(h); assert.equal(h.state.sessions['private:123'], undefined);
   await h.live.private(h.event('private', { message: [{ type: 'text', data: { text: '/reset' } }] }));
   failed(await h.request('validate', { method: 'POST', body: { taskId, leaseId } }), 409);
   assert.match(h.calls.sent.at(-1).text, /已取消电脑任务/);
 });
 await test('queued completion reply rechecks owner before actual transport and never becomes outbox replay', async h => {
-  const taskId = await claim(h);
+  const taskId = await claim(h); await bind(h, taskId);
   let release;
   let entered;
   const started = new Promise(resolve => { entered = resolve; });
@@ -192,7 +212,7 @@ await test('queued completion reply rechecks owner before actual transport and n
   assert.ok(!h.calls.sent.some(item => item.text.includes('private desktop result')));
 });
 await test('known tokens and local secret-looking output are blocked by existing outbound audit', async h => {
-  const taskId = await claim(h);
+  const taskId = await claim(h); await bind(h, taskId);
   const token = h.getSocialV2State('private:123').agentToken;
   const result = await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done', output: 'raw ' + token } });
   assert.equal(result.status, 200);
@@ -244,4 +264,139 @@ await test('source-record failures cannot erase QQ identity or send another prom
     passed++; console.log('PASS startup seeds custom QQ cwd and existing identity before retirement');
   } finally { await h.close(); }
 }
+await test('prepare keeps source model and persona while excluding source tokens and shared unread', async h => {
+  h.cfg.dsh = { ...h.cfg.dsh, followDefaultModel: false, provider: 'fixture-owner-provider', model: 'fixture-owner-model' };
+  const selections = [];
+  h.api.sessions.selectModel = async params => {
+    selections.push(params);
+    return { result: { ok: true, value: { selected: { provider: params.provider, model: params.model } } } };
+  };
+  const original = await h.ensureSession('private:123');
+  const created = h.calls.created.length;
+  h.appendSocialV2Message('private:123', 'untrusted fixture', 'UNRELATED_UNREAD_DO_NOT_EXECUTE', 'UNRELATED_UNREAD_DO_NOT_EXECUTE', false, false, 987654, [], '321');
+  const st = h.getSocialV2State('private:123');
+  const taskId = await claim(h);
+  const prepared = await bind(h, taskId);
+  assert.equal(prepared.sourceSessionId, original); assert.notEqual(prepared.desktopSessionId, original); assert.equal(prepared.sessionId, undefined); assert.equal(h.calls.created.length, created);
+  assert.equal(selections.length, 1); assert.equal(selections[0].provider, 'fixture-owner-provider'); assert.equal(selections[0].model, 'fixture-owner-model');
+  assert.match(prepared.prompt, /PERSONA_FIXTURE_CARD/);
+  assert.ok(!prepared.prompt.includes(st.agentToken)); assert.ok(!prepared.prompt.includes('qq_get_prompt')); assert.ok(!prepared.prompt.includes('【会话令牌】'));
+  assert.match(prepared.prompt, /本次主人原文/); assert.ok(prepared.prompt.endsWith('电脑：打开浏览器查看天气'));
+  assert.ok(!prepared.prompt.includes('UNRELATED_UNREAD_DO_NOT_EXECUTE'));
+  assert.ok(!prepared.prompt.includes('【首回复节奏】')); assert.ok(!prepared.prompt.includes('【沉睡前强制等待】'));
+  assert.equal(st.unread.length, 1); assert.equal(h.calls.prompts.length, 0);
+  failed(await h.request('prepare', { method: 'POST', body: { taskId, leaseId, sessionId: 'foreign' } }), 400);
+  failed(await h.request('bind', { method: 'POST', body: { taskId, leaseId, preparedId: prepared.preparedId, sessionId: prepared.desktopSessionId, messageId: 'other-host-message-fixture' } }), 409);
+}, { globals: { readPersonaLayerText: layer => layer === 'full' ? 'PERSONA_FIXTURE_CARD' : '' } });
+
+await test('source QQ stays responsive during desktop execution and shutdown', async h => {
+  const key = 'private:123'; const taskId = await claim(h); const prepared = await bind(h, taskId);
+  h.appendSocialV2Message(key, 'owner', '普通聊天仍需保留', '普通聊天仍需保留', false, true, 765432, [], '123');
+  const st = h.getSocialV2State(key);
+  assert.equal(h.isConversationBusyV2(key, st), false);
+  h.scheduleWakeV2(key, 'at'); assert.ok(st.pendingWakeTimer, 'desktop execution must not defer ordinary QQ wakes');
+  clearTimeout(st.pendingWakeTimer); st.pendingWakeTimer = null;
+  await h.deliverPrompt(key, 'ordinary owner chat');
+  assert.equal(h.calls.prompts.length, 1); assert.equal(st.unread.length, 1);
+  assert.equal(h.calls.prompts[0].sessionId, prepared.sourceSessionId);
+  assert.ok(!JSON.stringify(h.calls.prompts).includes(prepared.desktopSessionId));
+  const terminal = await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'failed', executionStopped: false } });
+  assert.equal(terminal.data.task.phase, 'stopping');
+  await h.deliverPrompt(key, 'ordinary chat during desktop shutdown');
+  assert.equal(h.calls.prompts.length, 2);
+  const count = h.calls.sent.length;
+  const closed = await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'failed', executionStopped: true } });
+  assert.equal(closed.data.task.phase, 'finished'); assert.equal(closed.data.late, true);
+  assert.equal(st.unread.length, 1); assert.equal(h.calls.sent.length, count);
+});
+
+await test('DSH readiness revoke sends one terminal after progress and later cancel reports it', async h => {
+  const taskId = await claim(h); await bind(h, taskId);
+  assert.equal((await h.request('progress', { method: 'POST', body: { taskId, leaseId, summary: 'fixture progress' } })).status, 200);
+  const before = h.calls.sent.length;
+  h.setReady(false);
+  failed(await h.request('validate', { method: 'POST', body: { taskId, leaseId } }), 409);
+  const closed = await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done', output: 'late output must not appear', executionStopped: true } });
+  const task = (await h.request('status')).data.tasks.find(t => t.id === taskId);
+  assert.equal(task.status, 'cancelled'); assert.equal(task.code, 'OWNER_DESKTOP_OFFLINE');
+  assert.equal(task.terminalNotification.ok, true); assert.equal(h.calls.sent.length, before + 1);
+  h.setReady(true);
+  assert.equal(closed.data.task.status, 'cancelled'); assert.equal(h.calls.sent.length, before + 1);
+  await h.live.private(h.event('private', { message: [{ type: 'text', data: { text: '取消电脑任务' } }] }));
+  assert.match(h.calls.sent.at(-1).text, /已取消/); assert.ok(!h.calls.sent.at(-1).text.includes('没有正在运行'));
+  assert.ok(!h.calls.sent.some(item => item.text.includes('late output must not appear')));
+});
+
+await test('fresh continue preserves source and desktop identity with a fresh message after stop proof', async h => {
+  const first = await claim(h); const prepared = await bind(h, first);
+  await h.live.private(h.event('private', { message: [{ type: 'text', data: { text: '继续电脑任务' } }] }));
+  failed(await h.request('validate', { method: 'POST', body: { taskId: first, leaseId } }), 409);
+  assert.equal((await h.request('pending')).data.tasks.length, 0, 'do not dispatch while the old child is stopping');
+  await h.request('complete', { method: 'POST', body: { taskId: first, leaseId, status: 'cancelled', executionStopped: true, sessionId: prepared.desktopSessionId } });
+  const pending = (await h.request('pending')).data.tasks;
+  assert.equal(pending.length, 1); assert.equal(pending[0].previousTaskId, first);
+  assert.equal(pending[0].continuationRequested, true);
+  const taskId = pending[0].id;
+  assert.equal((await h.request('claim', { method: 'POST', body: { taskId, leaseId } })).status, 200);
+  const next = await bind(h, taskId, 'desktop-second-turn');
+  assert.equal(next.sourceSessionId, prepared.sourceSessionId); assert.equal(next.desktopSessionId, prepared.desktopSessionId); assert.notEqual(next.preparedId, prepared.preparedId);
+  assert.ok(next.prompt.endsWith('继续电脑任务')); assert.equal(next.task.continuationRequested, true);
+  assert.equal(h.calls.created.length, 1);
+});
+await test('cancel drops already-queued progress while preserving a single terminal receipt', async h => {
+  const taskId = await claim(h); const prepared = await bind(h, taskId);
+  let release; let entered;
+  const barrier = new Promise(resolve => { entered = resolve; });
+  const original = h.bot.sendPrivateMessage.bind(h.bot);
+  h.bot.sendPrivateMessage = async (id, text) => {
+    if (text === 'progress queue barrier') { entered(); await new Promise(resolve => { release = resolve; }); }
+    return original(id, text);
+  };
+  const queued = h.sendToQQ('private:123', 'progress queue barrier'); await barrier;
+  const reporting = h.request('progress', { method: 'POST', body: { taskId, leaseId, summary: 'obsolete desktop progress' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await h.request('status')).data.tasks.find(task => task.id === taskId).progressNotification.status, 'sending');
+  const cancel = await h.request('cancel', { method: 'POST', body: { taskId, leaseId } });
+  assert.equal(cancel.status, 200); release(); await queued;
+  const progress = await reporting; failed(progress, 409); assert.equal(progress.data.code, 'OWNER_DESKTOP_NOTICE_FAILED');
+  const closed = await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'cancelled', executionStopped: true, sessionId: prepared.desktopSessionId } });
+  assert.equal(closed.data.task.terminalNotification.ok, true);
+  assert.ok(!h.calls.sent.some(item => item.text.includes('obsolete desktop progress')));
+  assert.equal(h.calls.sent.filter(item => item.text.startsWith('电脑任务已取消。')).length, 1);
+});
+await test('source history receives short audited summaries and visible desktop identity only', async h => {
+  const taskId = await claim(h); const prepared = await bind(h, taskId);
+  const st = h.getSocialV2State('private:123');
+  assert.ok(h.calls.sent.some(item => item.text.includes(prepared.desktopSessionId)));
+  assert.ok(st.recentMessages.some(item => item.isSelf && item.text.includes(prepared.desktopSessionId)));
+  assert.equal((await h.request('progress', { method: 'POST', body: { taskId, leaseId, summary: '已打开页面，正在查看标题' } })).status, 200);
+  assert.ok(st.recentMessages.some(item => item.isSelf && item.text.includes('正在查看标题')));
+  assert.equal(st.unread.length, 0);
+  assert.ok(st.recentMessages.filter(item => item.isSelf).every(item => item.text.length <= 200));
+  failed(await h.request('progress', { method: 'POST', body: { taskId, leaseId, summary: 'x'.repeat(501) } }), 400);
+  failed(await h.request('progress', { method: 'POST', headers: { 'x-agent-token': st.agentToken }, body: { taskId, leaseId, summary: 'model-forged summary' } }), 403);
+  assert.ok(!h.calls.sent.some(item => item.text.includes('model-forged summary')));
+  assert.ok(!prepared.prompt.includes(st.agentToken)); assert.equal(h.calls.prompts.length, 0);
+  const terminal = await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done', output: 'x'.repeat(1000), executionStopped: true, sessionId: prepared.desktopSessionId } });
+  assert.equal(terminal.data.task.terminalNotification.ok, true);
+  const summary = h.calls.sent.at(-1).text;
+  assert.ok(summary.includes('x'.repeat(500))); assert.ok(!summary.includes('x'.repeat(501)));
+  assert.ok(summary.includes('完整结果保留在桌面会话：' + prepared.desktopSessionId));
+});
+
+await test('fresh continuation with no broker history reaches host catalog lookup on the current source', async h => {
+  const original = await h.ensureSession('private:123');
+  await h.live.private(h.event('private', { message: [{ type: 'text', data: { text: '继续电脑任务：查看刚才的页面' } }] }));
+  const pending = (await h.request('pending')).data.tasks;
+  assert.equal(pending.length, 1); assert.equal(pending[0].continuationRequested, true); assert.equal(pending[0].previousTaskId, undefined);
+  const taskId = pending[0].id;
+  const claim = await h.request('claim', { method: 'POST', body: { taskId, leaseId } });
+  assert.equal(claim.status, 200); assert.equal(claim.data.task.continuationRequested, true);
+  const prepared = await h.request('prepare', { method: 'POST', body: { taskId, leaseId } });
+  assert.equal(prepared.status, 200); assert.equal(prepared.data.sourceSessionId, original); assert.equal(prepared.data.task.continuationRequested, true);
+  assert.ok(prepared.data.prompt.endsWith('继续电脑任务：查看刚才的页面'));
+  assert.equal((await h.request('validate', { method: 'POST', body: { taskId, leaseId } })).data.task.continuationRequested, true);
+  assert.equal(h.calls.created.length, 1); assert.equal(h.calls.prompts.length, 0);
+});
+
 console.log('Owner desktop wiring: ' + passed + ' tests passed (fake HTTP/QQ/DSH, no sockets).');

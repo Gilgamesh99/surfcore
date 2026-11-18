@@ -1,631 +1,515 @@
 import { randomUUID } from 'node:crypto';
-import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_DEFAULT_TIMEOUT_MS, OWNER_DESKTOP_PENDING_TTL_MS } from '../../../src/owner-desktop-options.js';
-import { armOwnerDesktopBoundary, isOwnerDesktopTool } from '../../../dsh/agent-presets/owner-desktop/owner-desktop-boundary.mjs';
+import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_DEFAULT_TIMEOUT_MS, OWNER_DESKTOP_PENDING_TTL_MS } from '../../../src/owner-desktop-conversation-options.js';
+import { armOwnerDesktopConversation, isOwnerDesktopTool } from './owner-desktop-conversation-gate.js';
 export { isOwnerDesktopTool };
+const PRESET = 'owner-desktop-conversation';
+const POLL_MS = 2_000, STOP_WAIT_MS = 10_000;
+const original = value => value?.[Symbol.for('cordis.original')] ?? value;
+const failure = (code, error, hint) => ({ ok: false, code, error, hint });
+const denial = issue => issue.code + ': ' + issue.error + ' ' + issue.hint;
+const idOf = agent => agent?.session?.id ?? agent?.id;
+function service(ctx, name) { try { return ctx?.get?.(name); } catch { return undefined; } }
+function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+const endedIssue = () => failure('owner-desktop.lease-revoked', '当前电脑指令授权已结束。', '由主人从原 QQ 对话发送新指令。');
+const boundaryIssue = () => failure('owner-desktop.native-presentation-unavailable', '独立电脑会话的原生工具边界不可用。', '重载 SurfCore 专用预设后重试，不要开放 run_code 或本地执行工具。');
 
-const POLL_MS = 2_000;
-const WORKER_LABEL = 'SurfCore owner desktop task';
-const WORKER_PRESET = 'owner-desktop';
-// Cordis exports this symbol; each ctx.get/serviceFor read may return a new tracing proxy.
-const SERVICE_ORIGINAL = Symbol.for('cordis.original');
-function serviceIdentity(value) { return value?.[SERVICE_ORIGINAL] ?? value; }
-function safeService(ctx, name) {
-  try { return typeof ctx?.get === 'function' ? ctx.get(name) : undefined; } catch { return undefined; }
-}
-
-function failure(code, error, hint) { return { ok: false, code, error, hint }; }
-function deferred() {
-  let resolve;
-  const promise = new Promise(done => { resolve = done; });
-  return { promise, resolve };
-}
-function sessionId(agent) { return agent?.session?.id ?? agent?.id; }
-function sessionEvents(session) {
-  try { return typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : null; } catch { return null; }
-}
-function textOf(message) {
-  if (!Array.isArray(message?.content)) return null;
-  if (message.content.length !== 1 || message.content[0]?.type !== 'text') return null;
-  return message.content[0].text;
-}
-function outputText(result) {
-  return (Array.isArray(result?.output) ? result.output : [])
-    .filter(block => block?.type === 'text' && typeof block.text === 'string')
-    .map(block => block.text).join('\n').slice(0, 4000);
-}
-
-/** Host-only owner-task consumer. Never installs or changes Windows grants.
- * bridge is callBridge(path, options); all dependencies are injectable for offline tests.
- * stop() pauses polling and drains cancellation; start() resumes after settings are saved.
+/** Official continuing subagent history; exact host receipt + committed object + one turn.
+ * The QQ parent is never cancelled, recomposed, granted tools, or used for screen context.
+ * Persisted mappings only deny authority: every continuation requires fresh bridge validation.
  */
 export function installOwnerDesktopRuntime(ctx, {
-  getSettings, getOwnerQQ, bridge, isManagedAgent: isOtherManaged = () => false,
-  registerWorkerSession, isWorkerSession, getPresetStatus,
-  now = Date.now, newLeaseId = randomUUID, newChildId = randomUUID, autoStart = true,
+  getSettings, getOwnerQQ, getPresetStatus, conversationStore, bridge,
+  isManagedAgent: isOtherManaged = () => false, isWorkerSession = () => false,
+  now = Date.now, newLeaseId = randomUUID, newSessionId = randomUUID, autoStart = true,
   setTimer = setTimeout, clearTimer = clearTimeout, onStatus = () => {},
 } = {}) {
-  let active = null;
-  let pollTimer = null;
-  let inFlight = null;
-  let paused = !autoStart;
-  let disposed = false;
-  let lastError = null;
-  let lastResult = null;
-  const ownedAgents = new WeakSet();
-  const ownedSessions = new Set();
-  const listeners = [];
-  let hooksReady = false;
-  const agentRegistry = safeService(ctx, 'agents');
-  const presetRegistry = safeService(ctx, 'agentPresets');
-  const toolRegistry = safeService(ctx, 'tools');
-
-  function rootServicesMatch() {
-    return [['agents', agentRegistry], ['agentPresets', presetRegistry], ['tools', toolRegistry]]
-      .every(([name, bound]) => bound && serviceIdentity(safeService(ctx, name)) === serviceIdentity(bound));
+  const agents = service(ctx, 'agents'), tools = service(ctx, 'tools'), presets = service(ctx, 'agentPresets');
+  let active = null, pollTimer = null, inFlight = null, paused = !autoStart, disposed = false;
+  let lastError = null, availabilityError = null, lastResult = null, hooksReady = false;
+  let pendingStop = null, brokerBlocked = null;
+  const recoveryHint = '若停止证明已丢失或持续无法确认，请先完全退出 DSH 并确认其桌面工具子进程结束，再重启 QQ 桥接和 DSH；单独重新启用不能解除阻塞。';
+  function stopIssue() {
+    if (!pendingStop) return brokerBlocked;
+    if (pendingStop.proofState === 'stopped') return failure('owner-desktop.stop-proof-pending',
+      '电脑执行已停止，但桥接尚未确认停止证明。' + (pendingStop.reportIssue ? ' ' + pendingStop.reportIssue.error : ''),
+      '恢复 QQ 桥接连接后，在 QQ 设置中重新启用电脑任务以重试原停止证明；确认前不会启动新任务。' + recoveryHint);
+    return failure('owner-desktop.stop-unconfirmed', '权限已撤销，但电脑执行未确认停止。', pendingStop.proofState === 'unavailable' ? recoveryHint
+      : '在独立电脑会话点停止，并保持 DSH 运行；原工具结束后会自动补交停止证明。请等待状态确认停止，再重新启用并发送新指令。' + recoveryHint);
   }
-  function validParent(parent, config) {
-    try {
-      return !!parent && agentRegistry.get(config.parentSessionId) === parent
-        && sessionId(parent) === config.parentSessionId && !parent.session?.header?.parentSession
-        && parent.session?.header?.origin !== 'subagent' && !isOtherManaged(parent);
-    } catch { return false; }
-  }
-  function subagentService(parent) {
-    // Only called after checking the exact live human management parent.
-    try {
-      const root = safeService(ctx, 'subagents');
-      return root ? { service: root, source: 'root' }
-        : { service: presetRegistry?.serviceFor?.(parent, 'subagents'), source: 'parent-preset' };
-    } catch { return { service: undefined, source: 'parent-preset' }; }
-  }
-  function supportedProvider(provider) {
-    return provider?.inheritsParentContext === false && typeof provider.prepareContinuable === 'function'
-      && ['depthLimit', 'agentPreset'].every(key => provider.capabilities?.[key] === true);
-  }
-  function missingCapabilities(missing) {
-    return failure('owner-desktop.host-unavailable', '宿主缺少受控桌面子代理接口：' + missing.join('、') + '。', '更新并重载 SurfCore 与 DSH 后重试。');
-  }
-
   function settings() {
     try {
       const value = getSettings?.() ?? {};
-      const timeoutMs = normalizeOwnerDesktopTimeout(value.timeoutMs);
-      return { enabled: value.enabled === true, parentSessionId: String(value.parentSessionId ?? ''),
-        authorizationEpoch: String(value.authorizationEpoch ?? ''),
-        timeoutMs, ownerQQ: String(getOwnerQQ?.() ?? '') };
+      return { enabled: value.enabled === true, authorizationEpoch: String(value.authorizationEpoch ?? ''),
+        timeoutMs: normalizeOwnerDesktopTimeout(value.timeoutMs), ownerQQ: String(getOwnerQQ?.() ?? '') };
     } catch (error) {
-      if (error?.code === 'owner-desktop.timeout-invalid') lastError = failure(error.code, error.message, error.hint);
-      return { enabled: false, parentSessionId: '', authorizationEpoch: '', ownerQQ: '', timeoutMs: OWNER_DESKTOP_DEFAULT_TIMEOUT_MS };
+      lastError = failure(error?.code ?? 'owner-desktop.settings-invalid', '无法读取电脑任务设置。', error?.hint ?? '修复设置后重新保存授权。');
+      return { enabled: false, authorizationEpoch: '', ownerQQ: '', timeoutMs: OWNER_DESKTOP_DEFAULT_TIMEOUT_MS };
     }
   }
-  function toolNames() {
-    const schemas = toolRegistry?.definitions?.();
-    if (!Array.isArray(schemas)) return [];
-    return [...new Set(schemas.map(schema => schema?.name).filter(isOwnerDesktopTool))];
+  function servicesMatch() {
+    return [['agents', agents], ['tools', tools], ['agentPresets', presets]].every(([name, value]) => value && original(service(ctx, name)) === original(value));
   }
-  function inspectHost(config) {
-    const missing = Object.entries({ hooks: hooksReady, 'context.get': typeof ctx?.get === 'function',
-      'agents.get': typeof agentRegistry?.get === 'function', bridge: typeof bridge === 'function',
-      registerWorkerSession: typeof registerWorkerSession === 'function', isWorkerSession: typeof isWorkerSession === 'function',
-      'tools.guard': typeof toolRegistry?.guard === 'function', 'tools.definitions': typeof toolRegistry?.definitions === 'function',
-      getPresetStatus: typeof getPresetStatus === 'function',
-      'agentPresets.composedPreset': typeof presetRegistry?.composedPreset === 'function',
-    }).filter(([, available]) => !available).map(([name]) => name);
-    if (missing.length) return { issue: missingCapabilities(missing) };
-    if (!rootServicesMatch()) return { issue: failure('owner-desktop.service-changed', '宿主服务已经关闭或替换。', '重载 SurfCore 后重新启用桌面任务。') };
-    const preset = getPresetStatus();
-    if (preset?.ok !== true) return { issue: failure('owner-desktop.preset-unavailable', '隔离桌面预设尚未就绪。', preset?.hint || '重载 SurfCore 并确认主人桌面任务预设注册成功后重试。') };
-    if (!config.parentSessionId || !config.authorizationEpoch || !config.ownerQQ) {
-      return { issue: failure('owner-desktop.settings-incomplete', '主人桌面任务设置不完整。', '在设置页保存主人账号和已授权的管理会话。') };
-    }
-    const parent = agentRegistry.get(config.parentSessionId);
-    if (!validParent(parent, config)) {
-      return { issue: failure('owner-desktop.parent-unavailable', '已授权的管理会话当前不可用。', '打开独立管理会话，手动开启 Computer Use 后重新保存该会话。') };
-    }
-    const selected = subagentService(parent);
-    const unavailable = Object.entries({
-      'subagents.startActivation': typeof selected.service?.startActivation === 'function',
-      'subagents.getProvider': typeof selected.service?.getProvider === 'function',
-      ...(selected.source === 'parent-preset' ? { 'agentPresets.serviceFor': typeof presetRegistry?.serviceFor === 'function' } : {}),
-    }).filter(([, available]) => !available).map(([name]) => name);
-    if (unavailable.length) return { issue: missingCapabilities(unavailable) };
-    const provider = selected.service.getProvider('spawn');
-    if (!supportedProvider(provider)) {
-      return { issue: failure('owner-desktop.provider-unavailable', '宿主不支持隔离的本地子代理。', '启用支持 startActivation 与独立 agentPreset 的 DSH spawn 提供方。') };
-    }
-    const names = toolNames();
-    if (!names.includes('windows_desktop') || !names.some(name => name.startsWith('mcp__windows__'))) {
-      return { issue: failure('owner-desktop.tools-unavailable', '宿主尚未注册可用的 Windows 桌面工具。', '启用 Windows MCP 并等候工具注册后重新发送指令。') };
-    }
-    return { parent, subagents: selected.service, serviceSource: selected.source, provider };
-  }
-  function hostIssue(config) { return inspectHost(config).issue ?? null; }
-  function status() {
-    const config = settings();
-    let issue = lastError;
-    try { if (config.enabled && !issue) issue = hostIssue(config); } catch {
-      issue = failure('owner-desktop.host-unavailable', '无法读取宿主桌面接口。', '重载插件后查看桌面任务状态。');
-    }
-    return { ok: !issue, enabled: config.enabled, phase: disposed ? 'stopped' : paused ? 'paused'
-      : active ? active.phase : config.enabled ? 'idle' : 'disabled',
-      activeTaskId: active?.taskId ?? null, sessionId: active?.child ? sessionId(active.child) : null,
-      lastError: issue ? { ...issue } : null, lastResult: lastResult ? { ...lastResult } : null };
-  }
-  function publish() { try { onStatus(status()); } catch { /* UI observers cannot change authority. */ } }
-  function remember(agent) {
-    if (!agent || typeof agent !== 'object') return;
-    ownedAgents.add(agent);
-    if (sessionId(agent)) ownedSessions.add(sessionId(agent));
-  }
-  function hasRetiredDescriptor(agent) {
-    if (agent?.session?.header?.agentPreset === WORKER_PRESET) return true;
-    const events = sessionEvents(agent?.session);
-    if (!Array.isArray(events)) return false;
-    const descriptor = events.find(event => event?.type === 'subagent/descriptor')?.data;
-    // Denial only: neither a copied label nor a resumed preset can authorize tools.
-    return descriptor?.label === WORKER_LABEL || agent.session?.header?.agentPreset === WORKER_PRESET;
-  }
-  function candidate(agent) {
-    const lease = active;
-    if (!lease || lease.published || !lease.parent || !agent || sessionId(agent) !== lease.childId) return null;
-    if (agent.session?.header?.origin !== 'subagent'
-      || agent.session?.header?.parentSession !== sessionId(lease.parent)
-      || agentRegistry.get(sessionId(agent)) !== agent) return null;
-    if (!lease.candidates.has(agent)) lease.candidates.set(agent, { initial: null, turn: null, invalid: false, inserted: null });
-    return lease.candidates.get(agent);
-  }
-  function managed(agent) {
-    const seen = new Set();
-    for (let cursor = agent, depth = 0; cursor && depth < 16; depth++) {
-      const id = sessionId(cursor);
-      if (seen.has(cursor)) return false;
-      seen.add(cursor);
-      let registered = false;
-      try { registered = isWorkerSession?.(id) === true; } catch { registered = cursor.session?.header?.origin === 'subagent'; }
-      if (ownedAgents.has(cursor) || ownedSessions.has(id) || registered || hasRetiredDescriptor(cursor)) {
-        for (const descendant of seen) remember(descendant);
-        return true;
-      }
-      // Only the host-reserved fresh child is held behind the publication barrier.
-      if (candidate(cursor)) return true;
-      const header = cursor.session?.header;
-      if (header?.origin !== 'subagent' || !header.parentSession) return false;
-      let retiredParent = ownedSessions.has(header.parentSession);
-      try { retiredParent ||= isWorkerSession?.(header.parentSession) === true; } catch { retiredParent = true; }
-      if (retiredParent) {
-        for (const descendant of seen) remember(descendant);
-        return true;
-      }
-      cursor = agentRegistry?.get?.(header.parentSession);
-    }
-    return false;
-  }
-  function created({ agent }) {
-    const record = candidate(agent);
-    if (record) {
-      const events = sessionEvents(agent.session);
-      record.created = agent.session?.header?.isSeeded === false && agent.session.inheritedEventCount === 0
-        && Array.isArray(events) && !events.some(event => ['user/message', 'turn/start'].includes(event?.type));
-    }
-    managed(agent);
-  }
-  function recordFor(agent) {
-    if (active?.child === agent) return active.record;
-    return candidate(agent);
-  }
-  function configMatches(lease) {
-    const current = settings();
-    return current.enabled && ['ownerQQ', 'parentSessionId', 'authorizationEpoch', 'timeoutMs']
-      .every(key => current[key] === lease.config[key]);
-  }
-  function leaseIssue(lease, agent, signal) {
-    if (!lease || active !== lease || lease.revoked || paused || disposed || lease.controller.signal.aborted || signal?.aborted)
-      return failure('owner-desktop.lease-revoked', '桌面任务授权已结束。', '由主人发送一条新的桌面指令。');
-    if (!configMatches(lease)) return failure('owner-desktop.settings-changed', '桌面任务设置或主人身份已经变化。', '确认设置后由主人重新发送指令。');
-    if (lease.config.timeoutMs === 0 ? lease.deadline !== null : !Number.isSafeInteger(lease.deadline))
-      return failure('owner-desktop.deadline-invalid', '桌面任务执行期限无效。', '重载兼容的 QQ 桥接后，由主人重新发送指令。');
-    if (lease.deadline !== null && now() >= lease.deadline)
-      return failure('owner-desktop.expired', '桌面任务已达到执行时限。', '检查当前桌面状态后重新发送指令。');
-    if (!rootServicesMatch())
-      return failure('owner-desktop.service-changed', '宿主服务已经关闭或替换。', '重载 SurfCore 后重新启用桌面任务。');
-    if (!validParent(lease.parent, lease.config))
-      return failure('owner-desktop.parent-unavailable', '管理会话已经关闭或替换。', '重新打开并授权管理会话后再发送指令。');
-    try {
-      const current = subagentService(lease.parent);
-      if (current.source !== lease.serviceSource || serviceIdentity(current.service) !== lease.subagentIdentity)
-        return failure('owner-desktop.service-changed', '管理会话的子代理服务已经关闭或替换。', '确认管理会话服务后重新发送指令。');
-      const provider = current.service?.getProvider?.('spawn');
-      if (serviceIdentity(provider) !== lease.providerIdentity || !supportedProvider(provider))
-        return failure('owner-desktop.provider-changed', '桌面任务的 spawn 提供方已经关闭或替换。', '确认本地 spawn 提供方后重新发送指令。');
-    } catch {
-      return failure('owner-desktop.service-changed', '无法重新校验管理会话的子代理服务。', '重载 SurfCore 后重新发送指令。');
-    }
-    if (getPresetStatus?.()?.ok !== true)
-      return failure('owner-desktop.preset-unavailable', '隔离桌面预设已卸载。', '重载 SurfCore 后重新发送指令。');
-    if (agent && (agent !== lease.child || agentRegistry.get(sessionId(agent)) !== agent))
-      return failure('owner-desktop.agent-mismatch', '工具调用不属于当前桌面任务。', '只允许当前受控任务子代理执行。');
-    if (agent && (!lease.boundary?.isActive() || presetRegistry.composedPreset(agent.ctx) !== WORKER_PRESET))
-      return failure('owner-desktop.boundary-unavailable', '隔离桌面执行边界已失效。', '重载桌面任务预设后重试。');
-    if (agent && (!lease.record?.initial || !Number.isSafeInteger(lease.record.turn) || !lease.stepAccepted || lease.record.invalid || lease.ended))
-      return failure('owner-desktop.turn-mismatch', '当前消息或轮次没有桌面授权。', '由主人重新发送单条桌面指令。');
+  function subagentsFor(parent) { try { return presets?.serviceFor?.(parent, 'subagents') ?? service(ctx, 'subagents'); } catch { return undefined; } }
+  function hostIssue(config) {
+    if (!hooksReady || !servicesMatch() || typeof agents?.get !== 'function' || typeof tools?.definitions !== 'function'
+      || typeof presets?.composedPreset !== 'function' || typeof bridge !== 'function'
+      || !['find', 'reserve', 'confirm', 'isSession', 'list', 'status'].every(name => typeof conversationStore?.[name] === 'function'))
+      return failure('owner-desktop.host-unavailable', '独立电脑会话所需的宿主接口不可用。', '更新并重载 SurfCore 与 DSH 后重试。');
+    const preset = getPresetStatus?.();
+    if (!preset?.ok || preset.agentPreset !== PRESET) return preset?.ok === false ? preset : boundaryIssue();
+    const stored = conversationStore.status();
+    if (stored?.ok === false) return stored;
+    if (!config.ownerQQ || !config.authorizationEpoch)
+      return failure('owner-desktop.settings-incomplete', '主人身份或电脑授权版本不完整。', '在 QQ 设置中保存主人账号和电脑授权。');
+    if (!tools.definitions().some(row => row.name.startsWith('mcp__windows__')))
+      return failure('owner-desktop.tools-unavailable', '宿主尚未注册 Windows 桌面工具。', '启用 Windows MCP 并等候工具注册后重新发送指令。');
     return null;
   }
-  function revoke(lease, issue, terminal = 'cancelled') {
-    if (!lease || lease.revoked) return;
-    lease.revoked = issue;
-    lease.terminal = terminal;
-    lease.phase = 'cancelling';
-    lease.tickets.clear();
-    lease.ready.resolve();
-    lease.controller.abort({ kind: 'hook', reason: issue.code });
-    lease.boundary?.close();
-    for (const child of new Set([lease.child, ...lease.candidates.keys()])) {
-      try { child?.cancel?.({ kind: 'hook', reason: issue.code }); } catch { /* The exact activation is also disposed in finally. */ }
+  function status() {
+    const config = settings(); let issue = stopIssue() ?? availabilityError ?? lastError, conversations = [];
+    try {
+      const rows = conversationStore?.list?.();
+      if (!Array.isArray(rows)) throw failure('owner-desktop.conversation-store-unavailable', '电脑会话目录不可用。', '重载插件并检查持久化会话目录。');
+      conversations = rows.map(row => ({ ...row }));
+      if (config.enabled && !issue) issue = hostIssue(config);
+    } catch (error) {
+      issue = failure(typeof error?.code === 'string' && error.code.startsWith('owner-desktop.') ? error.code : 'owner-desktop.host-unavailable',
+        typeof error?.error === 'string' ? error.error : '无法读取电脑会话状态。', typeof error?.hint === 'string' && error.hint ? error.hint : '重载插件并检查持久化会话目录后重试。');
     }
-    lastError = issue;
-    publish();
+    const current = active ?? pendingStop?.lease;
+    return { ok: !issue, enabled: config.enabled, phase: disposed ? 'stopped' : stopIssue() ? 'stopping' : paused ? 'paused' : active?.phase ?? (config.enabled ? 'idle' : 'disabled'),
+      activeTaskId: current?.taskId ?? null, sessionId: current?.childId ?? null,
+      sourceSessionId: current?.sourceSessionId ?? null, desktopSessionId: current?.childId ?? null,
+      conversations, lastError: issue ? { ...issue } : null, lastResult: lastResult ? { ...lastResult } : null };
   }
+  function publish() { try { onStatus(status()); } catch { /* observers never mint authority */ } }
   async function call(path, body) {
     let raw;
-    try { raw = await bridge(`/api/owner-desktop/${path}`, body === undefined
-      ? { timeoutMs: 4000 } : { method: 'POST', body, timeoutMs: 4000 }); } catch { raw = null; }
+    try { raw = await bridge('/api/owner-desktop/' + path, body === undefined ? { timeoutMs: 4000 } : { method: 'POST', body, timeoutMs: 4000 }); } catch { raw = null; }
     const value = raw && Object.hasOwn(raw, 'data') ? raw.data : raw;
     if (raw?.ok !== true || value?.ok !== true) {
       const detail = value?.ok === false ? value : null;
       return failure(typeof detail?.code === 'string' ? detail.code : 'owner-desktop.bridge-unavailable',
-        typeof detail?.error === 'string' ? detail.error.slice(0, 300) : '主人桌面任务桥接校验失败。',
-        typeof detail?.hint === 'string' && detail.hint ? detail.hint.slice(0, 300) : '检查 QQ 桥接连接与桌面任务设置后重试。');
+        typeof detail?.error === 'string' ? detail.error.slice(0, 300) : '主人电脑任务桥接校验失败。',
+        typeof detail?.hint === 'string' && detail.hint ? detail.hint.slice(0, 300) : '检查 QQ 桥接连接与电脑任务设置后重试。');
     }
     return value;
   }
-  function taskTimingIssue(task, config) {
+  function retired(agent) {
+    const seen = new Set();
+    for (let current = agent; current && seen.size < 32; current = agents?.get?.(current.session?.header?.parentSession)) {
+      if (seen.has(current)) return true; seen.add(current);
+      try {
+        if (isWorkerSession(idOf(current)) || current.session?.header?.agentPreset === 'owner-desktop') return true;
+        if ((current.session?.snapshotEvents?.() ?? []).some(event => event?.type === 'subagent/descriptor' && event.data?.label === 'SurfCore owner desktop task')) return true;
+      } catch { return true; }
+      if (!current.session?.header?.parentSession) return false;
+    }
+    return false;
+  }
+  function desktop(agent) {
+    if (agent?.session?.header?.agentPreset === PRESET) return true;
+    try { if (presets?.composedPreset?.(agent?.ctx) === PRESET) return true; } catch { /* header still identifies dedicated sessions */ }
+    try { return conversationStore?.isSession?.(idOf(agent)) === true; }
+    catch { return false; } // Broken desktop storage must not disable ordinary QQ's safe tools.
+  }
+  function managed(agent) { try { return desktop(agent) || retired(agent) || isOtherManaged(agent); } catch { return true; } }
+  function timingIssue(task, config) {
     if (!task || task.status !== 'running' || task.timeoutMs !== config.timeoutMs
       || !Number.isSafeInteger(task.sourceReceivedAt) || task.sourceReceivedAt <= 0
       || !Number.isSafeInteger(task.claimedAt) || task.claimedAt < task.sourceReceivedAt || task.claimedAt > now()
       || !Number.isSafeInteger(task.claimExpiresAt) || task.claimedAt >= task.claimExpiresAt
       || task.claimExpiresAt > task.sourceReceivedAt + OWNER_DESKTOP_PENDING_TTL_MS
-      || (config.timeoutMs === 0 ? task.expiresAt !== null
-        : !Number.isSafeInteger(task.expiresAt) || task.expiresAt !== task.claimedAt + config.timeoutMs))
-      return failure('owner-desktop.deadline-invalid', '桥接任务缺少有效的领取时间或执行期限。', '重载兼容的 QQ 桥接后，由主人重新发送实时指令。');
+      || (config.timeoutMs === 0 ? task.expiresAt !== null : !Number.isSafeInteger(task.expiresAt) || task.expiresAt !== task.claimedAt + config.timeoutMs))
+      return failure('owner-desktop.deadline-invalid', '桥接任务缺少有效领取时间或执行期限。', '重载兼容桥接后，由主人重新发送实时指令。');
     return null;
   }
-  async function validateLease(lease) {
+  function leaseIssue(lease, agent, signal) {
+    if (!lease || active !== lease || lease.revoked || lease.ended || paused || disposed || signal?.aborted) return endedIssue();
+    const config = settings();
+    if (!config.enabled || ['ownerQQ', 'authorizationEpoch', 'timeoutMs'].some(key => config[key] !== lease.config[key]))
+      return failure('owner-desktop.settings-changed', '电脑设置或主人身份已改变。', '确认设置后由主人重新发送指令。');
+    if (!servicesMatch() || (lease.subagents && original(subagentsFor(lease.source)) !== original(lease.subagents)))
+      return failure('owner-desktop.service-changed', '宿主服务已关闭或替换。', '重载 SurfCore 后重新发送指令。');
+    if (lease.task?.expiresAt !== null && now() >= lease.task?.expiresAt)
+      return failure('owner-desktop.expired', '电脑任务已达到执行时限。', '检查当前桌面状态后重新发送指令。');
+    if (lease.source && agents.get(lease.sourceSessionId) !== lease.source)
+      return failure('owner-desktop.source-session-changed', '来源 QQ 会话已关闭或替换。', '恢复原 QQ 会话后由主人重新发送指令。');
+    if (lease.agent && (agents.get(lease.childId) !== lease.agent || (agent && agent !== lease.agent)))
+      return failure('owner-desktop.agent-mismatch', '电脑会话实例已关闭或替换。', '从原 QQ 对话发送新指令恢复独立电脑会话。');
+    try {
+      const stored = conversationStore.status();
+      if (stored?.ok !== true) return stored?.ok === false ? stored : failure('owner-desktop.conversation-store-unavailable', '电脑会话目录不可用。', '检查并恢复持久化目录后重试。');
+    } catch { return failure('owner-desktop.conversation-store-unavailable', '无法校验电脑会话目录。', '检查并恢复持久化目录后重试。'); }
+    if (lease.boundary && !lease.boundary.isActive()) return boundaryIssue();
+    if (agent && (!lease.bound || !lease.initial || !lease.stepAccepted || !Number.isSafeInteger(lease.turn) || signal !== lease.turnSignal))
+      return failure('owner-desktop.turn-mismatch', '此次调用不属于获准消息的执行轮次。', '由主人发送新的电脑指令。');
+    return null;
+  }
+  function close(lease) { lease.tickets.clear(); lease.boundary?.close(); }
+  function revoke(lease, issue, terminal = 'cancelled') {
+    if (!lease || lease.revoked || lease.ended) return;
+    lease.revoked = issue; lease.terminal = terminal; lease.phase = 'cancelling'; close(lease);
+    lease.controller.abort({ kind: 'hook', reason: issue.code });
+    // The child has its own inbox and history. Never touch the QQ parent's loop.
+    if (lease.agent) { try { lease.agent.cancel({ kind: 'hook', reason: issue.code }); } catch { lease.cancelFailed = true; } }
+    lease.revokedEvent.resolve(); lastError = issue; publish();
+  }
+  async function validate(lease) {
     const checked = await call('validate', { taskId: lease.taskId, leaseId: lease.leaseId });
     if (!checked.ok) return checked;
-    const timing = taskTimingIssue(checked.task, lease.config);
-    if (timing) return timing;
-    if (['id', 'ownerQQ', 'conversationKey', 'sourceMessageId', 'sourceReceivedAt', 'timeoutMs', 'claimExpiresAt', 'claimedAt', 'expiresAt']
-      .some(key => checked.task[key] !== lease.task[key]))
-      return failure('owner-desktop.task-changed', '桥接任务身份或执行期限已经变化。', '停止当前任务，由主人重新发送指令。');
+    const timing = timingIssue(checked.task, lease.config); if (timing) return timing;
+    const keys = ['id', 'ownerQQ', 'selfUserId', 'conversationKey', 'sourceMessageId', 'sourceReceivedAt', 'sourceTime', 'continuationRequested', 'timeoutMs', 'claimExpiresAt', 'claimedAt', 'expiresAt'];
+    if (lease.preparedId) keys.push('sourceSessionId', 'preparedId');
+    if (lease.bound) keys.push('sessionId', 'messageId');
+    if (keys.some(key => checked.task[key] !== lease.task[key]))
+      return failure('owner-desktop.task-changed', '可信任务、来源会话或消息绑定已变化。', '停止当前任务，由主人重新发送指令。');
     return checked;
   }
-  function ticketIdentity(exec) {
-    return typeof exec?.token === 'symbol' && typeof exec.callId === 'string' && typeof exec.rootCallId === 'string';
-  }
-  function denial(issue) { return `${issue.code}: ${issue.error} ${issue.hint}`; }
   function ordinaryDenial(exec) {
-    if (!exec.agent || !isOwnerDesktopTool(exec.name)) return undefined;
-    try { if (!isOtherManaged(exec.agent)) return undefined; } catch { /* Classification failure cannot enable Windows. */ }
-    return 'owner-desktop.owner-task-required: 当前普通聊天会话不能直接操作电脑。主人可在 QQ 私聊直接发送一条新消息「电脑：打开B站」；群聊则需主人真正 @ 当前机器人后发送同样指令。主人私聊不需要群聊 @，已启用的桌面授权无需重复放行。';
+    if (retired(exec.agent)) return 'owner-desktop.retired-worker: 旧桌面子代理不能恢复权限。请从原 QQ 对话发送新指令。';
+    if (desktop(exec.agent)) return 'owner-desktop.owner-task-required: 电脑会话没有有效主人消息授权。';
+    if (isOwnerDesktopTool(exec.name) && managed(exec.agent)) return 'owner-desktop.owner-task-required: 普通 QQ/B站消息没有桌面权限。';
   }
   async function preExecute(exec, next) {
-    if (!managed(exec.agent)) {
-      const reason = ordinaryDenial(exec);
-      return reason ? { kind: 'deny', reason } : next();
-    }
     const lease = active;
+    if (lease?.agent !== exec.agent) { const reason = ordinaryDenial(exec); return reason ? { kind: 'deny', reason } : next(); }
+    if (!isOwnerDesktopTool(exec.name)) return { kind: 'deny', reason: 'owner-desktop.tool-not-allowed: 独立电脑会话只允许 Windows 工具。' };
     const issue = leaseIssue(lease, exec.agent, exec.signal);
-    if (issue || !isOwnerDesktopTool(exec.name) || !ticketIdentity(exec))
-      return { kind: 'deny', reason: denial(issue ?? failure('owner-desktop.tool-denied', '桌面子代理不能调用这个工具。', '仅使用已授权的 Windows 桌面工具。')) };
-    const decision = await next();
-    if (decision?.kind !== 'allow') return decision;
-    const checked = await validateLease(lease);
-    const changed = leaseIssue(lease, exec.agent, exec.signal);
-    if (!checked.ok || changed) {
-      const reason = changed ?? checked;
-      revoke(lease, reason);
-      return { kind: 'deny', reason: denial(reason) };
-    }
-    lease.tickets.set(exec.token, { agent: exec.agent, callId: exec.callId, rootCallId: exec.rootCallId,
-      name: exec.name, signal: exec.signal, turn: lease.record.turn });
+    if (issue || typeof exec.token !== 'symbol' || typeof exec.callId !== 'string' || typeof exec.rootCallId !== 'string')
+      return { kind: 'deny', reason: denial(issue ?? failure('owner-desktop.invocation-invalid', '工具调用缺少宿主执行身份。', '重载兼容宿主后重试。')) };
+    const decision = await next(); if (decision?.kind !== 'allow') return decision;
+    const checked = await validate(lease), changed = leaseIssue(lease, exec.agent, exec.signal);
+    if (!checked.ok || changed) { const reason = changed ?? checked; revoke(lease, reason); return { kind: 'deny', reason: denial(reason) }; }
+    lease.tickets.set(exec.token, { agent: exec.agent, name: exec.name, callId: exec.callId, rootCallId: exec.rootCallId, signal: exec.signal, turn: lease.turn });
     return decision;
   }
   function guard(exec) {
-    if (!managed(exec.agent)) return ordinaryDenial(exec);
     const lease = active;
-    const issue = leaseIssue(lease, exec.agent, exec.signal);
-    if (issue) { if (lease?.child === exec.agent && !lease.ended) revoke(lease, issue); return denial(issue); }
-    if (!isOwnerDesktopTool(exec.name)) return 'owner-desktop.tool-denied: 仅允许当前任务的 Windows 桌面工具。';
-    const ticket = lease.tickets.get(exec.token);
-    lease.tickets.delete(exec.token);
-    if (!ticket || ticket.agent !== exec.agent || ticket.callId !== exec.callId || ticket.rootCallId !== exec.rootCallId
-      || ticket.name !== exec.name || ticket.signal !== exec.signal || ticket.turn !== lease.record.turn)
-      return 'owner-desktop.validation-required: 此次调用没有通过桥接的实时身份校验。';
-    return undefined;
+    if (lease?.agent !== exec.agent) return ordinaryDenial(exec);
+    if (!isOwnerDesktopTool(exec.name)) return 'owner-desktop.tool-not-allowed: 独立电脑会话只允许 Windows 工具。';
+    const issue = leaseIssue(lease, exec.agent, exec.signal); if (issue) { revoke(lease, issue); return denial(issue); }
+    const ticket = lease.tickets.get(exec.token); lease.tickets.delete(exec.token);
+    if (!ticket || ['agent', 'name', 'callId', 'rootCallId', 'signal'].some(key => ticket[key] !== exec[key]) || ticket.turn !== lease.turn)
+      return 'owner-desktop.validation-required: 此次调用未通过桥接实时校验。';
+  }
+  function created({ agent }) {
+    const lease = active;
+    if (!lease || !lease.dispatching || idOf(agent) !== lease.childId || lease.agent) return;
+    if (agents.get(lease.childId) !== agent || agent.session?.header?.parentSession !== lease.sourceSessionId
+      || agent.session?.header?.origin !== 'subagent' || presets.composedPreset(agent.ctx) !== PRESET || retired(agent)
+      || typeof agent.model?.select !== 'function' || typeof agent.cancel !== 'function' || typeof agent.whenIdle !== 'function' || typeof agent.inbox?.remove !== 'function') {
+      revoke(lease, failure('owner-desktop.child-identity-invalid', '宿主创建的电脑会话身份不匹配。', '重载专用预设后由主人重试。'), 'failed'); return;
+    }
+    lease.agent = agent;
+    // Official synchronous model/selection event. Cold resumes follow the QQ's current route.
+    agent.model.select(lease.modelSelection);
   }
   function inserted({ agent, message }) {
-    const record = recordFor(agent);
-    if (!record) return;
-    if (record.inserted && record.inserted !== message) {
-      record.invalid = true;
-      if (active?.child === agent) revoke(active, failure('owner-desktop.extra-message', '桌面任务收到额外消息，授权已撤销。', '不要向执行子代理追加消息；由主人重新发送指令。'));
-    } else record.inserted = message;
+    // Host continuation settlement is not an owner instruction or QQ context.
+    if (message?.source?.kind === 'subagent-settled' && message.source.form === 'notice') {
+      const childId = message.source.senderSessionId;
+      try {
+        if (conversationStore?.isSession?.(childId) && conversationStore.list().some(row => row.sessionId === childId && row.sourceSessionId === idOf(agent))) {
+          agent.inbox.remove(message.id); return;
+        }
+      } catch { /* no broad deletion on unavailable storage */ }
+    }
+    const lease = active;
+    if (lease?.agent !== agent || lease.ended || lease.revoked) return;
+    const trustedSource = lease.continuation ? message?.source?.kind === 'agent-message' && message.source.senderSessionId === lease.sourceSessionId : message?.source?.kind === 'user';
+    if (!lease.inserted && lease.dispatching && message?.role === 'user' && typeof message.id === 'string' && trustedSource) {
+      lease.inserted = message;
+      lease.boundary = armOwnerDesktopConversation(agent, exec => { const issue = leaseIssue(lease, exec.agent, exec.signal); return issue ? denial(issue) : undefined; }, () => revoke(lease, boundaryIssue()));
+      if (!lease.boundary) revoke(lease, boundaryIssue(), 'failed');
+    } else revoke(lease, failure('owner-desktop.extra-message', '电脑轮次收到未经绑定的额外输入，授权已撤销。', '由主人从原 QQ 对话重新发送指令。'));
   }
   function claimed({ agent, message, turn }) {
-    const record = recordFor(agent);
-    if (!record) return;
-    if (record.initial || !Number.isSafeInteger(turn) || textOf(message) !== active?.prompt
-      || typeof message?.id !== 'string' || message.source?.kind !== 'user') record.invalid = true;
-    else { record.initial = message; record.turn = turn; }
-    if (record.invalid && active?.child === agent) revoke(active, failure('owner-desktop.extra-message', '桌面任务的消息或轮次发生变化。', '由主人重新发送单条桌面指令。'));
+    const lease = active; if (lease?.agent !== agent || lease.ended || lease.revoked) return;
+    if (lease.initial || message !== lease.inserted || !Number.isSafeInteger(turn)) {
+      revoke(lease, failure('owner-desktop.extra-message', '宿主领取的消息与待绑定首条消息不一致。', '从原 QQ 对话重新发送指令。')); return;
+    }
+    lease.initial = message; lease.turn = turn;
+    // Real host order: claim -> tools.resolve -> pre-step. The message receipt is checked before model entry.
+    if (!lease.boundary?.activate()) revoke(lease, boundaryIssue(), 'failed');
+    else if (!lease.boundary.desktopAvailable()) revoke(lease, failure('owner-desktop.computer-use-off', '来源 QQ 会话的 Computer Use 未开启或电脑能力不可用。', '在原 QQ 会话输入框手动打开 Computer Use，再由主人重新发送指令。'), 'failed');
   }
   async function preStep(payload, next) {
-    const { agent } = payload;
-    const pending = candidate(agent);
     const lease = active;
-    if (pending && !lease.published) await lease.ready.promise;
-    if (!managed(agent)) return next();
-    if (!lease || lease !== active || lease.child !== agent) return { kind: 'reject' };
-    const record = lease.record;
-    const firstStep = !lease.stepAccepted;
-    const messages = payload.messages;
-    if (!record?.initial || record.initial.id !== lease.messageId || record.invalid || payload.turn !== record.turn
-      || !Array.isArray(messages) || messages.some(message => message !== record.initial)
-      || (lease.stepAccepted ? messages.length !== 0 : (messages.length !== 1 || messages[0] !== record.initial))) {
-      revoke(lease, failure('owner-desktop.extra-message', '桌面任务只能执行首条指令所在的一轮。', '由主人发送新指令启动新的隔离任务。'));
-      return { kind: 'reject' };
+    if (lease?.agent !== payload.agent) return desktop(payload.agent) || retired(payload.agent) ? { kind: 'reject' } : next();
+    if (lease.revoked || lease.ended) return { kind: 'reject' };
+    const first = !lease.stepAccepted;
+    if (!lease.initial || payload.turn !== lease.turn || !Array.isArray(payload.messages)
+      || (first ? payload.messages.length !== 1 || payload.messages[0] !== lease.initial : payload.messages.length !== 0)
+      || (lease.turnSignal && payload.signal !== lease.turnSignal)) {
+      revoke(lease, failure('owner-desktop.extra-message', '电脑授权轮次混入了其他消息。', '从原 QQ 对话重新发送指令。')); return { kind: 'reject' };
     }
-    // This listener is cancellable through the official turn signal.
     if (!lease.turnSignal) {
       lease.turnSignal = payload.signal;
-      lease.abortListener = () => { if (!lease.ended) revoke(lease, failure('owner-desktop.aborted', '桌面任务已被中止。', '检查当前桌面状态后重新发送指令。')); };
+      lease.abortListener = () => revoke(lease, failure('owner-desktop.aborted', '电脑指令已被中止。', '确认桌面状态后由主人发送新指令。'));
       payload.signal.addEventListener('abort', lease.abortListener, { once: true });
     }
+    await lease.binding.promise;
+    if (lease.revoked || !lease.bound || lease.messageId !== lease.initial.id) return { kind: 'reject' };
     lease.stepAccepted = true;
-    const issue = leaseIssue(lease, agent, payload.signal);
-    if (issue) { revoke(lease, issue); return { kind: 'reject' }; }
-    const decision = await next();
-    // The 0.2.2 loop adds runtime-context placeholders after claiming inbox messages.
-    // Remove them here: the loop regenerates context from its authoritative assembly
-    // during commit. No placeholder content or identity enters our task authorization.
-    const admitted = Array.isArray(decision?.messages)
-      ? decision.messages.filter(message => message?.source?.kind !== 'runtime-context') : null;
-    if (decision?.kind === 'enter' && (!admitted
-      || (firstStep ? admitted.length !== 1 || admitted[0] !== record.initial : admitted.length !== 0))) {
-      revoke(lease, failure('owner-desktop.extra-message', '宿主追加了本任务之外的消息。', '检查消息注入插件后重新发送指令。'));
-      return { kind: 'reject' };
+    const issue = leaseIssue(lease, payload.agent, payload.signal); if (issue) { revoke(lease, issue); return { kind: 'reject' }; }
+    const checked = await validate(lease), changed = leaseIssue(lease, payload.agent, payload.signal);
+    if (!checked.ok || changed) { revoke(lease, changed ?? checked); return { kind: 'reject' }; }
+    if (first) {
+      const started = await call('started', { taskId: lease.taskId, leaseId: lease.leaseId, messageId: lease.messageId, turnId: lease.turn });
+      if (!started.ok) { revoke(lease, started); return { kind: 'reject' }; }
     }
-    if (leaseIssue(lease, agent, payload.signal)) return { kind: 'reject' };
-    return decision?.kind === 'enter' ? { ...decision, messages: admitted } : decision;
+    const decision = await next();
+    if (decision?.kind !== 'enter') return decision;
+    const admitted = Array.isArray(decision.messages) ? decision.messages.filter(message => !['runtime-context', 'model-selection'].includes(message?.source?.kind)) : null;
+    if (!admitted || (first ? admitted.length !== 1 || admitted[0] !== lease.initial : admitted.length !== 0)) {
+      revoke(lease, failure('owner-desktop.extra-message', '宿主插件追加了未经授权的输入。', '检查消息注入插件后重试。')); return { kind: 'reject' };
+    }
+    if (leaseIssue(lease, payload.agent, payload.signal)) return { kind: 'reject' };
+    // Drop placeholders instead of trusting their source.kind as permission-bearing text.
+    return { ...decision, messages: admitted };
   }
   function sessionEvent(session, event) {
     const lease = active;
-    if (!lease?.child || session !== lease.child.session || event?.type !== 'turn/end') return;
-    lease.ended = true;
-    lease.turnEnded = lease.record?.turn === event.data?.turn;
-    lease.tickets.clear();
-    if (lease.record?.turn !== event.data?.turn) revoke(lease, failure('owner-desktop.turn-mismatch', '桌面任务轮次结束信号不匹配。', '重新发送指令。'));
+    if (!lease || session !== lease.agent?.session || event.data?.turn !== lease.turn) return;
+    if (event.type === 'assistant/message') {
+      const message = event.data.message;
+      if (message?.role !== 'assistant' || !Array.isArray(message.content)) return;
+      const text = message.content.filter(block => block.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n');
+      if (!message.content.some(block => block.type === 'tool-call')) lease.output = text.slice(0, 4000);
+      else if (lease.bound && lease.stepAccepted && !lease.revoked && !lease.ended && text.trim() && text !== lease.lastProgress && now() - lease.progressAt >= 15_000) {
+        lease.lastProgress = text; lease.progressAt = now();
+        void call('progress', { taskId: lease.taskId, leaseId: lease.leaseId, summary: text.slice(0, 500) }).then(result => {
+          if (!result.ok && active === lease && !lease.ended && !lease.revoked) { lastError = result; publish(); }
+        });
+      }
+      return;
+    }
+    if (event.type !== 'turn/end') return;
+    lease.ended = true; lease.turnEnd = event.data; close(lease); lease.finished.resolve(event.data);
   }
   function agentDisposed(agent) {
     const lease = active;
-    if (lease && !lease.settled && (agent === lease.parent || (agent === lease.child && !lease.ended)))
-      revoke(lease, failure('owner-desktop.agent-disposed', '桌面执行或管理会话已经关闭。', '重新打开并授权管理会话后再发送指令。'));
+    if (lease?.source === agent && !lease.ended) revoke(lease, failure('owner-desktop.source-session-changed', '来源 QQ 会话已关闭。', '恢复原 QQ 会话后重试。'));
+    if (lease?.agent !== agent) return;
+    if (!lease.ended && !lease.revoked) revoke(lease, failure('owner-desktop.agent-disposed', '电脑会话已关闭。', '从原 QQ 对话发送新指令恢复历史。'));
   }
-  function listen(name, fn) { const off = ctx.on(name, fn); if (typeof off === 'function') listeners.push(off); }
-
   try {
-    if (typeof ctx?.on === 'function' && typeof toolRegistry?.guard === 'function') {
-      const off = toolRegistry.guard(guard);
-      if (typeof off === 'function') listeners.push(off);
-      listen('tools/pre-execute', preExecute);
-      listen('agent/created', created);
-      listen('agent/inbox/inserted', inserted);
-      listen('agent/inbox/claimed', claimed);
-      listen('agent/pre-step', preStep);
-      listen('agent/disposed', ({ agent }) => agentDisposed(agent));
-      listen('session/disposed', session => {
-        if (active?.child?.session === session) agentDisposed(active.child);
-        else if (active?.parent?.session === session) agentDisposed(active.parent);
+    if (typeof ctx?.on === 'function' && typeof tools?.guard === 'function') {
+      tools.guard(guard); ctx.on('tools/pre-execute', preExecute); ctx.on('agent/created', created); ctx.on('agent/inbox/inserted', inserted);
+      ctx.on('agent/inbox/claimed', claimed); ctx.on('agent/pre-step', preStep); ctx.on('session/event', sessionEvent);
+      ctx.on('agent/disposed', ({ agent }) => agentDisposed(agent));
+      ctx.on('subagent/end', info => {
+        const lease = active;
+        if (lease && info?.id === lease.childId && info.parentSessionId === lease.sourceSessionId) {
+          if (!lease.ended && !lease.revoked) revoke(lease, failure('owner-desktop.execution-failed', '电脑执行提前结束。', '检查独立电脑会话后重新发送指令。'), 'failed');
+        }
       });
-      listen('session/event', sessionEvent);
-      listen('dispose', async () => { disposed = true; await stop(); });
-      hooksReady = true;
+      ctx.on('dispose', async () => { disposed = true; await stop(); }); hooksReady = true;
     }
-  } catch {
-    lastError = failure('owner-desktop.host-unavailable', '无法安装桌面执行守卫。', '重载兼容的 DSH 与 SurfCore 后重试。');
+  } catch { lastError = failure('owner-desktop.host-unavailable', '无法安装独立电脑执行守卫。', '重载兼容的 DSH 与 SurfCore 后重试。'); }
+  async function bounded(promise) {
+    let timer;
+    try { return await Promise.race([promise, new Promise(resolve => { timer = setTimer(() => resolve(false), STOP_WAIT_MS); })]); }
+    finally { if (timer) clearTimer(timer); }
   }
-
+  function observeStopped(lease) {
+    // Capture the original instance and dispatch, never a later agents.get(id).
+    // This promise survives the UI timeout, but never participates in admission.
+    const agent = lease.agent, dispatch = lease.dispatchTask;
+    if (!lease.dispatchAttempted) return Promise.resolve(true);
+    return (async () => {
+      try {
+        if (dispatch) await dispatch.catch(() => {});
+        if (!agent || !lease.dispatchSettled) return false;
+        await agent.whenIdle();
+        return true;
+      } catch { return false; }
+    })();
+  }
+  async function reportStopped(record) {
+    if (pendingStop !== record || record.proofState !== 'stopped') return;
+    if (record.reporting) return record.reporting;
+    record.reporting = (async () => {
+      const result = await call('complete', record.payload);
+      if (!result.ok || result.task?.id !== record.lease.taskId || result.task.executionStopped !== true
+        || (record.lease.bound && result.task.sessionId !== record.lease.childId)) {
+        record.reportIssue = result.ok ? failure('owner-desktop.stop-proof-mismatch', '停止回执与原任务或会话不一致。', recoveryHint) : result;
+        publish(); return;
+      }
+      if (pendingStop !== record) return;
+      pendingStop = null;
+      if (lastResult?.taskId === record.lease.taskId) lastResult = { ...lastResult, executionStopped: true };
+      if (lastError === record.terminalError) lastError = null;
+      publish();
+    })();
+    try { await record.reporting; } finally { record.reporting = null; }
+  }
   async function execute(taskId, config) {
-    const lease = { taskId, leaseId: newLeaseId(), childId: newChildId(), config, parent: null, child: null, task: null, record: null,
-      phase: 'claiming', controller: new AbortController(), ready: deferred(), candidates: new Map(),
-      tickets: new Map(), published: false, revoked: null, stepAccepted: false, ended: false, settled: false,
-      deadline: undefined, done: deferred() };
-    active = lease;
-    publish();
-    let run;
-    let claimedTask = false;
-    let completion = null;
-    let timeout;
-    let heartbeat;
+    const lease = { taskId, leaseId: newLeaseId(), config, phase: 'claiming', agent: null, task: null, tickets: new Map(), controller: new AbortController(),
+      finished: deferred(), revokedEvent: deferred(), done: deferred(), binding: deferred(),
+      revoked: null, ended: false, bound: false, stepAccepted: false, dispatching: false, progressAt: 0 };
+    active = lease; publish();
+    let completion, claimedTask = false, timeout, heartbeat;
     function watch() {
       if (active !== lease || lease.ended || lease.revoked) return;
       heartbeat = setTimer(async () => {
-        const changed = leaseIssue(lease);
-        if (changed) { revoke(lease, changed); return; }
-        const checked = await validateLease(lease);
-        if (active === lease && !lease.ended && !checked.ok) revoke(lease, checked);
-        watch();
-      }, POLL_MS);
-      heartbeat?.unref?.();
+        const changed = leaseIssue(lease); if (changed) { revoke(lease, changed); return; }
+        const checked = await validate(lease); if (!lease.ended && !checked.ok) revoke(lease, checked); watch();
+      }, POLL_MS); heartbeat?.unref?.();
     }
     try {
       const claim = await call('claim', { taskId, leaseId: lease.leaseId });
       if (!claim.ok) { lastError = claim; return; }
-      claimedTask = true;
-      lease.task = claim.task ? Object.freeze({ ...claim.task }) : null;
-      if (!lease.task || lease.task.id !== taskId || String(lease.task.ownerQQ) !== config.ownerQQ
-        || typeof lease.task.text !== 'string' || !lease.task.text.trim()
-        || typeof lease.task.sourceMessageId !== 'string' || !lease.task.sourceMessageId
-        || !Number.isFinite(lease.task.sourceReceivedAt) || !lease.task.conversationKey) {
-        completion = failure('owner-desktop.invalid-task', '桥接任务缺少可信消息来源。', '由主人重新发送实时桌面指令。');
-        return;
+      claimedTask = true; lease.task = claim.task ? { ...claim.task } : null;
+      if (!lease.task || lease.task.id !== taskId || lease.task.ownerQQ !== config.ownerQQ || !lease.task.selfUserId || !lease.task.sourceMessageId || !lease.task.conversationKey || typeof lease.task.continuationRequested !== 'boolean') {
+        completion = failure('owner-desktop.invalid-task', '电脑任务缺少可信主人消息身份。', '由主人重新发送实时电脑指令。'); return;
       }
-      const timing = taskTimingIssue(lease.task, config);
-      if (timing) { completion = timing; return; }
-      lease.deadline = lease.task.expiresAt;
-      const host = inspectHost(config);
-      if (host.issue) { completion = host.issue; return; }
-      lease.parent = host.parent;
-      lease.subagents = host.subagents;
-      lease.serviceSource = host.serviceSource;
-      lease.subagentIdentity = serviceIdentity(host.subagents);
-      lease.providerIdentity = serviceIdentity(host.provider);
-      const invalid = leaseIssue(lease);
-      if (invalid) { completion = invalid; return; }
-      const validated = await validateLease(lease);
-      if (!validated.ok) { completion = validated; return; }
-      const stale = leaseIssue(lease);
-      if (stale) { completion = stale; return; }
-      if (lease.deadline !== null) {
-        timeout = setTimer(() => revoke(lease, failure('owner-desktop.timeout', '桌面任务已达到时间上限。', '先确认当前桌面状态，再发送新的指令。')), Math.max(1, lease.deadline - now()));
-        timeout?.unref?.();
+      completion = timingIssue(lease.task, config) ?? hostIssue(config); if (completion) return;
+      const prepared = await call('prepare', { taskId, leaseId: lease.leaseId });
+      if (!prepared.ok) { completion = prepared; return; }
+      if (typeof prepared.sourceSessionId !== 'string' || !prepared.sourceSessionId || typeof prepared.preparedId !== 'string' || !prepared.preparedId
+        || typeof prepared.prompt !== 'string' || !prepared.prompt.trim()) {
+        completion = failure('owner-desktop.prepare-invalid', '桥接没有返回来源 QQ 会话和可信人设提示。', '重载兼容桥接后重新发送指令。'); return;
       }
-      watch();
-      if (typeof lease.childId !== 'string' || !lease.childId || agentRegistry.get(lease.childId) || isWorkerSession(lease.childId)) {
-        completion = failure('owner-desktop.child-id-unavailable', '无法预留全新的桌面任务身份。', '重新发送指令以生成新的独立任务。');
-        return;
+      lease.preparedId = prepared.preparedId; lease.sourceSessionId = prepared.sourceSessionId;
+      Object.assign(lease.task, { sourceSessionId: prepared.sourceSessionId, preparedId: prepared.preparedId });
+      lease.source = agents.get(lease.sourceSessionId);
+      const source = lease.source;
+      if (!source || idOf(source) !== lease.sourceSessionId || source.session?.header?.parentSession || retired(source) || desktop(source)
+        || !['qq-chat', 'qq-chat-v2'].includes(presets.composedPreset(source.ctx))) {
+        completion = failure('owner-desktop.qq-session-unavailable', '可信来源 QQ 会话当前不可用。', '恢复同一 QQ 会话后由主人重新发送指令。'); return;
       }
-      const registered = await registerWorkerSession(lease.childId);
-      if (registered !== true && registered?.ok !== true) {
-        completion = failure('owner-desktop.worker-registration-failed', '无法记录桌面子代理的永久拒绝标记。', '修复主人桌面任务状态存储后重试。');
-        revoke(lease, completion, 'failed');
-        return;
+      const model = source.model?.current?.();
+      if (!model?.provider || !model?.model) { completion = failure('owner-desktop.model-unavailable', '无法读取来源 QQ 当前模型。', '在原 QQ 会话选定模型后重新发送指令。'); return; }
+      lease.modelSelection = { provider: model.provider, model: model.model, ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort }) };
+      lease.subagents = subagentsFor(source);
+      if (typeof lease.subagents?.startActivation !== 'function' || typeof lease.subagents?.sendMessage !== 'function') {
+        completion = failure('owner-desktop.subagents-unavailable', '宿主不支持独立电脑会话的正式创建与续接接口。', '更新 DSH 并重载 SurfCore 后重试。'); return;
       }
-      ownedSessions.add(lease.childId);
-      const cancelled = leaseIssue(lease);
-      if (cancelled) { completion = cancelled; return; }
-      lease.phase = 'starting';
-      lease.prompt = lease.task.text;
-      run = await lease.subagents.startActivation({ provider: 'spawn', parent: lease.parent, childId: lease.childId,
-        prompt: [{ type: 'text', text: lease.prompt }], label: WORKER_LABEL, delivery: 'caller',
-        signal: lease.controller.signal, agentPreset: WORKER_PRESET, maxDepth: 1 });
-      const child = agentRegistry.get(lease.childId);
-      if (!child || !run?.result || typeof run.dispose !== 'function' || run.childId !== sessionId(child)
-        || run.childId !== lease.childId || typeof run.messageId !== 'string' || !run.messageId
-        || child.session?.header?.parentSession !== sessionId(lease.parent) || child.session?.header?.origin !== 'subagent'
-        || child.session?.header?.isSeeded !== false || child.session?.inheritedEventCount !== 0
-        || presetRegistry.composedPreset(child.ctx) !== WORKER_PRESET) {
-        completion = failure('owner-desktop.nonlocal-provider', '提供方没有返回可验证的独立本地子代理。', '启用支持独立预设和本地 startActivation 的 spawn 后重试。');
-        revoke(lease, completion, 'failed');
-        return;
+      const identity = { conversationKey: lease.task.conversationKey, ownerQQ: lease.task.ownerQQ, selfUserId: lease.task.selfUserId, sourceSessionId: lease.sourceSessionId };
+      const previous = conversationStore.find(identity);
+      if (lease.task.continuationRequested && !previous) {
+        completion = failure('owner-desktop.no-previous', '当前 QQ 对话没有可继续的电脑会话历史。', '请先由主人发送新的电脑任务，建立独立会话后再发送继续指令。'); return;
       }
-      lease.child = child;
-      lease.messageId = run.messageId;
-      remember(child);
-      lease.record = lease.candidates.get(child);
-      lease.boundary = armOwnerDesktopBoundary(child, exec => {
-        const issue = leaseIssue(lease, exec.agent, exec.signal);
-        if (issue && !lease.ended) revoke(lease, issue);
-        return issue ? denial(issue) : undefined;
+      lease.continuation = Boolean(previous); lease.childId = previous?.sessionId ?? newSessionId();
+      if (typeof lease.childId !== 'string' || !lease.childId || lease.childId === lease.sourceSessionId || agents.get(lease.childId)) {
+        completion = failure('owner-desktop.child-unavailable', '电脑会话仍在运行或会话身份无效。', '在独立电脑会话中确认停止后，从原 QQ 对话重试。'); return;
+      }
+      if (!previous) conversationStore.reserve({ ...identity, sessionId: lease.childId });
+      const verified = await validate(lease), changed = leaseIssue(lease);
+      if (!verified.ok || changed) { completion = changed ?? verified; return; }
+      if (lease.task.expiresAt !== null) { timeout = setTimer(() => revoke(lease, failure('owner-desktop.timeout', '电脑任务达到执行时限。', '确认桌面状态后重新发送指令。')), Math.max(1, lease.task.expiresAt - now())); timeout?.unref?.(); }
+      lease.phase = 'starting'; lease.dispatching = true; lease.dispatchAttempted = true; watch(); publish();
+      const prompt = [{ type: 'text', text: prepared.prompt }];
+      lease.dispatchTask = Promise.resolve().then(async () => {
+        try {
+          if (lease.continuation) return { childId: lease.childId, messageId: await lease.subagents.sendMessage(source, lease.childId, prompt, { signal: lease.controller.signal }) };
+          return await lease.subagents.startActivation({ provider: 'spawn', parent: source, childId: lease.childId,
+            agentPreset: PRESET, delivery: 'caller', name: 'surfcore-desktop-' + lease.childId.slice(0, 8),
+            description: 'SurfCore independent desktop conversation', prompt, agentOptions: lease.modelSelection, signal: lease.controller.signal, maxDepth: 1 });
+        } finally { lease.dispatchSettled = true; }
       });
-      if (!lease.record?.created || !lease.boundary) {
-        completion = failure('owner-desktop.native-presentation-unavailable', '隔离桌面预设未在首步之前建立原生执行边界。', '重载 owner-desktop 预设；不要放开 run_code 作为替代。');
-        revoke(lease, completion, 'failed');
-        return;
+      let receipt;
+      try { receipt = await Promise.race([lease.dispatchTask, lease.revokedEvent.promise.then(() => null)]); }
+      finally { lease.dispatching = false; }
+      if (lease.revoked) { completion = lease.revoked; return; }
+      if (receipt?.childId !== lease.childId || !receipt.messageId || !lease.agent || !lease.inserted || receipt.messageId !== lease.inserted.id) {
+        completion = failure('owner-desktop.message-unverified', '宿主回执与实际电脑消息不一致。', '重载兼容宿主后由主人重试。'); revoke(lease, completion, 'failed'); return;
       }
-      const changed = leaseIssue(lease);
-      if (changed) { completion = changed; revoke(lease, changed); return; }
-      lease.phase = 'running';
-      lease.published = true;
-      lease.ready.resolve();
-      publish();
-      const result = await run.result;
-      const finishedIssue = leaseIssue(lease);
-      if (finishedIssue && !lease.revoked) revoke(lease, finishedIssue);
-      lease.settled = true;
-      lease.ended = true;
-      lease.tickets.clear();
+      conversationStore.confirm(lease.childId);
+      lease.messageId = receipt.messageId;
+      const bound = await call('bind', { taskId, leaseId: lease.leaseId, preparedId: lease.preparedId, sessionId: lease.childId, messageId: lease.messageId });
+      if (!bound.ok) { completion = bound; revoke(lease, bound, 'failed'); return; }
+      lease.bound = true; Object.assign(lease.task, { sessionId: lease.childId, messageId: lease.messageId });
+      const boundChecked = await validate(lease), boundChanged = leaseIssue(lease);
+      if (!boundChecked.ok || boundChanged) { completion = boundChanged ?? boundChecked; revoke(lease, completion, 'failed'); return; }
+      lease.phase = 'running'; lease.binding.resolve(); publish();
+      await Promise.race([lease.finished.promise, lease.revokedEvent.promise]);
       if (lease.revoked) completion = { ...lease.revoked, status: lease.terminal };
-      else if (!lease.turnEnded || !lease.stepAccepted || !lease.record?.initial || lease.record.initial.id !== lease.messageId || lease.record.invalid) completion = failure('owner-desktop.turn-unverified', '无法确认桌面任务的初始消息与执行轮次。', '更新兼容的 DSH 生命周期接口后重试。');
-      else if (result?.stopReason !== 'completed') completion = { ...failure('owner-desktop.execution-failed', '桌面子代理没有正常完成任务。', '查看独立执行会话中的失败原因，确认桌面状态后重试。'), status: result?.stopReason === 'aborted' ? 'cancelled' : 'failed' };
-      else completion = { ok: true, status: 'done', output: outputText(result) };
-    } catch {
-      completion = lease.revoked ? { ...lease.revoked, status: lease.terminal }
-        : failure('owner-desktop.execution-failed', '桌面任务启动或执行失败。', '查看 DSH 子代理与 Computer Use 状态后重试。');
+      else if (lease.turnEnd?.reason?.kind !== 'completed' || !lease.stepAccepted) completion = failure('owner-desktop.execution-failed', '独立电脑轮次没有正常完成。', '查看电脑会话中的失败原因，确认桌面状态后重试。');
+      else completion = { ok: true, status: 'done', output: lease.output ?? '' };
+    } catch (error) {
+      completion = lease.revoked ?? failure(typeof error?.code === 'string' && error.code.startsWith('owner-desktop.') ? error.code : 'owner-desktop.execution-failed', '独立电脑会话启动或执行失败。', typeof error?.hint === 'string' ? error.hint : '检查电脑会话、原 QQ 的 Computer Use 与桥接状态后重试。');
+      revoke(lease, completion, 'failed');
     } finally {
-      if (timeout) clearTimer(timeout);
-      if (heartbeat) clearTimer(heartbeat);
-      lease.ready.resolve();
-      lease.ended = true;
-      lease.tickets.clear();
-      if (lease.turnSignal && lease.abortListener) lease.turnSignal.removeEventListener('abort', lease.abortListener);
-      try { if (run?.dispose) await run.dispose(); } catch {
-        completion = failure('owner-desktop.dispose-failed', '桌面子代理未能确认停止。', '关闭执行会话并重载插件，确认停止后再开启桌面任务。');
-        paused = true;
+      if (timeout) clearTimer(timeout); if (heartbeat) clearTimer(heartbeat);
+      if (!lease.ended && !lease.revoked) revoke(lease, completion ?? endedIssue(), 'failed');
+      close(lease); lease.binding.resolve();
+      // subagent/end and result settle even when host disposal fails. Neither is
+      // proof that tools stopped. Only the exact child loop's whenIdle completion
+      // proves execution drained; a failure before dispatch has nothing to drain.
+      let proofState = 'waiting';
+      const proof = observeStopped(lease).then(stopped => { proofState = stopped ? 'stopped' : 'unavailable'; return stopped; });
+      const executionStopped = await bounded(proof);
+      if (!executionStopped) {
+        paused = true; pendingStop = { lease, proofState, reporting: null }; completion = stopIssue();
       }
-      lease.boundary?.close();
+      if (lease.turnSignal && lease.abortListener) lease.turnSignal.removeEventListener('abort', lease.abortListener);
+      lease.ended = true;
       if (claimedTask) {
-        completion ??= lease.revoked ?? failure('owner-desktop.execution-failed', '桌面任务未完成。', '检查执行会话后重试。');
+        completion ??= lease.revoked ?? failure('owner-desktop.execution-failed', '电脑任务未完成。', '查看电脑会话后重试。');
         const terminal = completion.status ?? (completion.ok ? 'done' : 'failed');
-        const payload = { taskId, leaseId: lease.leaseId, status: terminal,
-          ...(lease.child ? { sessionId: sessionId(lease.child) } : {}),
+        const payload = { taskId, leaseId: lease.leaseId, status: terminal, executionStopped,
+          ...(lease.bound ? { sessionId: lease.childId } : {}),
           ...(completion.ok ? { output: completion.output ?? '' } : { code: completion.code, error: completion.error, hint: completion.hint }) };
         const finished = await call('complete', payload);
-        lastResult = { taskId, status: terminal, ...(lease.child ? { sessionId: sessionId(lease.child) } : {}) };
+        lastResult = { taskId, status: terminal, executionStopped, sourceSessionId: lease.sourceSessionId ?? null, desktopSessionId: lease.childId ?? null, sessionId: lease.childId ?? null };
         lastError = !finished.ok ? finished : completion.ok ? null : completion;
+        if (pendingStop?.lease === lease) {
+          const record = pendingStop; record.payload = { ...payload, executionStopped: true }; record.terminalError = lastError;
+          // Attach after the original terminal request: a late proof can only close
+          // that same lease, and must never race the initial executionStopped:false.
+          void proof.then(stopped => {
+            record.proofState = stopped ? 'stopped' : 'unavailable'; publish();
+            if (stopped) return reportStopped(record);
+          });
+        }
       }
-      active = null;
-      lease.done.resolve();
-      publish();
+      if (active === lease) active = null; lease.done.resolve(); publish();
     }
   }
   function schedule() {
     if (paused || disposed || pollTimer) return;
-    pollTimer = setTimer(() => { pollTimer = null; void tick(); }, POLL_MS);
-    pollTimer?.unref?.();
+    pollTimer = setTimer(() => { pollTimer = null; void tick(); }, POLL_MS); pollTimer?.unref?.();
   }
   async function tick() {
     if (paused || disposed) return status();
-    if (inFlight) {
-      const issue = active && leaseIssue(active);
-      if (issue) revoke(active, issue);
-      return status();
-    }
+    if (inFlight) { const issue = active && leaseIssue(active); if (issue) revoke(active, issue); return status(); }
     inFlight = (async () => {
-      const config = settings();
-      if (!config.enabled) return;
-      const pending = await call('pending');
-      if (!pending.ok) { lastError = pending; publish(); return; }
-      if (!Array.isArray(pending.tasks)) { lastError = failure('owner-desktop.invalid-pending', '桥接任务列表格式无效。', '重载兼容的 QQ 桥接后重试。'); publish(); return; }
+      if (pendingStop?.proofState === 'stopped') await reportStopped(pendingStop);
+      const config = settings(); if (!config.enabled && !pendingStop && !brokerBlocked) return;
+      const pending = await call('pending'); if (!pending.ok) { availabilityError = pending; publish(); return; }
+      if (!Array.isArray(pending.tasks)) { availabilityError = failure('owner-desktop.invalid-pending', '桥接任务列表无效。', '重载兼容桥接后重试。'); publish(); return; }
+      if (pending.blocked !== undefined) {
+        const blocked = pending.blocked;
+        brokerBlocked = blocked?.ok === false && ['code', 'error', 'hint'].every(key => typeof blocked[key] === 'string' && blocked[key])
+          ? failure(blocked.code, blocked.error, blocked.hint + ' ' + recoveryHint)
+          : failure('owner-desktop.invalid-pending', '桥接停止阻塞状态无效，无法确认旧执行已停止。', recoveryHint);
+        publish(); return;
+      }
+      brokerBlocked = null;
+      if (pendingStop) { publish(); return; }
+      if (!config.enabled) { publish(); return; }
+      const issue = hostIssue(config); if (issue) { availabilityError = issue; publish(); return; }
+      // A healthy poll repairs only availability, never an earlier task outcome.
+      if (availabilityError) { availabilityError = null; publish(); }
       const task = pending.tasks.find(item => typeof item?.id === 'string' && item.id);
       if (!paused && !disposed && task) await execute(task.id, config);
     })();
-    try { await inFlight; } catch {
-      lastError = failure('owner-desktop.runtime-failed', '桌面任务轮询失败。', '重载插件并检查任务状态。'); publish();
-    } finally { inFlight = null; schedule(); }
+    try { await inFlight; } catch { availabilityError = failure('owner-desktop.runtime-failed', '电脑任务轮询失败。', '重载插件并检查任务状态。'); publish(); }
+    finally { inFlight = null; schedule(); }
     return status();
   }
   async function cancelActive() {
-    if (active) {
-      const lease = active;
-      revoke(lease, failure('owner-desktop.cancelled', '主人桌面任务已取消。', '需要继续时请发送一条新的指令。'));
-      await lease.done.promise;
-    }
+    if (active) { const lease = active; revoke(lease, failure('owner-desktop.cancelled', '主人电脑任务已取消。', '需要继续时请由主人发送新指令。')); await lease.done.promise; }
     return status();
   }
   async function stop() {
-    paused = true;
-    if (pollTimer) clearTimer(pollTimer);
-    pollTimer = null;
-    await cancelActive();
-    if (inFlight) await inFlight;
-    publish();
-    return status();
+    paused = true; if (pollTimer) clearTimer(pollTimer); pollTimer = null;
+    await cancelActive(); if (inFlight) await inFlight; publish(); return status();
   }
-  function start() {
-    if (!disposed) { paused = false; lastError = null; schedule(); publish(); }
-    return status();
-  }
+  function start() { if (!disposed) { paused = false; schedule(); publish(); } return status(); }
   schedule();
   return { status, tick, stop, start, cancelActive, isManagedAgent: managed };
 }

@@ -2732,7 +2732,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
           `规则：窗口 ${Math.round((data.config.windowMs || 0) / 60000)} 分钟 · 冷却 ${Math.round((data.config.cooldownMs || 0) / 60000)} 分钟 · 不同鱼 ≥${data.config.maxFish} · 连续 ${data.config.maxConsecutiveFish} 条 · 单鱼 ${data.config.singleFishMaxConsecutive} 条`) : null);
     }
 
-    function OwnerDesktopCard({ toast, reload }) {
+    function OwnerDesktopCard({ toast, reload, openDesktopSession }) {
       const [data, setData] = React.useState(null);
       const [draft, setDraft] = React.useState(null);
       const [issue, setIssue] = React.useState('');
@@ -2751,7 +2751,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
         if (!draft) return;
         setSaving(true); setIssue('');
         try {
-          const result = await api('/owner-desktop', { method: 'POST', body: { enabled, parentSessionId: draft.parentSessionId, timeoutMs: draft.timeoutMs, expectedEpoch: draft.authorizationEpoch } });
+          const result = await api('/owner-desktop', { method: 'POST', body: { enabled, timeoutMs: draft.timeoutMs, expectedEpoch: draft.authorizationEpoch } });
           if (!result.ok) { setIssue(describe(result)); toast('✗ ' + describe(result)); return; }
           toast('✓ ' + result.note); await refresh(true); await reload?.();
         } catch (error) { setIssue(error.message); }
@@ -2759,31 +2759,39 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       };
       const runtimeIssue = describe(data?.runtime?.lastError);
       const brokerIssue = data?.broker?.ok === false ? describe(data.broker) : describe(data?.broker?.lastError);
-      const phaseNames = { disabled: '未启用', idle: '等待主人指令', paused: '已暂停', stopped: '已停止', claiming: '正在领取任务', starting: '正在创建独立任务', running: '正在执行' };
+      const phaseNames = { disabled: '未启用', idle: '等待主人指令', paused: '已暂停', stopped: '已停止', claiming: '正在领取任务', starting: '正在接入桌面会话', running: '正在执行', cancelling: '正在取消', stopping: '等待停止确认', blocked: '等待旧任务停止' };
       const phase = phaseNames[data?.runtime?.phase] || data?.runtime?.phase || '等待状态';
       const recentTasks = (data?.broker?.tasks || []).slice(-3).reverse();
+      const conversations = (data?.runtime?.conversations || []).filter((row) => row.phase === 'ready').slice(-5).reverse();
+      const openConversation = (row) => {
+        try { openDesktopSession(row); } catch (error) { setIssue(error.message || '打开桌面会话失败，请刷新重试。'); }
+      };
       return h('div', { className: 'qbw-card', style: { marginBottom: '10px' } },
         h('h4', null, '主人桌面授权'),
         h('p', null, '只有主人私聊，或主人在群中明确 @ 机器人，才能发起桌面任务。普通群友、引用和转发内容不能获得权限。'),
-        h('p', { className: 'qbw-hint' }, '授权管理会话需要由你开启 Computer Use；这里不会代替 Windows 插件的会话开关。任务结束、取消或授权变更后，旧任务权限立即失效。'),
+        h('p', { className: 'qbw-hint' }, '桌面操作保存在独立会话中，沿用来源 QQ 的人格与当前模型，后续任务继续使用同一份桌面历史。主 QQ 只接收简短进度和结果。请在来源 QQ 会话开启 Computer Use。'),
         issue ? h('p', { className: 'qbw-error', role: 'alert' }, issue) : null,
         runtimeIssue ? h('p', { className: 'qbw-error', role: 'alert' }, runtimeIssue) : null,
         brokerIssue ? h('p', { className: 'qbw-error', role: 'alert' }, brokerIssue) : null,
         data && !data.ownerConfigured ? h('p', { className: 'qbw-error' }, '请先在管理员卡片中设置唯一主人 QQ。') : null,
         recentTasks.map((task) => h('div', { key: task.id, className: 'qbw-hint' },
-          h('p', null, '最近任务：' + ({ pending: '等待执行', running: '执行中', done: '已完成', failed: '失败', cancelled: '已取消' }[task.status] || task.status)),
+          h('p', null, '最近任务：' + (task.phase === 'stopping' ? '等待停止确认' : ({ pending: '等待执行', running: '执行中', done: '已完成', failed: '失败', cancelled: '已取消' }[task.status] || task.status))),
           task.error ? h('p', { className: 'qbw-error', role: 'alert' }, describe(task)) : null,
-          task.notification?.ok === false ? h('p', { className: 'qbw-error', role: 'alert' }, describe(task.notification)) : null)),
+          task.messageId ? h('p', null, '指令和操作步骤已记录在独立桌面会话。') : null,
+          ['ackNotification', 'startNotification', 'progressNotification', 'terminalNotification'].map((field) => task[field]?.ok === false ? h('p', { key: field, className: 'qbw-error', role: 'alert' }, describe(task[field])) : null),
+          !task.ackNotification && !task.terminalNotification && task.notification?.ok === false ? h('p', { className: 'qbw-error', role: 'alert' }, describe(task.notification)) : null)),
+        conversations.length ? h('div', { className: 'qbw-hint' },
+          h('p', null, '桌面历史（打开只查看，不会执行任务）：'),
+          conversations.map((row) => h('div', { key: row.sessionId, className: 'qbw-actions' },
+            h('span', null, row.conversationKey.startsWith('private:') ? '主人私聊' : '群聊 ' + row.conversationKey.replace(/^group:/, '')),
+            h(Btn, { kind: 'qbw-btn2', disabled: saving || typeof openDesktopSession !== 'function', onClick: () => openConversation(row) }, '打开桌面会话'))))
+          : h('p', { className: 'qbw-hint' }, '收到新的主人桌面指令后，这里会显示可打开的桌面会话。'),
         draft ? h('div', null,
           h(Row, { label: '允许主人桌面任务' }, h('input', { type: 'checkbox', checked: draft.enabled, disabled: saving, onChange: (e) => setDraft({ ...draft, enabled: e.target.checked }) })),
-          h(Row, { label: '授权管理会话', hint: '选择已由你开启 Computer Use 的管理会话；QQ / B站聊天不能作为授权来源。' },
-            h('select', { className: 'qbw-select', value: draft.parentSessionId, disabled: saving, onChange: (e) => setDraft({ ...draft, parentSessionId: e.target.value }) },
-              h('option', { value: '' }, '请选择管理会话'),
-              draft.parentSessionId && !(data?.parents || []).some((row) => row.id === draft.parentSessionId) ? h('option', { value: draft.parentSessionId }, '之前的管理会话当前不可用') : null,
-              (data?.parents || []).map((row) => h('option', { key: row.id, value: row.id }, row.title)))),
+          h('p', { className: 'qbw-hint' }, '私聊直接发“电脑：打开B站”；群聊需要主人明确 @。后续在 QQ 发“继续电脑任务：…”可接续同一桌面会话；“取消电脑任务”会停止后续动作并说明最近任务状态。'),
           h(Row, { label: '单次任务时限' }, h('select', { className: 'qbw-select', value: draft.timeoutMs, disabled: saving, onChange: (e) => setDraft({ ...draft, timeoutMs: Number(e.target.value) }) }, [[60000,'1 分钟'],[180000,'3 分钟'],[300000,'5 分钟'],[600000,'10 分钟'],[1800000,'30 分钟'],[3600000,'1 小时'],[7200000,'2 小时'],[14400000,'4 小时'],[28800000,'8 小时'],[86400000,'24 小时'],[0,'不限时（完成或手动取消）']].map(([value,label]) => h('option', { key: value, value }, label)))),
           h('p', { className: 'qbw-hint' }, '不限时不设自动截止。任务完成、主人取消、关闭授权或连接中断仍会结束；授权入口可持续保持启用。修改时限会先取消当前任务。'),
-          h('p', { className: 'qbw-hint' }, '当前：' + (data?.settings?.enabled ? '已启用' : '未启用') + ' · ' + (data?.runtime?.activeTaskId ? '正在执行主人任务' : phase)),
+          h('p', { className: 'qbw-hint' }, '当前：' + (data?.settings?.enabled ? '已启用' : '未启用') + ' · ' + phase),
           h('div', { className: 'qbw-actions' },
             h(Btn, { disabled: saving, onClick: () => save() }, saving ? '保存中…' : '保存授权'),
             h(Btn, { kind: 'qbw-btn2', disabled: saving, onClick: () => save(false) }, '关闭并取消任务'),
@@ -3776,7 +3784,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       );
     }
 
-    function QQTab({ cfg, set, admin, setAdmin, unified, setUnified, overview, busy, setBusy, toast, reload, goTab, onSave, onAdminDiscardContext, dirty }) {
+    function QQTab({ cfg, set, admin, setAdmin, unified, setUnified, overview, busy, setBusy, toast, reload, goTab, onSave, onAdminDiscardContext, dirty, openDesktopSession }) {
       const [query, setQuery] = useState("");
       const tools = Object.keys(cfg?.socialV2?.tools ?? {});
       const groups = [...QQ_FIELDS];
@@ -3852,7 +3860,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         h(ModelSettingsCard, { busy, toast, reload }),
         h(CostCard, { toast, set }),
         h(AdminCard, { admin, onChange: setAdmin, qqPrivate: cfg?.allow?.private ?? [], qqAllowAll: cfg?.allowAllWhenEmpty === true, toast, onDiscardContext: onAdminDiscardContext, onSave: () => onSave?.(true), busy, canSave: dirty }),
-        h(OwnerDesktopCard, { toast, reload }),
+        h(OwnerDesktopCard, { toast, reload, openDesktopSession }),
         h(WhitelistCard, {
           allow: cfg?.allow ?? {},
           allowAll: cfg?.allowAllWhenEmpty === true,
@@ -7962,7 +7970,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
     ];
     const NAMES = { nav: "SurfCore" };
 
-    function QQBIliWhaleSection() {
+    function QQBIliWhaleSection({ openDesktopSession } = {}) {
       useStyleOnce();
       const [tab, setTab] = useState("overview");
       const [overview, setOverview] = useState(null);
@@ -8242,7 +8250,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         if (tab === "overview") return h(OverviewTab, { overview, reload, busy, setBusy, toast: notify, unified, setUnified: setUnifiedPath, goTab: setTab });
         if (tab === "characters") return h(CharactersTab, { overview, busy, setBusy, toast: notify, reload, goTab: setTab, unified, setUnified: setUnifiedPath });
         if (tab === "purpose") return h(PurposeTab, { qq, setQq: setQqPath, unified, setUnified: setUnifiedPath, overview, busy, setBusy, toast: notify, reload, goTab: setTab });
-        if (tab === "qq") return h(QQTab, { cfg: qq, set: setQqPath, admin: unified?.admin ?? {}, setAdmin, unified, setUnified: setUnifiedPath, overview, busy, setBusy, toast: notify, reload, goTab: setTab, onSave: save, onAdminDiscardContext: setAdminDiscardContext, dirty });
+        if (tab === "qq") return h(QQTab, { cfg: qq, set: setQqPath, admin: unified?.admin ?? {}, setAdmin, unified, setUnified: setUnifiedPath, overview, busy, setBusy, toast: notify, reload, goTab: setTab, onSave: save, onAdminDiscardContext: setAdminDiscardContext, dirty, openDesktopSession });
         if (tab === "bili") return h(BiliTab, { cfg: bili, set: setBiliPath, qq: normalizedQq, setQqPath, admin: unified?.admin ?? {}, setAdmin, unified, setUnified: setUnifiedPath, qqPrivate: normalizedQq?.allow?.private ?? [], qqAllowAll: normalizedQq?.allowAllWhenEmpty === true, overview, busy, setBusy, toast: notify, reload, onSave: save, onAdminDiscardContext: setAdminDiscardContext, dirty });
         if (tab === "tokens") return h(TokenTab, { budget, limits: limitDraft, onChange: setLimitDraft, disabled: !!busy, alertedToday: tokenAlerted, onSave: () => save(false), busy, toast: notify, set: setQqPath, setUnified: setUnifiedPath, qq: normalizedQq, unified });
         if (tab === "watch") return h(WatchTab, { busy, setBusy, toast: notify, goTab: setTab });
@@ -8353,16 +8361,23 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       );
     }
 
-    const inject = ["slots"];
+    const inject = ["slots", "uiWorkspace"];
     const NS = "surfcore";
 
     function apply(ctx) {
+      const uiWorkspace = ctx.get("uiWorkspace");
+      const openDesktopSession = (row) => {
+        if (row?.phase !== "ready" || typeof row.sourceSessionId !== "string" || !row.sourceSessionId || typeof row.sessionId !== "string" || !row.sessionId || row.sourceSessionId === row.sessionId) {
+          throw new Error("桌面会话尚未就绪，请刷新状态。");
+        }
+        uiWorkspace.openSession({ parentSessionId: row.sourceSessionId, childSessionId: row.sessionId, mode: "continuable" });
+      };
       ctx.effect(
         () =>
           ctx.slots.inject("settings.section", () =>
             ctx.slots.register(
               { name: "settings.section", id: NS, order: 7, label: () => NAMES.nav },
-              QQBIliWhaleSection,
+              () => h(QQBIliWhaleSection, { openDesktopSession }),
             ),
             "surfcore: settings section",
           ),

@@ -12,7 +12,7 @@ import path from 'node:path';
 
 const idle = () => {};
 const React = {
-  createElement: () => null,
+  createElement: (type, props, ...children) => ({ type, props, children }),
   useCallback: (fn) => fn,
   useEffect: idle,
   useMemo: (fn) => fn(),
@@ -32,6 +32,25 @@ globalThis.window = {
 
 await import('../lib/client.js');
 assert.ok(client, 'client.js 没有被 ModuleLoader 加载');
+
+// Opening saved desktop history uses its exact QQ/child address and never submits a message.
+{
+  assert.ok(client.inject.includes('uiWorkspace'));
+  const opened = []; let registered;
+  client.apply({
+    get(name) { assert.equal(name, 'uiWorkspace'); return { openSession: (address) => opened.push(address) }; },
+    effect(fn) { fn(); },
+    slots: { inject(name, fn) { assert.equal(name, 'settings.section'); fn(); }, register(_meta, component) { registered = component; } },
+  });
+  const section = registered();
+  assert.equal(section.type, client.QQBIliWhaleSection);
+  section.props.openDesktopSession({ phase: 'ready', sourceSessionId: 'actual-qq-source', sessionId: 'saved-desktop' });
+  assert.deepEqual(opened, [{ parentSessionId: 'actual-qq-source', childSessionId: 'saved-desktop', mode: 'continuable' }]);
+  for (const row of [null, { phase: 'reserved', sourceSessionId: 'actual-qq-source', sessionId: 'saved-desktop' }, { phase: 'ready', sourceSessionId: 'same', sessionId: 'same' }]) {
+    assert.throws(() => section.props.openDesktopSession(row), /尚未就绪/);
+  }
+  assert.equal(opened.length, 1);
+}
 assert.ok(Array.isArray(client.BILI_FIELDS), 'BILI_FIELDS 没有导出');
 assert.ok(Array.isArray(client.QQ_BILI_SHARE_FIELDS), 'QQ_BILI_SHARE_FIELDS 没有导出');
 

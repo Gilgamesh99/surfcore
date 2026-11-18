@@ -4,17 +4,19 @@ import { createOwnerDesktopBroker, handleOwnerDesktopRoute, ownerDesktopIntent }
 let passed = 0;
 async function test(name, run) { await run(); passed++; console.log('PASS', name); }
 const leaseId = 'lease-fixture-0000000001';
+const desktopSessionId = 'desktop-child-fixture';
 function fixture(options = {}) {
   let time = 1_800_000_000_000;
   let seq = 1;
   let ledger = options.ledger ?? [];
-  const settings = { enabled: true, parentSessionId: 'management-fixture', timeoutMs: 600_000, authorizationEpoch: 'auth-epoch-one' };
+  const settings = { enabled: true, timeoutMs: 600_000, authorizationEpoch: 'auth-epoch-one' };
   const runtime = { ownerQQ: '123', selfUserId: '999', mode: 'reserved2', epoch: 1, enabled: true,
-    allowed: true, blocked: false, paused: false, silent: false, connected: true, ready: true };
+    allowed: true, blocked: false, paused: false, silent: false, connected: true, ready: true, sessionId: 'original-qq-fixture' };
   const notices = [];
   const makeBroker = extra => createOwnerDesktopBroker({ getSettings: () => ({ ...settings }), getRuntime: () => ({ ...runtime }),
     now: () => time, startedAt: time, notify: async (key, text, authority) => { notices.push({ key, text, authority }); },
-    readLedger: () => ledger, writeLedger: next => { ledger = structuredClone(next); }, ...options, ...extra });
+    readLedger: () => ledger, writeLedger: next => { ledger = structuredClone(next); },
+    prepareSession: async task => ({ sourceSessionId: runtime.sessionId, prompt: 'persona fixture\n' + task.text }), ...options, ...extra });
   const broker = makeBroker();
   function input(kind = 'private', patch = {}) {
     return { source: 'onebot-live', kind, id: kind === 'private' ? '123' : '456', event: {
@@ -27,6 +29,14 @@ function fixture(options = {}) {
 const expectFailure = (result, code) => { assert.equal(result.ok, false); if (code) assert.equal(result.code, code); assert.ok(result.error); assert.ok(result.hint); };
 async function accepted(f, kind = 'private') {
   const result = await f.broker.ingest(f.input(kind)); assert.equal(result.ok, true); assert.equal(result.handled, true); return result.task.id;
+}
+
+async function bindTask(f, taskId, turnId = 1) {
+  const p = await f.broker.prepare({ taskId, leaseId }); assert.equal(p.ok, true, p.error);
+  const messageId = 'message-fixture-' + taskId;
+  assert.equal(f.broker.bind({ taskId, leaseId, preparedId: p.preparedId, sessionId: desktopSessionId, messageId }).ok, true);
+  assert.equal((await f.broker.started({ taskId, leaseId, messageId, turnId })).ok, true);
+  return p;
 }
 
 await test('only explicit commands and direct natural computer requests are captured', () => {
@@ -72,7 +82,7 @@ await test('explicit Windows-MCP requests preserve the owner text without treati
     '你使用Windows-MCP打开B站，这只是举例，不要执行',
   ]) assert.equal(ownerDesktopIntent(text), null, text);
 });
-await test('private and typed group @ create isolated tasks without exposing command outside claim', async () => {
+await test('private and typed group @ create source-bound tasks without exposing command outside claim', async () => {
   for (const kind of ['private', 'group']) {
     const f = fixture(); const id = await accepted(f, kind);
     for (const result of [f.broker.status(), f.broker.pending()]) {
@@ -81,6 +91,8 @@ await test('private and typed group @ create isolated tasks without exposing com
     }
     const claim = f.broker.claim({ taskId: id, leaseId });
     assert.equal(claim.task.text, '电脑：打开浏览器查看天气'); assert.equal(claim.task.ownerQQ, '123');
+    assert.equal(claim.task.continuationRequested, false);
+    assert.equal(f.broker.status().tasks[0].continuationRequested, false);
     assert.equal(claim.task.conversationKey, kind === 'private' ? 'private:123' : 'group:456');
     assert.equal(f.broker.validate({ taskId: id, leaseId }).ok, true);
     assert.ok(!JSON.stringify(f.broker.validate({ taskId: id, leaseId })).includes('打开浏览器'));
@@ -160,15 +172,16 @@ await test('concurrent commands claim complete and wrong lease are single-use', 
   expectFailure(f.broker.claim({ taskId: id, leaseId }), 'OWNER_DESKTOP_ALREADY_CLAIMED');
   expectFailure(f.broker.validate({ taskId: id, leaseId: 'wrong-lease-fixture-123' }), 'OWNER_DESKTOP_LEASE_MISMATCH');
   expectFailure(await f.broker.complete({ taskId: id, leaseId: 'wrong-lease-fixture-123', status: 'done' }), 'OWNER_DESKTOP_LEASE_MISMATCH');
+  await bindTask(f, id);
   const count = f.notices.length;
   const completions = await Promise.all([f.broker.complete({ taskId: id, leaseId, status: 'done', output: '已查看天气' }), f.broker.complete({ taskId: id, leaseId, status: 'done' })]);
-  assert.equal(completions.filter(r => r.ok).length, 1); assert.equal(f.notices.length, count + 1);
+  assert.equal(completions.filter(r => r.ok && !r.late).length, 1); assert.equal(completions.filter(r => r.late).length, 1); assert.equal(f.notices.length, count + 1);
   expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_FINISHED');
   assert.equal(f.notices.at(-1).key, 'private:123');
 });
 await test('every policy mutation cancels before a later tool; restoring values never restores lease', async () => {
   for (const timeoutMs of [600_000, 0]) for (const [target, patch] of [
-    ['settings', { enabled: false }], ['settings', { parentSessionId: 'different' }], ['settings', { authorizationEpoch: 'auth-epoch-two' }],
+    ['settings', { enabled: false }], ['settings', { authorizationEpoch: 'auth-epoch-two' }],
     ['runtime', { ownerQQ: '321' }], ['runtime', { selfUserId: '888' }], ['runtime', { mode: 'chat' }], ['runtime', { epoch: 2 }],
     ['runtime', { enabled: false }], ['runtime', { allowed: false }], ['runtime', { blocked: true }], ['runtime', { paused: true }],
     ['runtime', { silent: true }], ['runtime', { connected: false }], ['runtime', { ready: false }],
@@ -211,7 +224,7 @@ await test('configuration parse failure is visible and never falls through as a 
 await test('notice failure cannot cause task replay or fake a sent receipt', async () => {
   const f = fixture({ notify: async () => { throw new Error('transport down'); } }); const id = await accepted(f);
   assert.equal(f.broker.status().tasks[0].notification.code, 'OWNER_DESKTOP_NOTICE_FAILED');
-  f.broker.claim({ taskId: id, leaseId }); const done = await f.broker.complete({ taskId: id, leaseId, status: 'done' });
+  f.broker.claim({ taskId: id, leaseId }); await bindTask(f, id); const done = await f.broker.complete({ taskId: id, leaseId, status: 'done' });
   assert.equal(done.task.status, 'done'); assert.equal(done.task.notification.ok, false);
 });
 await test('route accepts only existing-task actions and rejects all model markers', async () => {
@@ -226,6 +239,7 @@ await test('route accepts only existing-task actions and rejects all model marke
   }
   for (const action of ['create', 'mint', 'ingest']) { const r = await route(action, 'POST', { text: '电脑：打开浏览器' }); assert.equal(r.status, 404); expectFailure(r.data); }
   const injected = await route('claim', 'POST', { taskId: id, leaseId, text: 'forged', ownerQQ: '321' }); assert.equal(injected.status, 400);
+  assert.equal((await route('claim', 'POST', { taskId: id, leaseId, continuationRequested: true })).status, 400);
   for (const malformed of [[leaseId], {}, 123, null]) {
     const rejected = await route('claim', 'POST', { taskId: id, leaseId: malformed });
     assert.equal(rejected.status, 400); expectFailure(rejected.data, 'OWNER_DESKTOP_BAD_REQUEST');
@@ -233,7 +247,18 @@ await test('route accepts only existing-task actions and rejects all model marke
   const claim = await route('claim', 'POST', { taskId: id, leaseId }); assert.equal(claim.status, 200);
   assert.equal((await route('validate', 'POST', { taskId: id, leaseId })).status, 200);
   assert.equal((await route('complete', 'POST', { taskId: id, leaseId, status: 'done', conversationKey: 'group:789' })).status, 400);
-  assert.equal((await route('complete', 'POST', { taskId: id, leaseId, status: 'done' })).status, 200);
+  const prepared = await route('prepare', 'POST', { taskId: id, leaseId }); assert.equal(prepared.status, 200);
+  for (const extra of [{ sessionId: 'foreign' }, { sourceSessionId: 'foreign' }, { prompt: 'forged' }, { text: 'forged' }]) {
+    assert.equal((await route('prepare', 'POST', { taskId: id, leaseId, ...extra })).status, 400);
+  }
+  const messageId = 'fixture-bound-message-123';
+  assert.equal((await route('bind', 'POST', { taskId: id, leaseId, preparedId: prepared.data.preparedId, sessionId: desktopSessionId, messageId })).status, 200);
+  assert.equal((await route('started', 'POST', { taskId: id, leaseId, messageId, turnId: 1 })).status, 200);
+  assert.equal((await route('bind', 'POST', { taskId: id, leaseId, preparedId: prepared.data.preparedId, sessionId: desktopSessionId, messageId, sourceSessionId: 'forged' })).status, 400);
+  assert.equal((await route('progress', 'POST', { taskId: id, leaseId, summary: 'fixture', conversationKey: 'group:789' })).status, 400);
+  assert.equal((await route('progress', 'POST', { taskId: id, leaseId, summary: 'fixture' }, { 'x-agent-call': '1' })).status, 403);
+  assert.equal((await route('progress', 'POST', { taskId: id, leaseId, summary: 'fixture progress' })).status, 200);
+  assert.equal((await route('complete', 'POST', { taskId: id, leaseId, status: 'done', executionStopped: true })).status, 200);
   assert.equal((await route('claim', 'POST', { taskId: id, leaseId })).status, 409);
   assert.equal((await route('status', 'GET')).status, 200);
 });
@@ -253,10 +278,11 @@ await test('finite execution starts at claim and lasts the full configured durat
 await test('unlimited execution uses explicit JSON null and remains cancellable after a day', async () => {
   const f = fixture(); f.settings.timeoutMs = 0; const id = await accepted(f);
   const claimed = f.broker.claim({ taskId: id, leaseId }).task;
+  await bindTask(f, id);
   assert.equal(claimed.expiresAt, null); assert.equal(claimed.timeoutMs, 0);
   assert.equal(JSON.parse(JSON.stringify(claimed)).expiresAt, null);
   f.advance(86_400_001); assert.equal(f.broker.validate({ taskId: id, leaseId }).ok, true);
-  expectFailure(await f.broker.ingest(f.input()), 'OWNER_DESKTOP_BUSY');
+  expectFailure(await f.broker.ingest(f.input('group')), 'OWNER_DESKTOP_BUSY');
   const cancel = f.input(); cancel.event.message[0].data.text = '取消电脑任务';
   assert.equal((await f.broker.ingest(cancel)).ok, true);
   expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_FINISHED');
@@ -287,4 +313,166 @@ await test('invalid raw settings cannot be coerced into unlimited; absence retai
   const task = f.broker.claim({ taskId: id, leaseId }).task;
   assert.equal(task.timeoutMs, 600_000); assert.equal(task.expiresAt - task.claimedAt, 600_000);
 });
+
+await test('prepare derives the source while bind fixes a distinct host desktop session once', async () => {
+  let preparations = 0;
+  const f = fixture({ prepareSession: async task => { preparations++; return { sourceSessionId: 'original-qq-fixture', prompt: 'persona fixture\n' + task.text }; } });
+  const id = await accepted(f); f.broker.claim({ taskId: id, leaseId });
+  expectFailure(await f.broker.complete({ taskId: id, leaseId, status: 'done' }), 'OWNER_DESKTOP_NOT_BOUND');
+  const [p, p2] = await Promise.all([f.broker.prepare({ taskId: id, leaseId }), f.broker.prepare({ taskId: id, leaseId })]);
+  assert.equal(preparations, 1); assert.equal(p.preparedId, p2.preparedId); assert.equal(p.sourceSessionId, f.runtime.sessionId); assert.equal(p.sessionId, undefined);
+  assert.match(p.prompt, /persona fixture/); assert.match(p.prompt, /打开浏览器/);
+  expectFailure(f.broker.bind({ taskId: id, leaseId, preparedId: 'forged', messageId: 'host-message-fixture-1' }), 'OWNER_DESKTOP_PREPARE_MISMATCH');
+  for (const sessionId of [undefined, '', f.runtime.sessionId, 'bad/path', {}]) expectFailure(f.broker.bind({ taskId: id, leaseId, preparedId: p.preparedId, sessionId, messageId: 'host-message-fixture-1' }), 'OWNER_DESKTOP_BAD_REQUEST');
+  assert.equal(f.broker.bind({ taskId: id, leaseId, preparedId: p.preparedId, sessionId: desktopSessionId, messageId: 'host-message-fixture-1' }).ok, true);
+  expectFailure(f.broker.bind({ taskId: id, leaseId, preparedId: p.preparedId, sessionId: 'another-child', messageId: 'host-message-fixture-1' }), 'OWNER_DESKTOP_ALREADY_BOUND');
+  assert.equal(f.broker.bind({ taskId: id, leaseId, preparedId: p.preparedId, sessionId: desktopSessionId, messageId: 'host-message-fixture-1' }).ok, true);
+  expectFailure(f.broker.bind({ taskId: id, leaseId, preparedId: p.preparedId, sessionId: desktopSessionId, messageId: 'host-message-fixture-2' }), 'OWNER_DESKTOP_ALREADY_BOUND');
+  expectFailure(await f.broker.started({ taskId: id, leaseId, messageId: 'host-message-fixture-2', turnId: 7 }), 'OWNER_DESKTOP_MESSAGE_MISMATCH');
+  assert.equal((await f.broker.started({ taskId: id, leaseId, messageId: 'host-message-fixture-1', turnId: 7 })).ok, true);
+  expectFailure(await f.broker.started({ taskId: id, leaseId, messageId: 'host-message-fixture-1', turnId: 8 }), 'OWNER_DESKTOP_TURN_MISMATCH');
+  assert.equal(f.broker.ownsTurn(desktopSessionId, 7), true); assert.equal(f.broker.ownsTurn(desktopSessionId, 8), false);
+  assert.equal(f.broker.ownsTurn('foreign-session', 7), false);
+  assert.ok(!JSON.stringify(f.broker.validate({ taskId: id, leaseId })).includes('打开浏览器'));
+  f.runtime.sessionId = 'replacement-qq'; expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_SESSION_CHANGED');
+});
+await test('cancel during asynchronous prepare cannot return a usable prompt or rebind', async () => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const f = fixture({ prepareSession: async () => { await gate; return { sourceSessionId: 'original-qq-fixture', prompt: 'desktop command' }; } });
+  const id = await accepted(f); f.broker.claim({ taskId: id, leaseId });
+  const preparing = f.broker.prepare({ taskId: id, leaseId }); f.broker.cancel({ taskId: id }); release();
+  expectFailure(await preparing, 'OWNER_DESKTOP_FINISHED');
+  assert.equal(f.broker.status().tasks[0].sourceSessionId, undefined); assert.equal(f.broker.status().tasks[0].phase, 'finished');
+});
+await test('prepare failure has a terminal receipt and actionable error', async () => {
+  const f = fixture({ prepareSession: async () => { throw new Error('fixture unavailable'); } });
+  const id = await accepted(f); f.broker.claim({ taskId: id, leaseId });
+  expectFailure(await f.broker.prepare({ taskId: id, leaseId }), 'OWNER_DESKTOP_PREPARE_FAILED');
+  const task = f.broker.status().tasks[0]; assert.equal(task.status, 'failed'); assert.equal(task.terminalNotification.ok, true);
+});
+await test('new live command and explicit continue require shutdown before reusing the desktop session', async () => {
+  const f = fixture(); const first = await accepted(f); f.broker.claim({ taskId: first, leaseId }); await bindTask(f, first);
+  const second = await accepted(f); assert.notEqual(second, first);
+  expectFailure(f.broker.validate({ taskId: first, leaseId }), 'OWNER_DESKTOP_FINISHED');
+  assert.equal(f.broker.status().tasks.find(t => t.id === first).code, 'OWNER_DESKTOP_REPLACED');
+  expectFailure(f.broker.claim({ taskId: second, leaseId }), 'OWNER_DESKTOP_PREVIOUS_STOPPING');
+  assert.equal(f.broker.pending().tasks.length, 0);
+  expectFailure(f.broker.pending().blocked, 'OWNER_DESKTOP_PREVIOUS_STOPPING');
+  const stopped = await f.broker.complete({ taskId: first, leaseId, status: 'cancelled', executionStopped: true, sessionId: desktopSessionId });
+  assert.equal(stopped.late, true); assert.equal(f.broker.pending().tasks[0].id, second);
+  assert.equal(f.broker.claim({ taskId: second, leaseId }).ok, true);
+  const p = await bindTask(f, second, 2); assert.equal(p.sourceSessionId, 'original-qq-fixture');
+  assert.equal(f.broker.validate({ taskId: second, leaseId }).task.sessionId, desktopSessionId);
+  const next = f.input(); next.event.message[0].data.text = '继续电脑任务，看看刚才的页面';
+  const result = await f.broker.ingest(next); assert.equal(result.ok, true); assert.equal(result.task.previousTaskId, second);
+  expectFailure(f.broker.validate({ taskId: second, leaseId }), 'OWNER_DESKTOP_FINISHED');
+  await f.broker.complete({ taskId: second, leaseId, status: 'cancelled', executionStopped: true, sessionId: desktopSessionId });
+  assert.equal(f.broker.claim({ taskId: result.task.id, leaseId }).task.text, '继续电脑任务，看看刚才的页面');
+  const g = fixture(); const missing = g.input(); missing.event.message[0].data.text = '继续电脑任务';
+  const uncorrelated = await g.broker.ingest(missing);
+  assert.equal(uncorrelated.ok, true); assert.equal(uncorrelated.task.continuationRequested, true); assert.equal(uncorrelated.task.previousTaskId, undefined);
+  assert.equal(g.broker.claim({ taskId: uncorrelated.task.id, leaseId }).task.continuationRequested, true);
+});
+await test('offline revoke has one visible terminal; late completion only proves shutdown', async () => {
+  const f = fixture(); const id = await accepted(f); f.broker.claim({ taskId: id, leaseId }); await bindTask(f, id);
+  f.runtime.ready = false; expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_OFFLINE');
+  await Promise.resolve(); const count = f.notices.length;
+  assert.equal(f.broker.status().tasks[0].terminalNotification.ok, true);
+  assert.equal(f.broker.status().tasks[0].phase, 'stopping');
+  f.runtime.ready = true; expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_FINISHED');
+  const unproven = await f.broker.complete({ taskId: id, leaseId, status: 'done', output: 'late result' });
+  assert.equal(unproven.late, true); assert.equal(unproven.task.status, 'cancelled'); assert.equal(unproven.task.phase, 'stopping');
+  expectFailure(await f.broker.complete({ taskId: id, leaseId, status: 'done', executionStopped: true, sessionId: 'foreign' }), 'OWNER_DESKTOP_SESSION_CHANGED');
+  const closed = await f.broker.complete({ taskId: id, leaseId, status: 'done', executionStopped: true });
+  assert.equal(closed.task.status, 'cancelled'); assert.equal(closed.task.code, 'OWNER_DESKTOP_OFFLINE'); assert.equal(closed.task.phase, 'finished');
+  assert.equal(f.broker.status().tasks[0].phase, 'finished'); assert.equal(f.notices.length, count);
+  const cancel = f.input(); cancel.event.message[0].data.text = '取消电脑任务'; await f.broker.ingest(cancel);
+  assert.match(f.notices.at(-1).text, /最近的电脑任务状态：已取消/); assert.match(f.notices.at(-1).text, /连接不可用/);
+});
+
+await test('start is idempotent and progress is bounded, deduplicated and source-routed', async () => {
+  const f = fixture(); const id = await accepted(f); f.broker.claim({ taskId: id, leaseId });
+  expectFailure(await f.broker.progress({ taskId: id, leaseId, summary: 'not started' }), 'OWNER_DESKTOP_NOT_STARTED');
+  const p = await bindTask(f, id, 27); const messageId = 'message-fixture-' + id;
+  const count = f.notices.length;
+  const again = await f.broker.started({ taskId: id, leaseId, messageId, turnId: 27 });
+  assert.equal(again.task.startNotification.ok, true); assert.equal(f.notices.length, count);
+  assert.match(f.notices.at(-1).text, /desktop-child-fixture/);
+  assert.equal(f.broker.bind({ taskId: id, leaseId, preparedId: p.preparedId, sessionId: desktopSessionId, messageId }).task.phase, 'executing');
+  for (const summary of ['', '  ', 'x'.repeat(501), {}, 1, null]) expectFailure(await f.broker.progress({ taskId: id, leaseId, summary }), 'OWNER_DESKTOP_BAD_REQUEST');
+  expectFailure(await f.broker.progress({ taskId: id, leaseId: 'wrong-lease-fixture-123', summary: 'wrong lease' }), 'OWNER_DESKTOP_LEASE_MISMATCH');
+  const first = await f.broker.progress({ taskId: id, leaseId, summary: '已打开浏览器' });
+  assert.equal(first.task.progressNotification.ok, true); assert.equal(f.notices.length, count + 1);
+  assert.equal(f.notices.at(-1).key, 'private:123'); assert.equal(f.notices.at(-1).authority.isCurrent(), true);
+  assert.equal((await f.broker.progress({ taskId: id, leaseId, summary: '已打开浏览器' })).skipped, true);
+  assert.equal((await f.broker.progress({ taskId: id, leaseId, summary: '正在查看页面' })).skipped, true);
+  f.advance(5000); assert.equal((await f.broker.progress({ taskId: id, leaseId, summary: '正在查看页面' })).ok, true);
+  assert.equal(f.notices.length, count + 2);
+  const progressAuthority = f.notices.at(-1).authority;
+  f.broker.cancel({ taskId: id }); assert.equal(progressAuthority.isCurrent(), false);
+  expectFailure(await f.broker.progress({ taskId: id, leaseId, summary: 'cancelled progress' }), 'OWNER_DESKTOP_FINISHED');
+});
+await test('progress send failure is visible without changing task execution status', async () => {
+  const f = fixture({ notify: async (key, text) => { if (text.startsWith('电脑任务进度：')) throw new Error('fixture send failure'); } });
+  const id = await accepted(f); f.broker.claim({ taskId: id, leaseId }); await bindTask(f, id);
+  const progress = await f.broker.progress({ taskId: id, leaseId, summary: '已打开浏览器' });
+  expectFailure(progress, 'OWNER_DESKTOP_NOTICE_FAILED');
+  assert.equal(progress.task.status, 'running'); assert.equal(progress.task.phase, 'executing');
+  assert.equal(f.broker.validate({ taskId: id, leaseId }).ok, true);
+});
+
+await test('unknown dispatch without a binding blocks future claims until explicit shutdown proof', async () => {
+  const f = fixture(); const first = await accepted(f); f.broker.claim({ taskId: first, leaseId });
+  const failed = await f.broker.complete({ taskId: first, leaseId, status: 'failed', executionStopped: false });
+  assert.equal(failed.task.phase, 'stopping'); assert.equal(failed.task.executionStopped, false); assert.equal(failed.task.settledAt, undefined);
+  const second = await accepted(f);
+  assert.equal(f.broker.pending().tasks.length, 0);
+  expectFailure(f.broker.claim({ taskId: second, leaseId }), 'OWNER_DESKTOP_PREVIOUS_STOPPING');
+  const omitted = await f.broker.complete({ taskId: first, leaseId, status: 'failed' });
+  assert.equal(omitted.task.phase, 'stopping'); assert.equal(omitted.task.settledAt, undefined);
+  await f.broker.complete({ taskId: first, leaseId, status: 'failed', executionStopped: true });
+  assert.equal(f.broker.pending().tasks[0].id, second); assert.equal(f.broker.claim({ taskId: second, leaseId }).ok, true);
+});
+await test('late unknown-dispatch acknowledgement prevents a newer claimed task binding', async () => {
+  const f = fixture(); const first = await accepted(f); f.broker.claim({ taskId: first, leaseId });
+  const second = await accepted(f); assert.equal(f.broker.claim({ taskId: second, leaseId }).ok, true);
+  const p = await f.broker.prepare({ taskId: second, leaseId });
+  const late = await f.broker.complete({ taskId: first, leaseId, status: 'failed', executionStopped: false });
+  assert.equal(late.task.phase, 'stopping'); assert.equal(late.task.status, 'cancelled');
+  expectFailure(f.broker.bind({ taskId: second, leaseId, preparedId: p.preparedId, sessionId: desktopSessionId, messageId: 'fixture-new-bound-message' }), 'OWNER_DESKTOP_PREVIOUS_STOPPING');
+  await f.broker.complete({ taskId: first, leaseId, status: 'failed', executionStopped: true });
+  assert.equal(f.broker.bind({ taskId: second, leaseId, preparedId: p.preparedId, sessionId: desktopSessionId, messageId: 'fixture-new-bound-message' }).ok, true);
+});
+
+await test('broker restart accepts a fresh source-bound continuation without reviving old leases', async () => {
+  for (const kind of ['private', 'group']) {
+    const f = fixture(); const original = f.input(kind);
+    const first = await f.broker.ingest(original); f.broker.claim({ taskId: first.task.id, leaseId }); await bindTask(f, first.task.id);
+    await f.broker.complete({ taskId: first.task.id, leaseId, status: 'done', executionStopped: true, sessionId: desktopSessionId });
+    f.advance(1000); const restarted = f.makeBroker();
+    assert.equal(restarted.status().tasks.length, 0);
+    expectFailure(restarted.validate({ taskId: first.task.id, leaseId }), 'OWNER_DESKTOP_NOT_FOUND');
+    const fresh = f.input(kind); fresh.event.message.at(-1).data.text = '继续电脑任务：查看刚才的页面';
+    expectFailure(await restarted.ingest({ ...original, event: { ...original.event, time: fresh.event.time } }), 'OWNER_DESKTOP_REPLAY');
+    assert.equal((await restarted.ingest({ ...fresh, source: 'history' })).handled, false);
+    const forged = structuredClone(fresh); forged.event.user_id = 321; forged.event.sender.user_id = '321';
+    assert.equal((await restarted.ingest(forged)).handled, false);
+    if (kind === 'group') {
+      const noAt = structuredClone(fresh); noAt.event.message = noAt.event.message.filter(segment => segment.type !== 'at');
+      assert.equal((await restarted.ingest(noAt)).handled, false);
+    }
+    const accepted = await restarted.ingest(fresh); assert.equal(accepted.ok, true); assert.equal(accepted.handled, true);
+    assert.equal(accepted.task.continuationRequested, true); assert.equal(accepted.task.previousTaskId, undefined);
+    assert.notEqual(accepted.task.id, first.task.id); assert.equal(restarted.pending().tasks[0].continuationRequested, true);
+    const nextLease = 'fresh-continuation-lease-0001';
+    const claim = restarted.claim({ taskId: accepted.task.id, leaseId: nextLease });
+    assert.equal(claim.task.continuationRequested, true); assert.equal(claim.task.text, fresh.event.message.at(-1).data.text);
+    expectFailure(restarted.validate({ taskId: accepted.task.id, leaseId }), 'OWNER_DESKTOP_LEASE_MISMATCH');
+    const prepared = await restarted.prepare({ taskId: accepted.task.id, leaseId: nextLease });
+    assert.equal(prepared.ok, true); assert.equal(prepared.sourceSessionId, f.runtime.sessionId); assert.equal(prepared.task.continuationRequested, true);
+    assert.equal(restarted.validate({ taskId: accepted.task.id, leaseId: nextLease }).task.continuationRequested, true);
+    assert.equal(restarted.status().tasks[0].continuationRequested, true);
+  }
+});
+
 console.log('Owner desktop broker: ' + passed + ' tests passed (pure fixtures; no network).');

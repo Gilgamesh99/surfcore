@@ -21,7 +21,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const bridge = fs.readFileSync(path.join(root, 'src/bridge.js'), 'utf8');
 
 // ① 唤醒侧接线：两个入口都必须注入人格卡，不能再退回「只给指针」。
-assert.match(bridge, /function personaWakeBlockV2\(key\) \{/, '缺少 personaWakeBlockV2（唤醒侧随身身份证）');
+assert.match(bridge, /function personaWakeBlockV2\(key, includeToolHint = true\) \{/, '缺少 personaWakeBlockV2（唤醒侧随身身份证）');
 assert.match(
   bridge,
   /roleHintForMode\('v2', key, '', \{ personaOnly: true \}\)/,
@@ -29,7 +29,7 @@ assert.match(
 );
 assert.match(
   bridge,
-  /function buildWakePromptV2\(key, reason[^)]*\) \{\s*const roleState = readRoleState\(\);\s*const roleLine = personaWakeBlockV2\(key\);/,
+  /function buildWakePromptV2\(key, reason[^)]*\) \{\s*const roleState = readRoleState\(\);\s*const roleLine = personaWakeBlockV2\(key, reason !== 'ownerDesktop'\);/,
   '唤醒提示词没有注入人格卡（又退回只给指针？）',
 );
 assert.match(
@@ -37,7 +37,7 @@ assert.match(
   /function buildWakeReminderPromptV2\(key\) \{\s*const roleLine = personaWakeBlockV2\(key\);/,
   '「你还没完成回合收尾」提醒没有注入人格卡',
 );
-const injectionPoints = (bridge.match(/personaWakeBlockV2\(key\)/g) || []).length;
+const injectionPoints = (bridge.match(/personaWakeBlockV2\(key(?:, reason !== 'ownerDesktop')?\)/g) || []).length;
 assert.ok(injectionPoints >= 2, `人格卡注入点数量异常：${injectionPoints}`);
 
 // ② personaOnly 短路：只出人格卡正文，避免管理员规则/B站简报/记忆卡在一张纸上出现两次。

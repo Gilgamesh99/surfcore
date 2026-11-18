@@ -12,7 +12,9 @@ test('桥接：读 mode / 检索块 / 只在 vector 模式注入，不写向量�
   const bridge = read('src/bridge.js');
   assert.match(bridge, /import\s*\{[\s\S]*?embedTexts[\s\S]*?\}\s*from '\.\/vector-memory\.js'/);
   assert.match(bridge, /function memoryMode\(\)/);
-  assert.match(bridge, /async function vectorRecallBlockForWake\(key\)/);
+  assert.match(bridge, /async function vectorRecallBlockForWake\(key, queryText\)/);
+  assert.match(bridge, /await vectorRecallBlockForWake\(key, task\.text\)/);
+  assert.ok(bridge.includes("const query = String(queryText ?? (lastMessage?.text || lastMessage?.plain || '')).trim().slice(0, 300);"));
   assert.match(bridge, /const memoryCardText = memoryMode\(\) === 'vector' \? String\(vectorBlock \|\| ''\)\.trim\(\) : memoryCardPromptBlock\(key\);/);
   assert.match(bridge, /await vectorRecallBlockForWake\(key\)/);
   assert.match(bridge, /function vectorEntryVisibleForKey\(key, entry\)/);

@@ -66,11 +66,12 @@ import { PlatformRegistry } from './platforms.js';
 import { ExtensionHost } from './extensions.js';
 import { isLoopbackReq, json, readBody, sameOrigin } from './http-guard.js';
 import { startScheduler } from './scheduler.js';
-import { readOwnerDesktopSettings, desktopConfigError } from '../../../src/owner-desktop-options.js';
+import { readOwnerDesktopSettings, desktopConfigError } from '../../../src/owner-desktop-conversation-options.js';
 import { createOwnerDesktopPolicy } from './owner-desktop-policy.js';
 import { installOwnerDesktopRuntime } from './owner-desktop-runtime.js';
-import { installOwnerDesktopPreset } from './owner-desktop-preset.js';
 import { createOwnerDesktopSettings } from './owner-desktop-settings.js';
+import { installOwnerDesktopConversationPreset } from './owner-desktop-conversation-preset.js';
+import { createOwnerDesktopConversationStore } from './owner-desktop-conversation-store.js';
 import { createTokenBudgetService } from './token-budget.js';
 import { scanPluginCompatibility } from './compat.js';
 import { createGateEventStore } from '../../../src/gate-events.js';
@@ -253,12 +254,13 @@ export function apply(ctx) {
   });
 
   const ownerDesktopPolicy = createOwnerDesktopPolicy({ ledgerFile: path.join(STATE_DIR, 'owner-desktop-sessions.json'), qqStateDir: QQ_STATE_DIR(), biliWorkspace: biliWorkspacePath(DSH_HOME), agents: ctx.agents });
-  const ownerDesktopPreset = installOwnerDesktopPreset(ctx);
+  const ownerDesktopPreset = installOwnerDesktopConversationPreset(ctx);
+  const ownerDesktopConversations = createOwnerDesktopConversationStore({ file: path.join(STATE_DIR, 'owner-desktop-conversations.json') });
   const ownerDesktopRuntime = installOwnerDesktopRuntime(ctx, {
-    getPresetStatus: ownerDesktopPreset.status,
     getSettings: () => readOwnerDesktopSettings(UNIFIED_FILE), getOwnerQQ: () => readQqConfig().config?.ownerQQ || '',
     bridge: callBridge, isManagedAgent: ownerDesktopPolicy.isManagedAgent,
-    registerWorkerSession: ownerDesktopPolicy.registerWorkerSession, isWorkerSession: ownerDesktopPolicy.isWorkerSession,
+    isWorkerSession: ownerDesktopPolicy.isWorkerSession,
+    conversationStore: ownerDesktopConversations, getPresetStatus: ownerDesktopPreset.status,
   });
   const ownerDesktopSettings = createOwnerDesktopSettings({
     runtime: ownerDesktopRuntime, policy: ownerDesktopPolicy, bridge: callBridge,

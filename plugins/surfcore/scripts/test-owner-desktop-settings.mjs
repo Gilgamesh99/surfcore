@@ -21,8 +21,13 @@ test('off then on generates different epochs so an old lease cannot revive',asyn
 test('stale UI and unknown fields fail without cancelling or saving',async()=>{
  const f=fixture();for(const body of [{enabled:true,expectedEpoch:'stale'},{enabled:true,expectedEpoch:'old',grantWindows:true}]){const r=await f.controller.configure(body);assert.equal(r.ok,false);assert.ok(r.code&&r.hint);}assert.equal(f.events.length,0);
 });
-test('nonmanagement parent and absent owner cannot enable desktop use',async()=>{
- for(const overrides of [{policy:{parentSessions:()=>[]}},{getOwnerQQ:()=>''}]){const f=fixture(overrides);const r=await f.controller.configure({enabled:true,expectedEpoch:'old'});assert.equal(r.ok,false);assert.ok(r.hint);assert.equal(f.events.length,0);}
+test('desktop conversation mode needs an owner but no management parent',async()=>{
+ const noOwner=fixture({getOwnerQQ:()=>''});const denied=await noOwner.controller.configure({enabled:true,expectedEpoch:'old'});
+ assert.equal(denied.ok,false);assert.equal(denied.code,'owner-desktop.owner-missing');assert.ok(denied.hint);assert.equal(noOwner.events.length,0);
+ const f=fixture({policy:{parentSessions:()=>{throw new Error('management parent must not be consulted');}}});
+ const result=await f.controller.configure({enabled:true,parentSessionId:'',expectedEpoch:'old'});
+ assert.equal(result.ok,true);assert.equal(result.settings.parentSessionId,'');assert.match(result.note,/独立桌面会话/);assert.match(result.note,/来源 QQ/);
+ const status=await f.controller.status();assert.equal(status.executionMode,'desktop-conversation');assert.equal(status.parents,undefined);
 });
 test('bridge cancellation failure blocks enable and keeps the runtime stopped',async()=>{
  const f=fixture({bridge:async()=>({ok:false,data:{ok:false}})});const r=await f.controller.configure({enabled:true,expectedEpoch:'old'});assert.equal(r.code,'owner-desktop.cancel-unconfirmed');assert.deepEqual(f.events,['stop']);assert.equal(f.getSettings().enabled,false);
@@ -57,7 +62,7 @@ test('reloaded settings and runtime work while the host retains the old config m
   const cachedPath=path.join(root,'src/owner-desktop-config.js');
   fs.writeFileSync(cachedPath,"export function normalizeOwnerDesktopSettings(){throw new Error('stale configuration used');} export function desktopConfigError(code,message,hint){return Object.assign(new Error(message),{code,hint});}\n");
   const cachedUrl=pathToFileURL(cachedPath).href;const cached=await import(cachedUrl);
-  const files=['src/owner-desktop-config.js','src/owner-desktop-options.js','plugins/surfcore/lib/owner-desktop-settings.js','plugins/surfcore/lib/owner-desktop-runtime.js','dsh/agent-presets/owner-desktop/owner-desktop-boundary.mjs'];
+  const files=['src/owner-desktop-config.js','src/owner-desktop-options.js','src/owner-desktop-conversation-options.js','plugins/surfcore/lib/owner-desktop-settings.js','plugins/surfcore/lib/owner-desktop-runtime.js','plugins/surfcore/lib/owner-desktop-conversation-gate.js'];
   for(const file of files){const target=path.join(root,file);fs.mkdirSync(path.dirname(target),{recursive:true});fs.copyFileSync(new URL('../../../'+file,import.meta.url),target);}
   assert.equal(await import(cachedUrl),cached,'Node retains the old ESM instance despite updated disk contents');
   const loaded=await import(pathToFileURL(path.join(root,'plugins/surfcore/lib/owner-desktop-settings.js')).href);

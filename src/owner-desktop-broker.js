@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_PENDING_TTL_MS } from './owner-desktop-options.js';
+import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_PENDING_TTL_MS } from './owner-desktop-conversation-options.js';
 
 const MESSAGE_TTL = 5 * 60_000;
 const MAX_LEDGER = 2048;
@@ -23,6 +23,7 @@ export function ownerDesktopIntent(value) {
   const text = String(value ?? '').trim();
   if (/^(?:取消|停止|终止)(?:当前|这次|本次|我的)?(?:电脑|桌面)(?:操作|任务)?[。！!]?$/u.test(text)) return { kind: 'cancel' };
   if (!text || text.length > 8_000 || /[?？]$/u.test(text)) return null;
+  if (/^(?:请)?(?:继续|接着)(?:上次|刚才|之前|当前)?的?(?:电脑|桌面)(?:操作|任务)(?:[，,:：\s].*)?[。！!]?$/su.test(text)) return { kind: 'continue', text };
   const explicit = /^(?:电脑|桌面)(?:操作|任务)?\s*[:：]\s*(.+)$/su.exec(text)
     ?? /^computer use\s*[:：]\s*(.+)$/isu.exec(text);
   const natural = /^(?:请|麻烦)?\s*(?:你)?\s*(?:帮我)?\s*(?:在|用|使用|操作|控制)?\s*(?:我的|这台)?(?:电脑|桌面)(?:上)?\s*(?:帮我)?\s*[,，:：]?\s*(.+)$/su.exec(text);
@@ -72,7 +73,7 @@ export function trustedOwnerDesktopMessage({ source, kind, id, event, runtime, n
 
 /** All I/O is injected. Commands and leases are never serialized to the replay ledger. */
 export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.now, notify = async () => {},
-  readLedger = () => [], writeLedger = () => {}, startedAt = now() } = {}) {
+  readLedger = () => [], writeLedger = () => {}, prepareSession, startedAt = now() } = {}) {
   let ledger;
   let storageError = null;
   const tasks = new Map();
@@ -103,35 +104,50 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
   function policy(env, task) {
     if (env.error) return env.error;
     const { settings: s, runtime: r } = env;
-    if (s?.enabled !== true || !s.parentSessionId) return failure('OWNER_DESKTOP_DISABLED', '主人电脑操作尚未启用或未选择授权会话。', '在 SurfCore 设置中选择已开启 Computer Use 的管理会话，并启用主人电脑操作。');
+    if (s?.enabled !== true || !s.authorizationEpoch) return failure('OWNER_DESKTOP_DISABLED', '主人电脑操作尚未启用。', '在 SurfCore 设置中启用主人电脑操作，并确认 Windows Computer Use 人类开关已开启。');
     if (r?.mode !== 'reserved2' || r.enabled === false) return failure('OWNER_DESKTOP_MODE', '电脑操作只在二代仿真模式启用时可用。', '恢复二代仿真模式后重新发出指令。');
     if (!positiveId(r.ownerQQ) || (task && positiveId(r.ownerQQ) !== task.ownerQQ)) return failure('OWNER_DESKTOP_OWNER_CHANGED', '主人身份已变化，原任务授权已撤销。', retryHint);
     if (r.allowed !== true || r.blocked === true) return failure('OWNER_DESKTOP_TARGET_BLOCKED', '来源会话或主人已被访问规则禁止。', retryHint);
     if (r.paused || r.silent) return failure('OWNER_DESKTOP_PAUSED', '当前 AI 已暂停或静默，电脑任务已停止。', '恢复 AI 后，由主人重新发送指令。');
     if (r.connected !== true || r.ready !== true) return failure('OWNER_DESKTOP_OFFLINE', 'QQ 或 DSH 连接不可用，电脑任务已停止。', '恢复连接后重新发送指令；旧任务不会自动恢复。');
     if (task && (task.binding !== binding(env) || task.selfUserId !== positiveId(r.selfUserId))) return failure('OWNER_DESKTOP_AUTH_CHANGED', '任务所属授权或会话代际已变化。', retryHint);
+    if (task?.sourceSessionId && task.sourceSessionId !== r.sessionId) return failure('OWNER_DESKTOP_SESSION_CHANGED', '原 QQ 会话已变化，电脑任务已停止。', retryHint);
     return null;
   }
   function binding({ settings: s, runtime: r }) {
-    return JSON.stringify([s?.enabled, s?.parentSessionId, s?.timeoutMs, s?.authorizationEpoch ?? null,
+    return JSON.stringify([s?.enabled, s?.timeoutMs, s?.authorizationEpoch ?? null,
       positiveId(r?.ownerQQ), positiveId(r?.selfUserId), r?.mode, r?.epoch ?? null, r?.liveSince ?? null]);
   }
   function view(task, command = false) {
-    const { id, ownerQQ, conversationKey, sourceMessageId, sourceReceivedAt, timeoutMs, claimExpiresAt, claimedAt, expiresAt, status,
-      sessionId, completedAt, code, error, hint, notification } = task;
-    return { id, ownerQQ, conversationKey, sourceMessageId, sourceReceivedAt, timeoutMs, claimExpiresAt, claimedAt, expiresAt, status,
-      ...(sessionId ? { sessionId } : {}), ...(completedAt ? { completedAt } : {}),
-      ...(code ? { code, error, hint } : {}), ...(notification ? { notification } : {}),
-      ...(command ? { text: task.text } : {}) };
+    const fields = ['id', 'ownerQQ', 'selfUserId', 'conversationKey', 'sourceMessageId', 'sourceReceivedAt', 'sourceTime',
+      'timeoutMs', 'claimExpiresAt', 'claimedAt', 'expiresAt', 'status', 'phase', 'sourceSessionId', 'sessionId', 'preparedId', 'messageId', 'turnId',
+      'previousTaskId', 'continuationRequested', 'completedAt', 'settledAt', 'closureStatus', 'executionStopped', 'code', 'error', 'hint', 'ackNotification', 'startNotification', 'progressNotification', 'lastProgressAt', 'terminalNotification'];
+    const result = Object.fromEntries(fields.filter(key => task[key] !== undefined).map(key => [key, task[key]]));
+    // Backward-compatible display alias; the two receipt phases remain independently visible.
+    result.notification = task.terminalNotification ?? task.ackNotification;
+    if (command) result.text = task.text;
+    return result;
   }
-  function end(task, status, issue = null) {
+  const leaseDigest = lease => createHash('sha256').update(lease).digest('hex');
+  const awaitingStop = task => !task.settledAt && (Boolean(task.messageId) || task.executionStopped === false);
+  const stoppingIssue = () => failure('OWNER_DESKTOP_PREVIOUS_STOPPING', '先前电脑任务尚未确认停止。', '等待宿主确认旧回合已停止后，再处理新任务；不要并行启动。');
+  function end(task, status, issue = null, output = '') {
+    if (TERMINAL.has(task.status)) return task.terminalPromise;
     task.status = status;
+    task.phase = awaitingStop(task) ? 'stopping' : 'finished';
     task.completedAt = now();
     if (issue) Object.assign(task, { code: issue.code, error: issue.error, hint: issue.hint });
-    task.text = '';
-    task.leaseId = '';
+    task.closureLeaseDigest = task.leaseId ? leaseDigest(task.leaseId) : '';
+    task.text = ''; task.preparedPrompt = ''; task.leaseId = '';
     if (activeId === task.id) activeId = '';
-    while (tasks.size > 30) tasks.delete(tasks.keys().next().value);
+    const label = status === 'done' ? '电脑任务已完成。' : status === 'cancelled' ? '电脑任务已取消。' : '电脑任务失败。';
+    task.terminalPromise = report(task, label + (output ? '\n' + output : '') + (issue ? '\n' + issue.error + '\n' + issue.hint : ''), 'terminalNotification');
+    while (tasks.size > 30) {
+      const removable = [...tasks.values()].find(row => row.id !== activeId && TERMINAL.has(row.status) && !awaitingStop(row));
+      if (!removable) break;
+      tasks.delete(removable.id);
+    }
+    return task.terminalPromise;
   }
   function check(task) {
     const deadline = task.status === 'pending' ? task.claimExpiresAt : task.expiresAt;
@@ -147,21 +163,23 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
   function refresh() {
     if (activeId) { const task = tasks.get(activeId); if (task) check(task); }
   }
-  async function report(task, text) {
-    // The fixed original destination is never taken from a completion request.
+  async function report(task, text, field = 'ackNotification') {
     const env = environment(task.conversationKey);
     const r = env.runtime;
+    const save = result => { task[field] = { ...result, at: now() }; };
+    save({ ok: null, status: 'sending' });
     if (env.error || positiveId(r?.ownerQQ) !== task.ownerQQ || positiveId(r?.selfUserId) !== task.selfUserId
         || r?.allowed !== true || r.blocked || r.paused || r.silent || r.connected !== true || r.mode !== 'reserved2') {
-      task.notification = failure('OWNER_DESKTOP_NOTICE_BLOCKED', '任务回执被当前 QQ 权限阻止。', '在设置页查看任务结果；恢复权限不会自动补发。');
+      save(failure('OWNER_DESKTOP_NOTICE_BLOCKED', '任务回执被当前 QQ 权限阻止。', '在设置页查看任务结果；恢复权限不会自动补发。'));
       return;
     }
     try {
-      const sent = await notify(task.conversationKey, text, { ownerQQ: task.ownerQQ, selfUserId: task.selfUserId, epoch: env.runtime.epoch, authorizationEpoch: env.settings?.authorizationEpoch });
+      const sent = await notify(task.conversationKey, text, { ownerQQ: task.ownerQQ, selfUserId: task.selfUserId, epoch: r.epoch, authorizationEpoch: env.settings?.authorizationEpoch,
+        ...(['startNotification', 'progressNotification'].includes(field) ? { isCurrent: () => !TERMINAL.has(task.status) && !check(task) } : {}) });
       if (sent?.ok === false) throw new Error('notice rejected');
-      task.notification = { ok: true };
+      save({ ok: true, status: 'sent' });
     } catch {
-      task.notification = failure('OWNER_DESKTOP_NOTICE_FAILED', '电脑任务回执发送失败。', '请在设置页查看任务状态；不要重复执行原任务。');
+      save(failure('OWNER_DESKTOP_NOTICE_FAILED', '电脑任务回执发送失败。', '请在设置页查看任务状态；不要重复执行原任务。'));
     }
   }
   function consume(message) {
@@ -193,28 +211,41 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
       return { ...consumed, handled: true };
     }
     refresh();
+    const previous = [...tasks.values()].reverse().find(task => task.conversationKey === key
+      && task.ownerQQ === message.ownerQQ && task.selfUserId === message.selfUserId);
     if (message.kind === 'cancel') {
       const task = activeId ? tasks.get(activeId) : null;
       if (task && task.ownerQQ === message.ownerQQ) {
-        end(task, 'cancelled', failure('OWNER_DESKTOP_CANCELLED', '主人已取消电脑任务。', '需要继续时请重新发送指令。'));
-        await report(message, '已取消电脑任务；在途桌面动作无法撤回，后续动作已禁止。');
+        await end(task, 'cancelled', failure('OWNER_DESKTOP_CANCELLED', '主人已取消电脑任务；在途动作无法撤回，后续动作已禁止。', '需要继续时发送“继续电脑任务”或新的电脑指令。'));
+        if (key !== task.conversationKey) await report(message, '已取消电脑任务；结果保留在任务原会话。');
         return { ok: true, handled: true, task: view(task) };
       }
-      await report(message, '当前没有进行中的电脑任务。');
-      return { ok: true, handled: true };
+      const summary = previous ? '最近的电脑任务状态：' + ({ done: '已完成', failed: '失败', cancelled: '已取消' }[previous.status] || previous.status)
+        + (previous.error ? '\n' + previous.error : '') + (previous.hint ? '\n' + previous.hint : '') : '当前没有进行中的电脑任务，也没有本会话的近期任务记录。';
+      await report(message, summary);
+      return { ok: true, handled: true, ...(previous ? { task: view(previous) } : {}) };
     }
     const denied = policy(env);
     if (denied) { lastError = denied; await report(message, denied.error + '\n' + denied.hint); return { ...denied, handled: true }; }
+    // The host resolves continuation from its persistent exact-source catalog.
+    // In-memory task history is only a correlation hint and vanishes on restart.
     if (activeId) {
-      const busy = failure('OWNER_DESKTOP_BUSY', '已有电脑任务进行中，没有排队执行本条指令。', '等待当前任务结束，或发送“取消电脑任务”，再发一条新指令。');
-      lastError = busy; await report(message, busy.error + '\n' + busy.hint); return { ...busy, handled: true };
+      const active = tasks.get(activeId);
+      if (active.conversationKey !== key || active.ownerQQ !== message.ownerQQ) {
+        const busy = failure('OWNER_DESKTOP_BUSY', '另一会话已有电脑任务进行中，没有排队执行本条指令。', '回到原会话继续，或发送“取消电脑任务”后再发新指令。');
+        lastError = busy; await report(message, busy.error + '\n' + busy.hint); return { ...busy, handled: true };
+      }
+      // Revoke synchronously before admitting the new live instruction. Never await between them.
+      end(active, 'cancelled', failure('OWNER_DESKTOP_REPLACED', '主人发来新指令，旧任务授权已撤销。', '将按主人新指令继续独立桌面会话。'));
     }
     // Even unlimited execution must be claimed while its original live message is fresh.
     const claimExpiresAt = Math.min(message.sourceReceivedAt + OWNER_DESKTOP_PENDING_TTL_MS, message.sourceTime + MESSAGE_TTL);
-    const task = { ...message, id: randomUUID(), status: 'pending', leaseId: '', binding: binding(env),
-      timeoutMs: env.settings.timeoutMs, claimExpiresAt, claimedAt: null, expiresAt: claimExpiresAt };
+    const task = { ...message, id: randomUUID(), status: 'pending', phase: 'pending', leaseId: '', binding: binding(env),
+      timeoutMs: env.settings.timeoutMs, claimExpiresAt, claimedAt: null, expiresAt: claimExpiresAt,
+      continuationRequested: message.kind === 'continue' };
+    if (previous) task.previousTaskId = previous.id;
     tasks.set(task.id, task); activeId = task.id; lastError = null;
-    await report(task, '已收到电脑操作任务，将在独立会话执行。发送“取消电脑任务”可停止后续动作。');
+    await report(task, '已收到电脑操作任务，将在独立桌面会话中执行，进度和结果会回到这里。发送“继续电脑任务”可续接，发送“取消电脑任务”可停止后续动作。');
     return { ok: true, handled: true, task: view(task) };
   }
   function status() {
@@ -225,7 +256,8 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
   }
   function pending() {
     refresh();
-    return { ok: true, tasks: [...tasks.values()].filter(task => task.status === 'pending').map(task => view(task)) };
+    const blocked = [...tasks.values()].some(awaitingStop);
+    return { ok: true, tasks: blocked ? [] : [...tasks.values()].filter(task => task.status === 'pending').map(task => view(task)), ...(blocked ? { blocked: stoppingIssue() } : {}) };
   }
   function lookup(body, claimed = true) {
     if (!body || typeof body.taskId !== 'string' || typeof body.leaseId !== 'string' || !/^[a-zA-Z0-9_-]{16,128}$/.test(body.leaseId)) return { error: failure('OWNER_DESKTOP_BAD_REQUEST', '任务编号或租约格式无效。', '请由桌面运行时提交任务编号和一次性租约。') };
@@ -241,10 +273,82 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
     if (found.error) return found.error;
     const task = found.task;
     if (task.status !== 'pending') return failure('OWNER_DESKTOP_ALREADY_CLAIMED', '任务已经被执行器领取。', '禁止再次启动同一个任务。');
-    task.status = 'running'; task.leaseId = body.leaseId;
+    if ([...tasks.values()].some(other => other.id !== task.id && awaitingStop(other))) return stoppingIssue();
+    task.status = 'running'; task.phase = 'claimed'; task.leaseId = body.leaseId;
     task.claimedAt = now();
     task.expiresAt = task.timeoutMs === 0 ? null : task.claimedAt + task.timeoutMs;
     return { ok: true, task: view(task, true) };
+  }
+  async function prepare(body) {
+    const found = lookup(body);
+    if (found.error) return found.error;
+    const task = found.task;
+    if (task.preparedId) return { ok: true, task: view(task), sourceSessionId: task.sourceSessionId, preparedId: task.preparedId, prompt: task.preparedPrompt };
+    if (task.preparing) return task.preparing;
+    task.phase = 'preparing';
+    task.preparing = (async () => {
+      try {
+        if (typeof prepareSession !== 'function') throw new Error('prepare unavailable');
+        const result = await prepareSession(Object.freeze(view(task, true)));
+        const current = lookup(body);
+        if (current.error) return current.error;
+        if (!result || typeof result.sourceSessionId !== 'string' || !/^[a-zA-Z0-9_-]{1,150}$/.test(result.sourceSessionId)
+            || typeof result.prompt !== 'string' || !result.prompt.trim()) throw new Error('invalid prepared session');
+        task.sourceSessionId = result.sourceSessionId;
+        const issue = check(task);
+        if (issue) return issue;
+        task.preparedId = randomUUID(); task.preparedPrompt = result.prompt; task.phase = 'prepared';
+        return { ok: true, task: view(task), sourceSessionId: task.sourceSessionId, preparedId: task.preparedId, prompt: task.preparedPrompt };
+      } catch (error) {
+        if (TERMINAL.has(task.status)) return failure('OWNER_DESKTOP_FINISHED', '准备期间任务已结束。', retryHint);
+        const issue = failure('OWNER_DESKTOP_PREPARE_FAILED', '原 QQ 会话准备失败，尚未发送电脑任务。', '检查 QQ 会话预设、人格和 DSH 连接后，重新发送指令。');
+        lastError = issue; await end(task, 'failed', issue); return issue;
+      }
+    })();
+    return task.preparing;
+  }
+  function bind(body) {
+    const found = lookup(body);
+    if (found.error) return found.error;
+    const task = found.task;
+    if (!task.preparedId || body.preparedId !== task.preparedId) return failure('OWNER_DESKTOP_PREPARE_MISMATCH', '原会话准备记录不匹配。', '停止发送，重新读取当前任务状态。');
+    if (typeof body.messageId !== 'string' || !/^[a-zA-Z0-9_-]{16,128}$/.test(body.messageId)) return failure('OWNER_DESKTOP_BAD_REQUEST', '宿主消息编号格式无效。', '由运行时预留唯一宿主消息编号后绑定。');
+    if (typeof body.sessionId !== 'string' || !/^[a-zA-Z0-9_-]{1,150}$/.test(body.sessionId) || body.sessionId === task.sourceSessionId) return failure('OWNER_DESKTOP_BAD_REQUEST', '桌面目标必须是宿主核验的独立会话。', '使用官方桌面子会话编号，不能在来源 QQ 会话中执行。');
+    if (task.messageId) return task.messageId === body.messageId && task.sessionId === body.sessionId
+      ? { ok: true, task: view(task) } : failure('OWNER_DESKTOP_ALREADY_BOUND', '任务已绑定其他会话或消息，禁止再次投递。', '使用原绑定核对执行状态，不要重发。');
+    if ([...tasks.values()].some(other => other.id !== task.id && awaitingStop(other))) return stoppingIssue();
+    task.sessionId = body.sessionId; task.messageId = body.messageId; task.phase = 'bound';
+    return { ok: true, task: view(task) };
+  }
+  async function started(body) {
+    const found = lookup(body);
+    if (found.error) return found.error;
+    const task = found.task;
+    if (!task.messageId || body.messageId !== task.messageId) return failure('OWNER_DESKTOP_MESSAGE_MISMATCH', '执行回合的消息与原任务不匹配。', '停止当前回合，不要使用其他消息激活任务。');
+    const validTurn = typeof body.turnId === 'string' ? body.turnId.length > 0 && body.turnId.length <= 150
+      : Number.isSafeInteger(body.turnId) && body.turnId >= 0;
+    if (!validTurn) return failure('OWNER_DESKTOP_BAD_REQUEST', '宿主回合编号格式无效。', '使用实际领取任务消息的宿主回合编号。');
+    if (task.turnId !== undefined && task.turnId !== body.turnId) return failure('OWNER_DESKTOP_TURN_MISMATCH', '任务已登记其他执行回合。', '停止新回合，重新发送明确的电脑指令。');
+    task.turnId = body.turnId; task.phase = 'executing';
+    task.startPromise ??= report(task, '电脑任务已开始，执行过程保留在独立桌面会话。\n桌面会话：' + task.sessionId + '\n可在 DSH 打开该会话查看；这里可以继续聊天或发送“取消电脑任务”。', 'startNotification');
+    await task.startPromise;
+    return { ok: true, task: view(task) };
+  }
+  function ownsTurn(sessionId, turnId) {
+    return turnId !== undefined && [...tasks.values()].some(task => task.sessionId === sessionId && task.turnId === turnId);
+  }
+  async function progress(body) {
+    const found = lookup(body);
+    if (found.error) return found.error;
+    const task = found.task;
+    if (!task.messageId || task.turnId === undefined) return failure('OWNER_DESKTOP_NOT_STARTED', '任务尚未进入已绑定的桌面回合。', '先核对宿主消息与回合绑定，再报告进度。');
+    if (typeof body.summary !== 'string' || !body.summary.trim() || body.summary.length > 500) return failure('OWNER_DESKTOP_BAD_REQUEST', '桌面进度必须是 1 至 500 字的简短摘要。', '只回传当前进度；截图和详细记录保留在桌面会话。');
+    const summary = body.summary.trim();
+    const digest = createHash('sha256').update(summary).digest('hex');
+    if (task.progressDigest === digest || (task.lastProgressAt !== undefined && now() - task.lastProgressAt < 5000)) return { ok: true, skipped: true, task: view(task) };
+    task.progressDigest = digest; task.lastProgressAt = now();
+    await report(task, '电脑任务进度：' + summary, 'progressNotification');
+    return task.progressNotification.ok === false ? { ...task.progressNotification, task: view(task) } : { ok: true, task: view(task) };
   }
   function validate(body) {
     const found = lookup(body);
@@ -252,16 +356,34 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
   }
   async function complete(body) {
     if (!['done', 'failed', 'cancelled'].includes(body?.status)) return failure('OWNER_DESKTOP_BAD_REQUEST', '任务结束状态无效。', '请使用 done、failed 或 cancelled。');
-    const found = lookup(body);
+    let found = lookup(body);
+    // An ended lease can only acknowledge shutdown. It cannot amend the terminal outcome,
+    // send another receipt, restore authority, or provide a different session binding.
+    const closed = tasks.get(body.taskId);
+    if (found.error && closed && TERMINAL.has(closed.status) && typeof body.leaseId === 'string'
+        && closed.closureLeaseDigest && closed.closureLeaseDigest === leaseDigest(body.leaseId)) {
+      if (body.sessionId !== undefined && body.sessionId !== closed.sessionId) return failure('OWNER_DESKTOP_SESSION_CHANGED', '停止证明的会话与原任务不匹配。', '使用原任务绑定的桌面会话，不要提供其他会话。');
+      if (!closed.settledAt && body.executionStopped === false) {
+        closed.executionStopped = false; closed.phase = 'stopping';
+      } else if (!closed.settledAt && (body.executionStopped === true || (!closed.messageId && closed.executionStopped !== false))) {
+        closed.executionStopped = true; closed.settledAt = now(); closed.closureStatus = body.status; closed.phase = 'finished';
+      }
+      await closed.terminalPromise;
+      return { ok: true, late: true, task: view(closed) };
+    }
     if (found.error) return found.error;
     const task = found.task;
+    if (body.sessionId !== undefined && body.sessionId !== task.sessionId) return failure('OWNER_DESKTOP_SESSION_CHANGED', '结束回执的会话与原任务不匹配。', '使用绑定阶段记录的桌面会话编号。');
+    if (body.status === 'done' && !task.messageId) return failure('OWNER_DESKTOP_NOT_BOUND', '任务尚未绑定宿主消息，不能报告成功。', '先完成来源会话准备与桌面消息绑定。');
     const issue = body.status === 'done' ? null : failure(bounded(body.code, 100) || 'OWNER_DESKTOP_EXECUTION_FAILED',
       bounded(body.error, 500) || '电脑任务未完成。', bounded(body.hint, 500) || retryHint);
-    if (typeof body.sessionId === 'string') task.sessionId = body.sessionId.slice(0, 150);
-    const output = bounded(body.output, 3000).trim();
-    end(task, body.status, issue);
-    const label = body.status === 'done' ? '电脑任务已完成。' : body.status === 'cancelled' ? '电脑任务已取消。' : '电脑任务失败。';
-    await report(task, label + (output ? '\n' + output : '') + (issue ? '\n' + issue.error + '\n' + issue.hint : ''));
+    task.executionStopped = body.executionStopped === true || (body.executionStopped !== false && !task.messageId);
+    if (task.executionStopped) task.settledAt = now();
+    task.closureStatus = body.status;
+    const summary = bounded(body.output, 500).trim();
+    const more = typeof body.output === 'string' && body.output.length > 500 && task.sessionId
+      ? '\n完整结果保留在桌面会话：' + task.sessionId : '';
+    await end(task, body.status, issue, summary + more);
     return { ok: true, task: view(task) };
   }
   function revoke(reason = '授权已撤销', conversationKey = '') {
@@ -276,7 +398,7 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
     if (body.leaseId && tasks.get(activeId)?.leaseId !== body.leaseId) return failure('OWNER_DESKTOP_LEASE_MISMATCH', '任务租约不匹配。', '停止当前执行器。');
     return revoke('管理端已取消电脑任务。');
   }
-  return { ingest, status, pending, claim, validate, complete, cancel, revoke };
+  return { ingest, status, pending, claim, prepare, bind, started, progress, validate, complete, cancel, revoke, ownsTurn };
 }
 
 /** Call only after the console authentication / loopback / CSRF gates. No API can mint a task. */
@@ -286,12 +408,15 @@ export async function handleOwnerDesktopRoute(broker, req, url, { readBody, send
   }
   const action = url.pathname.slice('/api/owner-desktop/'.length);
   if (req.method === 'GET' && ['status', 'pending'].includes(action)) { sendJson(broker[action]()); return; }
-  if (req.method !== 'POST' || !['claim', 'validate', 'complete', 'cancel'].includes(action)) {
+  if (req.method !== 'POST' || !['claim', 'prepare', 'bind', 'started', 'progress', 'validate', 'complete', 'cancel'].includes(action)) {
     sendJson(failure('OWNER_DESKTOP_NOT_FOUND', '未知电脑任务接口或请求方法。', '仅可查询、领取、校验、完成或取消已存在的主人任务。'), 404); return;
   }
   try {
     const body = await readBody();
-    const allowed = action === 'complete' ? ['taskId', 'leaseId', 'status', 'output', 'code', 'error', 'hint', 'sessionId'] : ['taskId', 'leaseId'];
+    const allowed = action === 'complete' ? ['taskId', 'leaseId', 'status', 'output', 'code', 'error', 'hint', 'sessionId', 'executionStopped']
+      : action === 'bind' ? ['taskId', 'leaseId', 'preparedId', 'sessionId', 'messageId']
+      : action === 'started' ? ['taskId', 'leaseId', 'messageId', 'turnId']
+      : action === 'progress' ? ['taskId', 'leaseId', 'summary'] : ['taskId', 'leaseId'];
     if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).some(key => !allowed.includes(key))) {
       sendJson(failure('OWNER_DESKTOP_BAD_REQUEST', '电脑任务请求包含不允许的字段。', '任务正文、主人和发送目标只能来自实时 QQ 消息，不能由接口提供。'), 400); return;
     }

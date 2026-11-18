@@ -18,6 +18,7 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **主人桌面独立连续性（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-conversation` | `feat/owner-desktop-conversation`（基线a8e4f82） | Lead设置/预设/GUI/文档/集成；队友broker+bridge、runtime+边界、持久索引分文件；只读事故与可见入口审查 | 独立持续架构与专项验证中；来源QQ人格/模型、同child历史、可见入口与真实停止回执；生产未变 |
 | **主人私聊桌面指令识别（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-intent` | `feat/owner-desktop-intent`（基线cd36c1c） | Lead修复明确Windows-MCP自然指令与私聊提示；队友只读边界复核 | 已集成本机dev，插件/桥接在线、授权不限时、runtime无错误、配置与原作者更新保持；完整审计165/165及原句/权限专项通过；未重放历史命令、未发送测试消息、未推送发布 |
 | **主人桌面长任务（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-duration` | `feat/owner-desktop-duration`（基线4f0ce2f） | Lead负责UI/配置接口验证/集成，队友负责时限语义与测试 | 已集成本机并启用不限时；插件/桥接在线、原作者更新与配置保持；缓存兼容复现和时限/权限专项通过，审计162/165后两项复验通过，R11旧基线同样超时；未推送/发布/长期游戏实测 |
 | **主人专用 Computer Use（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-computer-use` | `feat/owner-computer-use`（基线6d25f3a） | 保留仿真模式，真实主人私聊/群@受控桌面任务；Lead整合，队友只读权限与身份审查 | 已集成本机 dev 并启用，runtime idle、QQ reserved2在线、原更新来源保留；49项插件脚本及最终50组运行时/API/预设/宿主检查通过，完整QQ桌面动作尚未实发验收；未推送/发布 |

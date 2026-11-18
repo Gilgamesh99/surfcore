@@ -171,6 +171,7 @@ try {
 
   const desktop = await invoke('GET', '/owner-desktop');
   assert.equal(desktop.status, 200); assert.equal(desktop.data.settings.enabled, false);
+  assert.equal(desktop.data.executionMode, 'desktop-conversation'); assert.equal(desktop.data.parents, undefined);
   const agentAttempt = await invoke('POST', '/owner-desktop', { enabled: true }, { 'x-agent-token': 'fake' });
   assert.equal(agentAttempt.status, 403); assert.equal(agentAttempt.data.code, 'owner-desktop.admin-only'); assert.ok(agentAttempt.data.hint);
   const unsigned = await invoke('POST', '/owner-desktop', { enabled: false, expectedEpoch: '' });
