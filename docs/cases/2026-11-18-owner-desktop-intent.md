@@ -11,12 +11,14 @@
 3. **影响面**：QQ 桥接和宿主插件两个进程，各一个线上调用链，失败有用户可见提示，估算 2×2×1=4。配置、用户消息和历史不迁移，不新增模型调用；明确命令仍只发起原来已有的受控任务。
 4. **取舍**：仅告诉用户必须输入“电脑：”改动最小，却继续漏掉明确的原句；让普通聊天直接用 Windows 会破坏隔离；选择受限自然语法加可复制快捷格式，改动集中，能用原句与拒绝边界共同验证并单独回滚。不是通用自然语言分类器，歧义说法仍可使用明确动作的“电脑：”格式。
 5. **生效**：提交后从 Git 对象重建安装清单，本机 dev 快进；正式 PluginManager 重载 SurfCore 以刷新提示，随后串行重启 QQ 桥接以刷新接收器。保留主人授权启用、timeoutMs=0、管理父会话、仿真模式、双远程及 upstream/main preserve-local 更新。
-6. **验证**：原句先在旧版报 expected command / actual null；修复后 broker23、实际接收回调15、运行时56组通过。回调用例验证私聊及真 @ 群聊原句进入独立任务、共享 QQ unread/prompt 为0、全文保留、0时限的 expiresAt=null。失败分支验证假身份、引用/转发、非真正 @、历史/重放、取消/撤权仍拒绝。完整 `npm run test:audit` 165/165 脚本通过（含桥接回归、R11 和 Git 更新事务）；受影响的设置10组、实际管理API和隔离宿主冒烟也通过。上线验证结果待补。
+6. **验证**：原句先在旧版报 expected command / actual null；修复后 broker23、实际接收回调15、运行时56组通过。回调用例验证私聊及真 @ 群聊原句进入独立任务、共享 QQ unread/prompt 为0、全文保留、0时限的 expiresAt=null。失败分支验证假身份、引用/转发、非真正 @、历史/重放、取消/撤权仍拒绝。完整 `npm run test:audit` 165/165 脚本通过（含桥接回归、R11 和 Git 更新事务）；受影响的设置10组、实际管理API和隔离宿主冒烟也通过。本机插件、桥接、授权状态及实际上游更新检查通过，详见下节。
 7. **回滚与残余**：生产基线 cd36c1cb282cde3dcc0017814b2187b6e07c99a0；备份在 Soul/backups/surfcore-owner-desktop-intent-20261118。回滚使用 revert 本次业务提交、重建清单、重载插件与桥接；不删除防重放记录，不恢复旧任务。没有发送真实 QQ 测试消息或执行实际打开 B站动作；需要主人重新发出新指令才能进行真实任务。
 
 ## 本机验证
 
-待集成：仅已核对当前生产授权 enabled=true、timeoutMs=0、runtime idle、QQ reserved2/在线。全部定向测试使用假传输/宿主，不访问真实 QQ 或桌面。
+已集成本机 dev：业务提交103cca8，运行代码及清单fc24ef1；正式 PluginManager 重载成功，QQ 桥接 PID20496→27372，reserved2、DSH 与 SnowLuma 在线。2026-11-18 10:26（Asia/Shanghai）回读 enabled=true、timeoutMs=0、管理父会话匹配、runtime.ok=true/idle/lastError=null、broker.ok=true；六份运行配置逐字节哈希保持。实际更新检查 checkedWithFetch=true、upstream/main、preserve-local、ahead33/behind0/dirty0。
+
+桥接重启期间产生的一次 fetch failed 被旧运行时状态保留，首次验收因此失败；确认桥接在线后再次正式重载插件，状态恢复并通过完整回读。未修改授权开关或 Windows 授权。最终文档/清单提交不改变运行代码，最终 HEAD 与更新回读保存在 Soul/surfcore-owner-desktop-intent-verification-20261118.json。接收/执行定向测试使用隔离传输和宿主，没有真实 QQ 测试消息或桌面操作。
 
 ## 可转发发布交接
 
