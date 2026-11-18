@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_DEFAULT_TIMEOUT_MS, OWNER_DESKTOP_PENDING_TTL_MS } from '../../../src/owner-desktop-config.js';
+import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_DEFAULT_TIMEOUT_MS, OWNER_DESKTOP_PENDING_TTL_MS } from '../../../src/owner-desktop-options.js';
 import { armOwnerDesktopBoundary, isOwnerDesktopTool } from '../../../dsh/agent-presets/owner-desktop/owner-desktop-boundary.mjs';
 export { isOwnerDesktopTool };
 

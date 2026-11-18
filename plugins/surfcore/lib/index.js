@@ -66,7 +66,7 @@ import { PlatformRegistry } from './platforms.js';
 import { ExtensionHost } from './extensions.js';
 import { isLoopbackReq, json, readBody, sameOrigin } from './http-guard.js';
 import { startScheduler } from './scheduler.js';
-import { readOwnerDesktopSettings, desktopConfigError } from '../../../src/owner-desktop-config.js';
+import { readOwnerDesktopSettings, desktopConfigError } from '../../../src/owner-desktop-options.js';
 import { createOwnerDesktopPolicy } from './owner-desktop-policy.js';
 import { installOwnerDesktopRuntime } from './owner-desktop-runtime.js';
 import { installOwnerDesktopPreset } from './owner-desktop-preset.js';

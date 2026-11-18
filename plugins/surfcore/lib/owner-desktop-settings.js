@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { normalizeOwnerDesktopSettings, desktopConfigError } from '../../../src/owner-desktop-config.js';
+import { normalizeOwnerDesktopSettings, desktopConfigError } from '../../../src/owner-desktop-options.js';
 
 const failure = (error) => ({ ok: false, code: error?.code || 'owner-desktop.settings-failed', error: String(error?.message || '桌面授权设置失败。'), hint: error?.hint || '重新读取设置和桥接状态后再试。' });
 

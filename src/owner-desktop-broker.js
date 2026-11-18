@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_PENDING_TTL_MS } from './owner-desktop-config.js';
+import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_PENDING_TTL_MS } from './owner-desktop-options.js';
 
 const MESSAGE_TTL = 5 * 60_000;
 const MAX_LEDGER = 2048;
