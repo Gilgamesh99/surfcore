@@ -23,6 +23,37 @@ try {
     assert.equal(definition.plugins.find(row=>row.name.endsWith('/boundary.mjs')).name,new URL('../../../dsh/agent-presets/owner-desktop-conversation/boundary.mjs',import.meta.url).href);
     await p.stop();
   });
+  await test('cached preset boundary shares authorization with freshly loaded plugin modules', async () => {
+    const boundary = await import(new URL('../../../dsh/agent-presets/owner-desktop-conversation/boundary.mjs', import.meta.url));
+    const gateUrl = new URL('../lib/owner-desktop-conversation-gate.js', import.meta.url).href;
+    const initial = await import(gateUrl);
+    const handlers = new Map(); let allowed = [], guard;
+    const executor = { describe: definitions => ({ schemas: definitions }) };
+    const scopedTools = { restrict: options => { allowed = options.allow; return () => {}; } };
+    const agent = { ctx: { get: name => name === 'tools' ? scopedTools : undefined } };
+    const ctx = { on: (name, callback) => handlers.set(name, callback), tools: {
+      guard: callback => { guard = callback; },
+      view: () => ({ restrictableNames: new Set(['windows_desktop', 'mcp__windows__Click', 'run_code']) }),
+      definitions: () => allowed.map(name => ({ name })), selectExecutor: () => executor,
+    } };
+    boundary.apply(ctx); handlers.get('agent/created')({ agent });
+    for (const generation of [1, 2]) {
+      // A fresh plugin module namespace with the external preset still cached
+      // reproduces the host's package-removal eviction boundary without a host.
+      const reloaded = await import(gateUrl + '?pluginReload=' + generation);
+      assert.notEqual(reloaded, initial);
+      assert.match(guard({ agent, name: 'windows_desktop' }), /owner-task-required/);
+      const grant = reloaded.armOwnerDesktopConversation(agent, () => undefined);
+      assert.ok(grant, 'reloaded plugin must arm the previously cached preset boundary');
+      assert.equal(grant.activate(), true);
+      assert.equal(guard({ agent, name: 'windows_desktop' }), undefined);
+      assert.match(guard({ agent, name: 'run_code' }), /tool-not-allowed/);
+      grant.close();
+      assert.match(guard({ agent, name: 'windows_desktop' }), /owner-task-required/);
+    }
+    handlers.get('dispose')();
+    assert.match(guard({ agent, name: 'windows_desktop' }), /owner-task-required/);
+  });
   await test('official registration pins the boundary to its source and removes on stop', async () => {
     let definition, removed = 0;
     const p = installOwnerDesktopConversationPreset({ agentPresets: {

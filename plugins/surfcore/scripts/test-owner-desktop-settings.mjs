@@ -62,7 +62,7 @@ test('reloaded settings and runtime work while the host retains the old config m
   const cachedPath=path.join(root,'src/owner-desktop-config.js');
   fs.writeFileSync(cachedPath,"export function normalizeOwnerDesktopSettings(){throw new Error('stale configuration used');} export function desktopConfigError(code,message,hint){return Object.assign(new Error(message),{code,hint});}\n");
   const cachedUrl=pathToFileURL(cachedPath).href;const cached=await import(cachedUrl);
-  const files=['src/owner-desktop-config.js','src/owner-desktop-options.js','src/owner-desktop-conversation-options.js','plugins/surfcore/lib/owner-desktop-settings.js','plugins/surfcore/lib/owner-desktop-runtime.js','plugins/surfcore/lib/owner-desktop-conversation-gate.js'];
+  const files=['src/owner-desktop-config.js','src/owner-desktop-options.js','src/owner-desktop-conversation-options.js','plugins/surfcore/lib/owner-desktop-settings.js','plugins/surfcore/lib/owner-desktop-runtime.js','plugins/surfcore/lib/owner-desktop-conversation-gate.js','dsh/agent-presets/owner-desktop-conversation/gate.mjs'];
   for(const file of files){const target=path.join(root,file);fs.mkdirSync(path.dirname(target),{recursive:true});fs.copyFileSync(new URL('../../../'+file,import.meta.url),target);}
   assert.equal(await import(cachedUrl),cached,'Node retains the old ESM instance despite updated disk contents');
   const loaded=await import(pathToFileURL(path.join(root,'plugins/surfcore/lib/owner-desktop-settings.js')).href);
