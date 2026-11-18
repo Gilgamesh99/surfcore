@@ -18,6 +18,7 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **主人桌面长任务（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-duration` | `feat/owner-desktop-duration`（基线4f0ce2f） | Lead负责UI/配置接口验证/集成，队友负责时限语义与测试 | 时限/权限/宿主专项、更新器22项通过；审计162/165后两项复验通过，R11旧基线同样超时；准备本机加载 |
 | **主人专用 Computer Use（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-computer-use` | `feat/owner-computer-use`（基线6d25f3a） | 保留仿真模式，真实主人私聊/群@受控桌面任务；Lead整合，队友只读权限与身份审查 | 已集成本机 dev 并启用，runtime idle、QQ reserved2在线、原更新来源保留；49项插件脚本及最终50组运行时/API/预设/宿主检查通过，完整QQ桌面动作尚未实发验收；未推送/发布 |
 | **Fork dev 与原作者更新（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-fork-dev` | `feat/fork-dev-upstream`（基线f80a5a2） | 双远程、本地dev推送、独立upstream/main更新；Lead管Git/配置，队友仅更新器源码与测试 | 两边历史完整保留；生产dev双远程已生效，原作者更新真实回读通过；审计163/163、专项与清单通过；仅fork/dev推送，服务端最终SHA见case所列验收记录 |
 | **B站双分支本机集成（2026-11-13 夜）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-bili-integration` | `feat/bili-integration-20261113`（基线c9b8dbe） | 合并阅读/私信分享，修正消息顺序与测试隔离，保留远端更新 | 已快进生产并重载；新路由/GUI/群匹配/完整人格验收通过；审计残项复验通过，插件44/45（唯一旧基线同样失败）；备份保留，未发布或发送测试消息 |

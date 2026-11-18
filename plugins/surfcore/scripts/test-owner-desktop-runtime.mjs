@@ -34,12 +34,13 @@ function fixture(options = {}) {
   const done = deferred();
   const created = deferred();
   const owner = { value: '10001' };
-  const config = { enabled: true, parentSessionId: 'management', authorizationEpoch: 'epoch-1', timeoutMs: 600_000 };
+  const config = { enabled: true, parentSessionId: 'management', authorizationEpoch: 'epoch-1', timeoutMs: options.timeoutMs ?? 600_000 };
   const parent = agent('management');
   agents.set(parent.id, parent);
   const task = { id: 'task-a', ownerQQ: owner.value, conversationKey: 'private:10001',
-    sourceMessageId: 'message-123', sourceReceivedAt: clock, text: 'Open Calculator', expiresAt: clock + 300_000 };
-  const control = { validate: { ok: true }, complete: { ok: true }, claim: null, pending: null, throws: false,
+    sourceMessageId: 'message-123', sourceReceivedAt: clock, text: 'Open Calculator', status: 'running',
+    timeoutMs: config.timeoutMs, claimExpiresAt: clock + 300_000, claimedAt: clock, expiresAt: config.timeoutMs === 0 ? null : clock + config.timeoutMs };
+  const control = { validate: null, complete: { ok: true }, claim: null, pending: null, throws: false,
     inheritedEventCount: 0, local: true, registration: true, validateHook: null, postStepMessages: null, broker: null,
     preset: { ok: true }, receiptMessageId: 'accepted-message-1', provider: null, parentSubagents: null, serviceForCalls: [] };
   let starts = 0;
@@ -170,7 +171,7 @@ function fixture(options = {}) {
     let result;
     if (path.endsWith('/pending')) result = control.pending ?? { ok: true, tasks: [{ id: task.id }] };
     if (path.endsWith('/claim')) result = control.claim ?? { ok: true, task: { ...task } };
-    if (path.endsWith('/validate')) { if (control.validateHook) await control.validateHook(); result = control.validate; }
+    if (path.endsWith('/validate')) { if (control.validateHook) await control.validateHook(); result = control.validate ?? { ok: true, task: { ...task } }; }
     if (path.endsWith('/complete')) result = control.complete;
     return options.envelope ? { ok: true, status: 200, data: result } : result;
   }
@@ -335,13 +336,83 @@ await check('heartbeat notices cancellation even when no tool is being called', 
   assert.equal(f.runtime.status().lastResult.status, 'cancelled');
   await f.runtime.stop();
 });
-await check('timeout is capped and expiry fails closed', async () => {
-  const f = fixture(); f.config.timeoutMs = 900_000; f.task.expiresAt += 900_000;
-  await f.begin();
-  assert.ok([...f.timers.values()].some(timer => timer.ms === 600_000));
-  f.advance(600_001); await f.fire(600_000); await f.run();
-  assert.equal(f.runtime.status().lastError.code, 'owner-desktop.timeout');
-  await f.runtime.stop();
+await check('thirty-minute and day-long leases pass ten minutes then stop at their exact deadline', async () => {
+  for (const timeoutMs of [1_800_000, 86_400_000]) {
+    const f = fixture({ timeoutMs }); assert.equal((await f.begin()).kind, 'enter');
+    assert.ok([...f.timers.values()].some(timer => timer.ms === timeoutMs));
+    f.advance(600_001); await f.fire(2000);
+    assert.equal(await f.execute(f.exec()), undefined);
+    f.advance(timeoutMs - 600_002); assert.equal(await f.execute(f.exec()), undefined);
+    f.advance(1); await f.fire(timeoutMs); await f.run();
+    assert.equal(f.runtime.status().lastError.code, 'owner-desktop.timeout');
+    assert.equal(f.runtime.status().lastResult.status, 'cancelled');
+    assert.match(await f.execute(f.exec()), /lease-revoked/); await f.runtime.stop();
+  }
+});
+await check('finite deadline guard rejects at the exact boundary without relying on the timer', async () => {
+  const f = fixture({ timeoutMs: 30_000 }); await f.begin();
+  const value = f.exec(); await f.prepare(value); f.advance(30_000);
+  assert.match(f.guard(value), /expired/); await f.run(); await f.runtime.stop();
+});
+await check('unlimited execution has no deadline timer and stays active beyond twenty-four hours', async () => {
+  const f = fixture({ timeoutMs: 0 }); assert.equal((await f.begin()).kind, 'enter');
+  assert.ok([...f.timers.values()].every(timer => timer.ms === 2000), 'only poll and revocation heartbeat remain');
+  f.advance(86_400_001); await f.fire(2000);
+  assert.equal(await f.execute(f.exec()), undefined);
+  await f.runtime.cancelActive(); await f.run();
+  assert.equal(f.runtime.status().lastResult.status, 'cancelled');
+  assert.equal(f.disposals(), 1); assert.match(await f.execute(f.exec()), /lease-revoked/); await f.runtime.stop();
+});
+await check('unlimited execution retains setting, identity and broker revocation boundaries', async () => {
+  for (const mode of ['owner', 'disabled', 'epoch', 'parent', 'duration', 'broker', 'stop']) {
+    const f = fixture({ timeoutMs: 0 }); await f.begin(); f.advance(86_400_001);
+    const value = f.exec(); await f.prepare(value);
+    if (mode === 'owner') f.owner.value = '20002';
+    if (mode === 'disabled') f.config.enabled = false;
+    if (mode === 'epoch') f.config.authorizationEpoch = 'changed';
+    if (mode === 'parent') f.agents.delete('management');
+    if (mode === 'duration') f.config.timeoutMs = 1_800_000;
+    if (mode === 'broker') { f.control.validate = { ok: false, code: 'owner-desktop.offline', error: 'Disconnected', hint: 'Reconnect' }; await f.fire(2000); }
+    if (mode === 'stop') await f.runtime.stop();
+    assert.ok(f.guard(value), mode); await f.run();
+    assert.equal(f.runtime.status().lastResult.status, 'cancelled', mode); await f.runtime.stop();
+  }
+});
+await check('invalid or mismatched claim deadlines cannot authorize finite or unlimited workers', async () => {
+  const invalid = [undefined, null, 0, '', false, Infinity, NaN, '700000'];
+  for (const timeoutMs of [600_000, 0]) {
+    const cases = [...invalid.filter(value => !(timeoutMs === 0 && value === null)).map(expiresAt => ({ expiresAt })),
+      { claimedAt: undefined }, { claimedAt: null }, { claimedAt: 100_001 }, { claimedAt: 99_999 },
+      { claimExpiresAt: undefined }, { claimExpiresAt: null }, { claimExpiresAt: 100_000 }, { claimExpiresAt: 400_001 },
+      { timeoutMs: undefined }, { timeoutMs: timeoutMs === 0 ? 600_000 : 0 }, { status: 'pending' }];
+    for (const patch of cases) {
+      const f = fixture({ timeoutMs }); Object.assign(f.task, patch);
+      assert.equal((await f.begin()).kind, 'reject'); assert.equal(f.starts(), 0);
+      assert.equal(f.runtime.status().lastError.code, 'owner-desktop.deadline-invalid');
+      assert.ok(f.runtime.status().lastError.hint); await f.runtime.stop();
+    }
+  }
+});
+await check('deadline omission or mutation during validation revokes rather than extending execution', async () => {
+  for (const timeoutMs of [600_000, 0]) for (const mode of ['missing-task', 'missing-deadline', 'deadline', 'claim']) {
+    const f = fixture({ timeoutMs }); await f.begin();
+    const changed = { ...f.task };
+    if (mode === 'missing-deadline') delete changed.expiresAt;
+    if (mode === 'deadline') changed.expiresAt = timeoutMs === 0 ? 1_000_000 : null;
+    if (mode === 'claim') { changed.claimedAt += 1; if (changed.expiresAt !== null) changed.expiresAt += 1; f.advance(1); }
+    f.control.validate = mode === 'missing-task' ? { ok: true } : { ok: true, task: changed };
+    assert.match(await f.execute(f.exec()), /deadline-invalid|task-changed/); await f.run();
+    assert.equal(f.runtime.status().lastResult.status, 'cancelled'); await f.runtime.stop();
+  }
+});
+await check('runtime refuses invalid duration settings and preserves the omitted default', async () => {
+  for (const timeoutMs of [null, false, '', '0', [], -1, 29_999, 86_400_001, NaN, Infinity]) {
+    const f = fixture(); f.config.timeoutMs = timeoutMs; assert.equal((await f.begin()).kind, 'reject');
+    assert.equal(f.starts(), 0); assert.equal(f.runtime.status().lastError.code, 'owner-desktop.timeout-invalid');
+    assert.ok(f.runtime.status().lastError.hint); await f.runtime.stop();
+  }
+  const f = fixture(); delete f.config.timeoutMs; assert.equal((await f.begin()).kind, 'enter');
+  assert.ok([...f.timers.values()].some(timer => timer.ms === 600_000)); await f.finish(); await f.runtime.stop();
 });
 await check('stop drains the worker, pauses polling, and start reads fresh settings', async () => {
   const f = fixture(); await f.begin();

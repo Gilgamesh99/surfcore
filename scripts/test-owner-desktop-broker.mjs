@@ -129,13 +129,14 @@ await test('concurrent commands claim complete and wrong lease are single-use', 
   assert.equal(f.notices.at(-1).key, 'private:123');
 });
 await test('every policy mutation cancels before a later tool; restoring values never restores lease', async () => {
-  for (const [target, patch] of [
+  for (const timeoutMs of [600_000, 0]) for (const [target, patch] of [
     ['settings', { enabled: false }], ['settings', { parentSessionId: 'different' }], ['settings', { authorizationEpoch: 'auth-epoch-two' }],
     ['runtime', { ownerQQ: '321' }], ['runtime', { selfUserId: '888' }], ['runtime', { mode: 'chat' }], ['runtime', { epoch: 2 }],
     ['runtime', { enabled: false }], ['runtime', { allowed: false }], ['runtime', { blocked: true }], ['runtime', { paused: true }],
     ['runtime', { silent: true }], ['runtime', { connected: false }], ['runtime', { ready: false }],
   ]) {
-    const f = fixture(); const id = await accepted(f); f.broker.claim({ taskId: id, leaseId });
+    const f = fixture(); f.settings.timeoutMs = timeoutMs; const id = await accepted(f); f.broker.claim({ taskId: id, leaseId });
+    if (timeoutMs === 0) f.advance(86_400_001);
     const before = { ...f[target] }; Object.assign(f[target], patch); expectFailure(f.broker.validate({ taskId: id, leaseId }));
     Object.assign(f[target], before); expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_FINISHED');
     assert.equal(f.broker.status().tasks[0].status, 'cancelled');
@@ -197,5 +198,55 @@ await test('route accepts only existing-task actions and rejects all model marke
   assert.equal((await route('complete', 'POST', { taskId: id, leaseId, status: 'done' })).status, 200);
   assert.equal((await route('claim', 'POST', { taskId: id, leaseId })).status, 409);
   assert.equal((await route('status', 'GET')).status, 200);
+});
+await test('finite execution starts at claim and lasts the full configured duration past ten minutes', async () => {
+  for (const timeoutMs of [1_800_000, 86_400_000]) {
+    const f = fixture(); f.settings.timeoutMs = timeoutMs; const id = await accepted(f);
+    const pending = f.broker.pending().tasks[0];
+    assert.equal(pending.claimedAt, null); assert.equal(pending.expiresAt, pending.claimExpiresAt);
+    f.advance(240_000); const claimed = f.broker.claim({ taskId: id, leaseId }).task;
+    assert.equal(claimed.claimedAt - pending.sourceReceivedAt, 240_000);
+    assert.equal(claimed.expiresAt - claimed.claimedAt, timeoutMs);
+    f.advance(600_001); assert.equal(f.broker.validate({ taskId: id, leaseId }).ok, true);
+    f.advance(timeoutMs - 600_002); assert.equal(f.broker.validate({ taskId: id, leaseId }).ok, true);
+    f.advance(1); expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_EXPIRED');
+  }
+});
+await test('unlimited execution uses explicit JSON null and remains cancellable after a day', async () => {
+  const f = fixture(); f.settings.timeoutMs = 0; const id = await accepted(f);
+  const claimed = f.broker.claim({ taskId: id, leaseId }).task;
+  assert.equal(claimed.expiresAt, null); assert.equal(claimed.timeoutMs, 0);
+  assert.equal(JSON.parse(JSON.stringify(claimed)).expiresAt, null);
+  f.advance(86_400_001); assert.equal(f.broker.validate({ taskId: id, leaseId }).ok, true);
+  expectFailure(await f.broker.ingest(f.input()), 'OWNER_DESKTOP_BUSY');
+  const cancel = f.input(); cancel.event.message[0].data.text = '取消电脑任务';
+  assert.equal((await f.broker.ingest(cancel)).ok, true);
+  expectFailure(f.broker.validate({ taskId: id, leaseId }), 'OWNER_DESKTOP_FINISHED');
+});
+await test('all durations retain a five-minute pending claim window', async () => {
+  for (const timeoutMs of [0, 1_800_000, 86_400_000]) {
+    const f = fixture(); f.settings.timeoutMs = timeoutMs; const id = await accepted(f);
+    assert.equal(f.broker.pending().tasks[0].claimExpiresAt - f.broker.pending().tasks[0].sourceReceivedAt, 300_000);
+    f.advance(300_000); expectFailure(f.broker.claim({ taskId: id, leaseId }), 'OWNER_DESKTOP_EXPIRED');
+    assert.equal(f.broker.pending().tasks.length, 0);
+    const g = fixture({ startedAt: 1_799_999_000_000 }); g.settings.timeoutMs = timeoutMs;
+    const old = g.input('private', { time: 1_799_999_699 });
+    assert.equal((await g.broker.ingest(old)).handled, false, 'unlimited never accepts a five-minute-old source');
+  }
+});
+await test('near-expired sources cannot acquire a fresh five-minute waiting window', async () => {
+  const f = fixture({ startedAt: 1_799_999_000_000 }); f.settings.timeoutMs = 0;
+  const result = await f.broker.ingest(f.input('private', { time: 1_799_999_701 }));
+  assert.equal(result.ok, true); assert.equal(result.task.claimExpiresAt - result.task.sourceReceivedAt, 1000);
+  f.advance(1000); expectFailure(f.broker.claim({ taskId: result.task.id, leaseId }), 'OWNER_DESKTOP_EXPIRED');
+});
+await test('invalid raw settings cannot be coerced into unlimited; absence retains ten minutes', async () => {
+  for (const timeoutMs of [null, false, true, '', '0', '600000', [], {}, -1, 29999, 86400001, NaN, Infinity]) {
+    const f = fixture(); f.settings.timeoutMs = timeoutMs;
+    expectFailure(await f.broker.ingest(f.input()), 'OWNER_DESKTOP_TIMEOUT_INVALID'); assert.equal(f.broker.pending().tasks.length, 0);
+  }
+  const f = fixture(); delete f.settings.timeoutMs; const id = await accepted(f);
+  const task = f.broker.claim({ taskId: id, leaseId }).task;
+  assert.equal(task.timeoutMs, 600_000); assert.equal(task.expiresAt - task.claimedAt, 600_000);
 });
 console.log('Owner desktop broker: ' + passed + ' tests passed (pure fixtures; no network).');

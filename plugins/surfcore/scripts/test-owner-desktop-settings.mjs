@@ -29,3 +29,19 @@ test('disabling still revokes epoch when bridge is offline',async()=>{
 test('status exposes actionable backend failures without private command text',async()=>{
  const f=fixture({bridge:async()=>({ok:false})});const r=await f.controller.status();assert.equal(r.ok,true);assert.equal(r.ownerConfigured,true);assert.equal(r.broker.ok,false);assert.ok(r.broker.code&&r.broker.hint);assert.equal(r.settings.parentSessionId,'human');
 });
+
+test('long and unlimited duration changes revoke old task and persist an exact new value', async()=>{
+ const f=fixture();let epoch='old';
+ for(const timeoutMs of [1800000,86400000,0,600000]) {
+  f.events.length=0;const result=await f.controller.configure({enabled:true,timeoutMs,expectedEpoch:epoch});
+  assert.equal(result.ok,true);assert.equal(result.settings.timeoutMs,timeoutMs);assert.notEqual(result.settings.authorizationEpoch,epoch);epoch=result.settings.authorizationEpoch;
+  assert.deepEqual(f.events.map(x=>typeof x==='string'?x:x.route),['stop','/api/owner-desktop/cancel','save','start']);
+ }
+});
+test('invalid duration never cancels or changes existing authorization',async()=>{
+ const f=fixture();for(const timeoutMs of [null,false,'',-1,29999,86400001,Infinity]) {
+  const r=await f.controller.configure({enabled:true,timeoutMs,expectedEpoch:'old'});
+  assert.equal(r.ok,false);assert.equal(r.code,'owner-desktop.timeout-invalid');assert.ok(r.hint);
+ }
+ assert.equal(f.events.length,0);assert.equal(f.getSettings().authorizationEpoch,'old');
+});

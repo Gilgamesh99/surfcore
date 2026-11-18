@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_PENDING_TTL_MS } from './owner-desktop-config.js';
 
 const MESSAGE_TTL = 5 * 60_000;
-const MAX_TASK_MS = 10 * 60_000;
 const MAX_LEDGER = 2048;
 const TERMINAL = new Set(['done', 'failed', 'cancelled']);
 const failure = (code, error, hint) => ({ ok: false, code, error, hint });
@@ -80,7 +80,14 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
   function environment(key) {
     const env = { settings: {}, runtime: {} };
     try { env.runtime = getRuntime(key) || {}; } catch { env.error = failure('OWNER_DESKTOP_POLICY_UNAVAILABLE', '无法读取当前 QQ 授权策略。', retryHint); }
-    try { env.settings = getSettings() || {}; } catch { env.error = failure('OWNER_DESKTOP_POLICY_UNAVAILABLE', '无法读取当前桌面授权策略。', retryHint); }
+    try {
+      const settings = getSettings() || {};
+      env.settings = { ...settings, timeoutMs: normalizeOwnerDesktopTimeout(settings.timeoutMs) };
+    } catch (error) {
+      env.error = error?.code === 'owner-desktop.timeout-invalid'
+        ? failure('OWNER_DESKTOP_TIMEOUT_INVALID', error.message, error.hint)
+        : failure('OWNER_DESKTOP_POLICY_UNAVAILABLE', '无法读取当前桌面授权策略。', retryHint);
+    }
     return env;
   }
   function policy(env, task) {
@@ -100,9 +107,9 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
       positiveId(r?.ownerQQ), positiveId(r?.selfUserId), r?.mode, r?.epoch ?? null, r?.liveSince ?? null]);
   }
   function view(task, command = false) {
-    const { id, ownerQQ, conversationKey, sourceMessageId, sourceReceivedAt, expiresAt, status,
+    const { id, ownerQQ, conversationKey, sourceMessageId, sourceReceivedAt, timeoutMs, claimExpiresAt, claimedAt, expiresAt, status,
       sessionId, completedAt, code, error, hint, notification } = task;
-    return { id, ownerQQ, conversationKey, sourceMessageId, sourceReceivedAt, expiresAt, status,
+    return { id, ownerQQ, conversationKey, sourceMessageId, sourceReceivedAt, timeoutMs, claimExpiresAt, claimedAt, expiresAt, status,
       ...(sessionId ? { sessionId } : {}), ...(completedAt ? { completedAt } : {}),
       ...(code ? { code, error, hint } : {}), ...(notification ? { notification } : {}),
       ...(command ? { text: task.text } : {}) };
@@ -117,9 +124,13 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
     while (tasks.size > 30) tasks.delete(tasks.keys().next().value);
   }
   function check(task) {
-    const issue = now() >= task.expiresAt
-      ? failure('OWNER_DESKTOP_EXPIRED', '电脑任务已超时，原授权已撤销。', retryHint)
-      : policy(environment(task.conversationKey), task);
+    const deadline = task.status === 'pending' ? task.claimExpiresAt : task.expiresAt;
+    const unlimited = task.status === 'running' && task.timeoutMs === 0 && deadline === null;
+    const issue = !unlimited && !Number.isSafeInteger(deadline)
+      ? failure('OWNER_DESKTOP_DEADLINE_INVALID', '电脑任务期限无效，原授权已撤销。', retryHint)
+      : !unlimited && now() >= deadline
+        ? failure('OWNER_DESKTOP_EXPIRED', task.status === 'pending' ? '电脑指令未及时领取，原授权已过期。' : '电脑任务已超时，原授权已撤销。', retryHint)
+        : policy(environment(task.conversationKey), task);
     if (issue) { lastError = issue; end(task, 'cancelled', issue); }
     return issue;
   }
@@ -188,9 +199,10 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
       const busy = failure('OWNER_DESKTOP_BUSY', '已有电脑任务进行中，没有排队执行本条指令。', '等待当前任务结束，或发送“取消电脑任务”，再发一条新指令。');
       lastError = busy; await report(message, busy.error + '\n' + busy.hint); return { ...busy, handled: true };
     }
-    const timeout = Number(env.settings.timeoutMs);
+    // Even unlimited execution must be claimed while its original live message is fresh.
+    const claimExpiresAt = Math.min(message.sourceReceivedAt + OWNER_DESKTOP_PENDING_TTL_MS, message.sourceTime + MESSAGE_TTL);
     const task = { ...message, id: randomUUID(), status: 'pending', leaseId: '', binding: binding(env),
-      expiresAt: now() + Math.min(MAX_TASK_MS, Number.isFinite(timeout) && timeout > 0 ? timeout : MAX_TASK_MS) };
+      timeoutMs: env.settings.timeoutMs, claimExpiresAt, claimedAt: null, expiresAt: claimExpiresAt };
     tasks.set(task.id, task); activeId = task.id; lastError = null;
     await report(task, '已收到电脑操作任务，将在独立会话执行。发送“取消电脑任务”可停止后续动作。');
     return { ok: true, handled: true, task: view(task) };
@@ -220,6 +232,8 @@ export function createOwnerDesktopBroker({ getSettings, getRuntime, now = Date.n
     const task = found.task;
     if (task.status !== 'pending') return failure('OWNER_DESKTOP_ALREADY_CLAIMED', '任务已经被执行器领取。', '禁止再次启动同一个任务。');
     task.status = 'running'; task.leaseId = body.leaseId;
+    task.claimedAt = now();
+    task.expiresAt = task.timeoutMs === 0 ? null : task.claimedAt + task.timeoutMs;
     return { ok: true, task: view(task, true) };
   }
   function validate(body) {

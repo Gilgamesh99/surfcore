@@ -19,8 +19,22 @@ function fixture() {
 }
 test('disabled defaults and malformed authorization fail visibly', () => {
   assert.equal(readOwnerDesktopSettings(path.join(root, 'absent.json')).enabled, false);
-  for (const input of [{enabled:true}, {enabled:true,parentSessionId:'root'}, {timeoutMs:600001}, {parentSessionId:'../root'}]) assert.throws(() => normalizeOwnerDesktopSettings(input), (e) => e.code.startsWith('owner-desktop.') && Boolean(e.hint));
+  for (const input of [{enabled:true}, {enabled:true,parentSessionId:'root'}, {timeoutMs:86400001}, {parentSessionId:'../root'}]) assert.throws(() => normalizeOwnerDesktopSettings(input), (e) => e.code.startsWith('owner-desktop.') && Boolean(e.hint));
   const f=path.join(root, 'bad-config.json'); fs.writeFileSync(f,'{'); assert.throws(() => readOwnerDesktopSettings(f), {code:'owner-desktop.config-unreadable'});
+});
+test('duration defaults and explicit numeric unlimited survive configuration reads', () => {
+  assert.equal(normalizeOwnerDesktopSettings({}).timeoutMs, 600000);
+  const file = path.join(root, 'durations.json');
+  for (const timeoutMs of [0, 30000, 600000, 1800000, 86400000]) {
+    const value = normalizeOwnerDesktopSettings({ timeoutMs });
+    assert.equal(value.timeoutMs, timeoutMs);
+    fs.writeFileSync(file, JSON.stringify({ ownerDesktop: value }));
+    assert.equal(readOwnerDesktopSettings(file).timeoutMs, timeoutMs);
+  }
+});
+test('coerced zero, invalid numeric limits and non-numbers never mean unlimited', () => {
+  for (const timeoutMs of [null, false, true, '', ' ', '0', '600000', [], {}, -1, 29999, 30000.5, 86400001, NaN, Infinity, -Infinity])
+    assert.throws(() => normalizeOwnerDesktopSettings({ timeoutMs }), error => error.code === 'owner-desktop.timeout-invalid' && Boolean(error.hint));
 });
 test('private/group sessions and all modes stay managed, title is not authority', () => {
   const f=fixture(); fs.writeFileSync(path.join(f.qq,'sessions.json'),JSON.stringify({sessions:{'p:42':'private-custom','g:8':'group-custom'}}));

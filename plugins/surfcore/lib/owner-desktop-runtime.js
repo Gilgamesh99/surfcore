@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { normalizeOwnerDesktopTimeout, OWNER_DESKTOP_DEFAULT_TIMEOUT_MS, OWNER_DESKTOP_PENDING_TTL_MS } from '../../../src/owner-desktop-config.js';
 import { armOwnerDesktopBoundary, isOwnerDesktopTool } from '../../../dsh/agent-presets/owner-desktop/owner-desktop-boundary.mjs';
 export { isOwnerDesktopTool };
 
-const MAX_TIMEOUT_MS = 600_000;
 const POLL_MS = 2_000;
 const WORKER_LABEL = 'SurfCore owner desktop task';
 const WORKER_PRESET = 'owner-desktop';
@@ -89,12 +89,14 @@ export function installOwnerDesktopRuntime(ctx, {
   function settings() {
     try {
       const value = getSettings?.() ?? {};
-      const timeout = Number(value.timeoutMs);
+      const timeoutMs = normalizeOwnerDesktopTimeout(value.timeoutMs);
       return { enabled: value.enabled === true, parentSessionId: String(value.parentSessionId ?? ''),
         authorizationEpoch: String(value.authorizationEpoch ?? ''),
-        timeoutMs: Number.isFinite(timeout) && timeout > 0 ? Math.min(timeout, MAX_TIMEOUT_MS) : MAX_TIMEOUT_MS,
-        ownerQQ: String(getOwnerQQ?.() ?? '') };
-    } catch { return { enabled: false, parentSessionId: '', authorizationEpoch: '', ownerQQ: '', timeoutMs: MAX_TIMEOUT_MS }; }
+        timeoutMs, ownerQQ: String(getOwnerQQ?.() ?? '') };
+    } catch (error) {
+      if (error?.code === 'owner-desktop.timeout-invalid') lastError = failure(error.code, error.message, error.hint);
+      return { enabled: false, parentSessionId: '', authorizationEpoch: '', ownerQQ: '', timeoutMs: OWNER_DESKTOP_DEFAULT_TIMEOUT_MS };
+    }
   }
   function toolNames() {
     const schemas = toolRegistry?.definitions?.();
@@ -220,8 +222,10 @@ export function installOwnerDesktopRuntime(ctx, {
     if (!lease || active !== lease || lease.revoked || paused || disposed || lease.controller.signal.aborted || signal?.aborted)
       return failure('owner-desktop.lease-revoked', '桌面任务授权已结束。', '由主人发送一条新的桌面指令。');
     if (!configMatches(lease)) return failure('owner-desktop.settings-changed', '桌面任务设置或主人身份已经变化。', '确认设置后由主人重新发送指令。');
-    if (now() >= lease.deadline || now() >= lease.task?.expiresAt)
-      return failure('owner-desktop.expired', '桌面任务已超时或指令已过期。', '检查当前桌面状态后重新发送指令。');
+    if (lease.config.timeoutMs === 0 ? lease.deadline !== null : !Number.isSafeInteger(lease.deadline))
+      return failure('owner-desktop.deadline-invalid', '桌面任务执行期限无效。', '重载兼容的 QQ 桥接后，由主人重新发送指令。');
+    if (lease.deadline !== null && now() >= lease.deadline)
+      return failure('owner-desktop.expired', '桌面任务已达到执行时限。', '检查当前桌面状态后重新发送指令。');
     if (!rootServicesMatch())
       return failure('owner-desktop.service-changed', '宿主服务已经关闭或替换。', '重载 SurfCore 后重新启用桌面任务。');
     if (!validParent(lease.parent, lease.config))
@@ -274,6 +278,27 @@ export function installOwnerDesktopRuntime(ctx, {
     }
     return value;
   }
+  function taskTimingIssue(task, config) {
+    if (!task || task.status !== 'running' || task.timeoutMs !== config.timeoutMs
+      || !Number.isSafeInteger(task.sourceReceivedAt) || task.sourceReceivedAt <= 0
+      || !Number.isSafeInteger(task.claimedAt) || task.claimedAt < task.sourceReceivedAt || task.claimedAt > now()
+      || !Number.isSafeInteger(task.claimExpiresAt) || task.claimedAt >= task.claimExpiresAt
+      || task.claimExpiresAt > task.sourceReceivedAt + OWNER_DESKTOP_PENDING_TTL_MS
+      || (config.timeoutMs === 0 ? task.expiresAt !== null
+        : !Number.isSafeInteger(task.expiresAt) || task.expiresAt !== task.claimedAt + config.timeoutMs))
+      return failure('owner-desktop.deadline-invalid', '桥接任务缺少有效的领取时间或执行期限。', '重载兼容的 QQ 桥接后，由主人重新发送实时指令。');
+    return null;
+  }
+  async function validateLease(lease) {
+    const checked = await call('validate', { taskId: lease.taskId, leaseId: lease.leaseId });
+    if (!checked.ok) return checked;
+    const timing = taskTimingIssue(checked.task, lease.config);
+    if (timing) return timing;
+    if (['id', 'ownerQQ', 'conversationKey', 'sourceMessageId', 'sourceReceivedAt', 'timeoutMs', 'claimExpiresAt', 'claimedAt', 'expiresAt']
+      .some(key => checked.task[key] !== lease.task[key]))
+      return failure('owner-desktop.task-changed', '桥接任务身份或执行期限已经变化。', '停止当前任务，由主人重新发送指令。');
+    return checked;
+  }
   function ticketIdentity(exec) {
     return typeof exec?.token === 'symbol' && typeof exec.callId === 'string' && typeof exec.rootCallId === 'string';
   }
@@ -294,7 +319,7 @@ export function installOwnerDesktopRuntime(ctx, {
       return { kind: 'deny', reason: denial(issue ?? failure('owner-desktop.tool-denied', '桌面子代理不能调用这个工具。', '仅使用已授权的 Windows 桌面工具。')) };
     const decision = await next();
     if (decision?.kind !== 'allow') return decision;
-    const checked = await call('validate', { taskId: lease.taskId, leaseId: lease.leaseId });
+    const checked = await validateLease(lease);
     const changed = leaseIssue(lease, exec.agent, exec.signal);
     if (!checked.ok || changed) {
       const reason = changed ?? checked;
@@ -414,7 +439,7 @@ export function installOwnerDesktopRuntime(ctx, {
     const lease = { taskId, leaseId: newLeaseId(), childId: newChildId(), config, parent: null, child: null, task: null, record: null,
       phase: 'claiming', controller: new AbortController(), ready: deferred(), candidates: new Map(),
       tickets: new Map(), published: false, revoked: null, stepAccepted: false, ended: false, settled: false,
-      deadline: now() + config.timeoutMs, done: deferred() };
+      deadline: undefined, done: deferred() };
     active = lease;
     publish();
     let run;
@@ -427,7 +452,7 @@ export function installOwnerDesktopRuntime(ctx, {
       heartbeat = setTimer(async () => {
         const changed = leaseIssue(lease);
         if (changed) { revoke(lease, changed); return; }
-        const checked = await call('validate', { taskId, leaseId: lease.leaseId });
+        const checked = await validateLease(lease);
         if (active === lease && !lease.ended && !checked.ok) revoke(lease, checked);
         watch();
       }, POLL_MS);
@@ -437,14 +462,17 @@ export function installOwnerDesktopRuntime(ctx, {
       const claim = await call('claim', { taskId, leaseId: lease.leaseId });
       if (!claim.ok) { lastError = claim; return; }
       claimedTask = true;
-      lease.task = claim.task;
+      lease.task = claim.task ? Object.freeze({ ...claim.task }) : null;
       if (!lease.task || lease.task.id !== taskId || String(lease.task.ownerQQ) !== config.ownerQQ
-        || typeof lease.task.text !== 'string' || !lease.task.text.trim() || !Number.isFinite(lease.task.expiresAt)
+        || typeof lease.task.text !== 'string' || !lease.task.text.trim()
         || typeof lease.task.sourceMessageId !== 'string' || !lease.task.sourceMessageId
         || !Number.isFinite(lease.task.sourceReceivedAt) || !lease.task.conversationKey) {
         completion = failure('owner-desktop.invalid-task', '桥接任务缺少可信消息来源。', '由主人重新发送实时桌面指令。');
         return;
       }
+      const timing = taskTimingIssue(lease.task, config);
+      if (timing) { completion = timing; return; }
+      lease.deadline = lease.task.expiresAt;
       const host = inspectHost(config);
       if (host.issue) { completion = host.issue; return; }
       lease.parent = host.parent;
@@ -454,12 +482,14 @@ export function installOwnerDesktopRuntime(ctx, {
       lease.providerIdentity = serviceIdentity(host.provider);
       const invalid = leaseIssue(lease);
       if (invalid) { completion = invalid; return; }
-      const validated = await call('validate', { taskId, leaseId: lease.leaseId });
+      const validated = await validateLease(lease);
       if (!validated.ok) { completion = validated; return; }
       const stale = leaseIssue(lease);
       if (stale) { completion = stale; return; }
-      timeout = setTimer(() => revoke(lease, failure('owner-desktop.timeout', '桌面任务已达到时间上限。', '先确认当前桌面状态，再发送新的指令。')), Math.max(1, Math.min(lease.deadline, lease.task.expiresAt) - now()));
-      timeout?.unref?.();
+      if (lease.deadline !== null) {
+        timeout = setTimer(() => revoke(lease, failure('owner-desktop.timeout', '桌面任务已达到时间上限。', '先确认当前桌面状态，再发送新的指令。')), Math.max(1, lease.deadline - now()));
+        timeout?.unref?.();
+      }
       watch();
       if (typeof lease.childId !== 'string' || !lease.childId || agentRegistry.get(lease.childId) || isWorkerSession(lease.childId)) {
         completion = failure('owner-desktop.child-id-unavailable', '无法预留全新的桌面任务身份。', '重新发送指令以生成新的独立任务。');

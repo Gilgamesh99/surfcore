@@ -181,6 +181,18 @@ try {
   assert.equal(disabled.status, 200, JSON.stringify(disabled.data)); assert.equal(disabled.data.settings.enabled, false); assert.ok(disabled.data.settings.authorizationEpoch);
   const diskDesktop = readJson(path.join(tempState, 'config.json')).ownerDesktop;
   assert.equal(diskDesktop.authorizationEpoch, disabled.data.settings.authorizationEpoch);
+  let durationEpoch = diskDesktop.authorizationEpoch;
+  for (const timeoutMs of [1800000, 86400000, 0]) {
+    const saved = await invoke('POST', '/owner-desktop', { enabled: false, timeoutMs, expectedEpoch: durationEpoch }, { 'x-test-browser': 'owner' });
+    assert.equal(saved.status, 200, JSON.stringify(saved.data));
+    assert.equal(saved.data.settings.timeoutMs, timeoutMs);
+    durationEpoch = saved.data.settings.authorizationEpoch;
+    assert.equal(readJson(path.join(tempState, 'config.json')).ownerDesktop.timeoutMs, timeoutMs);
+    const reread = await invoke('GET', '/owner-desktop'); assert.equal(reread.data.settings.timeoutMs, timeoutMs);
+  }
+  const invalidDuration = await invoke('POST', '/owner-desktop', { enabled: false, timeoutMs: null, expectedEpoch: durationEpoch }, { 'x-test-browser': 'owner' });
+  assert.equal(invalidDuration.data.code, 'owner-desktop.timeout-invalid'); assert.ok(invalidDuration.data.hint);
+  assert.equal(readJson(path.join(tempState, 'config.json')).ownerDesktop.authorizationEpoch, durationEpoch);
   // Exercise the real generic owner-save route twice without any worker heartbeat in between.
   const unifiedFile = path.join(tempState, 'config.json');
   const priorOwner = String(readJson(qqFile).ownerQQ);
