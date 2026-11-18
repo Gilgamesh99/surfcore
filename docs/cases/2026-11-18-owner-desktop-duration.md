@@ -22,7 +22,9 @@
 
 专项验证已通过：broker22项、真实桥接 wiring14项、运行时56组、来源策略12项、设置控制10项（含宿主保留旧ESM模块时的重载复现）、独立预设7项；真实授权API（0/24小时保存回读、非法值不写入、主人ABA撤权）及隔离宿主加载通过。模拟时钟覆盖准确截止、不限时跨24小时、取消/断连/身份变化，以及缺失或篡改期限拒绝。
 
-`npm run test:audit`完整运行162/165：隔离表情配置层级已修正，独立复验72/72；Git更新夹具超过审计240秒包装时限，独立复验22/22。余下R11 Markdown耗时检查阈值500ms，本分支独立复验664ms，未修改的生产基线4f0ce2f同样1068ms失败；其源文件和断言均未变，记录为既有性能问题，不宣称全绿。其余桥接回归16项通过。首次集成已快进生产，但插件因宿主保留旧共享模块而未激活；恢复修复已验证，等待实际重新加载。未推送、未发布、未发送QQ测试消息。长时间真实游戏未运行，验证使用模拟时钟。
+`npm run test:audit`完整运行162/165：隔离表情配置层级已修正，独立复验72/72；Git更新夹具超过审计240秒包装时限，独立复验22/22。余下R11 Markdown耗时检查阈值500ms，本分支独立复验664ms，未修改的生产基线4f0ce2f同样1068ms失败；其源文件和断言均未变，记录为既有性能问题，不宣称全绿。其余桥接回归16项通过。首次集成遇到宿主旧ESM缓存，已用共享options模块修复并恢复插件。实际加载代码e5edf67，QQ桥接已重启到PID20496；当前授权enabled=true、timeoutMs=0，运行时idle且无错误，reserved2/DSH/SnowLuma均在线。真实原作者更新检查仍为upstream/main、preserve-local、dirty=0，除授权设置外原配置保持不变。未推送、未发布、未发送QQ测试消息。长时间真实游戏未运行，验证使用模拟时钟。
+
+本机验收记录：`D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-duration-verification-20261118.json`；备份：`D:/ProgramData/DSH NEXT/Soul/backups/surfcore-owner-desktop-duration-20261118`。刷新现有GUI后的QQ设置卡片已显示“不限时（完成或手动取消）”，启用框勾选、状态等待主人指令；24小时选项存在。截图为 `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-duration-ui.png`。最终文档/清单提交后再次核对实际HEAD和更新来源。
 
 ## 热加载兼容
 
