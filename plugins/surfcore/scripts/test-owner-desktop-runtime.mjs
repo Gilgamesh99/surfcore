@@ -521,7 +521,10 @@ await check('ordinary QQ and Bili classification denies Windows without affectin
   for (const id of ['qq-reserved2', 'qq-closed-agent', 'qq-friend', 'bili-comment']) {
     const ordinary = agent(id); f.agents.set(id, ordinary);
     for (const name of ['windows_desktop', 'windows_mcp_doctor', 'mcp__windows__Screenshot']) {
-      assert.match(await f.execute(f.exec(name, ordinary)), /owner-task-required/);
+      const rejected = await f.execute(f.exec(name, ordinary));
+      assert.match(rejected, /owner-task-required/);
+      assert.match(rejected, /主人可在 QQ 私聊直接发送一条新消息「电脑：打开B站」/);
+      assert.match(rejected, /主人私聊不需要群聊 @/);
       assert.match(f.guard(f.exec(name, ordinary)), /owner-task-required/, 'late hooks cannot force allow');
     }
     assert.equal(await f.execute(f.exec('qq_send_message', ordinary)), undefined);

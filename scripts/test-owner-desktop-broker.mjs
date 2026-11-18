@@ -34,6 +34,44 @@ await test('only explicit commands and direct natural computer requests are capt
   for (const text of ['今天天气不错', '电脑坏了怎么办', '你能在电脑上打开浏览器吗？', '不要用电脑打开网页', '有人说“电脑：打开网页”', '“电脑：打开网页”', '如果有空在电脑上打开网页', '桌面：', '电脑：' + 'x'.repeat(8001)]) assert.equal(ownerDesktopIntent(text), null, text.slice(0, 30));
   assert.equal(ownerDesktopIntent('取消电脑任务')?.kind, 'cancel');
 });
+await test('explicit Windows-MCP requests preserve the owner text without treating discussion as commands', () => {
+  for (const text of [
+    '你使用Windows-MCP控制我的电脑，打开b站刷一会',
+    '请你用 Windows-MCP 在我的电脑上打开B站',
+    '帮我使用 windows mcp 打开浏览器',
+    '麻烦你通过 Computer Use 操作这台电脑，打开记事本',
+    '电脑：打开 https://www.bilibili.com/video/BV1xx/?p=2',
+    '你使用Windows-MCP打开 https://www.bilibili.com/video/BV1xx/?p=2',
+    '电脑：打开B站，不要登录',
+  ]) assert.deepEqual(ownerDesktopIntent(text), { kind: 'command', text });
+  for (const text of [
+    '不要使用Windows-MCP控制我的电脑，打开B站',
+    '你不要用Windows-MCP打开B站',
+    '先别使用Windows-MCP打开B站',
+    '你能使用Windows-MCP打开B站吗？',
+    '你使用Windows-MCP打开B站吗',
+    '你使用Windows-MCP打开B站？我只是问问',
+    '如果有空你使用Windows-MCP打开B站',
+    '你使用Windows-MCP时不要打开B站',
+    '有人说“你使用Windows-MCP控制我的电脑，打开B站”',
+    '“你使用Windows-MCP控制我的电脑，打开B站”',
+    '你使用Windows-MCP控制我的电脑',
+    '你使用Windows-MCP控制我的电脑，不要打开B站',
+    '使用Windows-MCP的教程怎么写',
+    '看看要不要登陆',
+    '电脑：不要打开B站',
+    '电脑：如果我回来就打开B站',
+    '电脑：打开B站吗',
+    '电脑：“打开B站”是个示例',
+    '请在电脑打开B站的话需要先登录',
+    '电脑：请不要打开B站',
+    '电脑：请你先不要打开B站',
+    '电脑：先不要打开B站',
+    '你使用Windows-MCP打开B站的话请先告诉我',
+    '你使用Windows-MCP打开B站需要什么权限',
+    '你使用Windows-MCP打开B站，这只是举例，不要执行',
+  ]) assert.equal(ownerDesktopIntent(text), null, text);
+});
 await test('private and typed group @ create isolated tasks without exposing command outside claim', async () => {
   for (const kind of ['private', 'group']) {
     const f = fixture(); const id = await accepted(f, kind);

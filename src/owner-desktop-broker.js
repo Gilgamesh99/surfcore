@@ -25,8 +25,18 @@ export function ownerDesktopIntent(value) {
   if (!text || text.length > 8_000 || /[?？]$/u.test(text)) return null;
   const explicit = /^(?:电脑|桌面)(?:操作|任务)?\s*[:：]\s*(.+)$/su.exec(text)
     ?? /^computer use\s*[:：]\s*(.+)$/isu.exec(text);
-  const natural = /^(?:请|麻烦)?(?:你)?(?:帮我)?(?:在|用|操作)?(?:我的|这台)?(?:电脑|桌面)(?:上)?(?:帮我)?(?:打开|关闭|点击|双击|输入|搜索|查找|截图|查看|切换|滚动|播放|暂停|保存|下载|上传|运行|启动|操作|选中|复制|粘贴|移动|拖动|浏览|整理).+/u.test(text);
-  return explicit || natural ? { kind: 'command', text } : null;
+  const natural = /^(?:请|麻烦)?\s*(?:你)?\s*(?:帮我)?\s*(?:在|用|使用|操作|控制)?\s*(?:我的|这台)?(?:电脑|桌面)(?:上)?\s*(?:帮我)?\s*[,，:：]?\s*(.+)$/su.exec(text);
+  const namedTool = /^(?:请|麻烦)?\s*(?:你)?\s*(?:帮我)?\s*(?:用|使用|通过)\s*(?:Windows[\s-]*MCP|Computer\s+Use)(?:\s*工具)?\s*(?:来|帮我)?\s*(?:(?:控制|操作|在)\s*(?:我的|这台)?(?:电脑|桌面)(?:上)?\s*[,，:：]?\s*)?(?:来\s*)?(.+)$/isu.exec(text);
+  const body = (explicit ?? natural ?? namedTool)?.[1].trim();
+  if (!body) return null;
+  // A tool name is not enough: require a direct action, never a quoted/conditional/question example.
+  const prose = body.replace(/https?:\/\/[^\s<>"'“”‘’，。！？；]+/giu, '[URL]');
+  if (/^(?:(?:请|麻烦)\s*)?(?:你\s*)?(?:先\s*)?(?:不要|不用|别|勿|禁止|取消|停止|终止|如果|假如|假设|要是|若|等我|有人说|例如|比如|示例|[“‘「『"'])/u.test(prose)
+      || /[?？]|(?:吗|么|呢)[。！!]*$|的话(?:[，,\s]|请|需要|要|先|再|才|就|$)/u.test(prose)
+      || /(?:需要什么(?:权限|条件)|要多久)[。！!]*$/u.test(prose)
+      || /(?:^|[，,。；;])\s*(?:这(?:只)?是(?:举例|示例)|(?:请)?(?:不要|别|勿)执行)/u.test(prose)) return null;
+  if (!explicit && !/^(?:打开|关闭|点击|双击|输入|搜索|查找|截图|查看|切换|滚动|播放|暂停|保存|下载|上传|运行|启动|操作|选中|复制|粘贴|移动|拖动|浏览|整理).+/su.test(body)) return null;
+  return { kind: 'command', text };
 }
 
 /** Only the real transport caller supplies source; event fields never supply it. */

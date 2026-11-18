@@ -85,6 +85,27 @@ await test('real private/group transport callbacks alone mint isolated tasks bef
   const ledger = JSON.parse(fs.readFileSync(path.join(h.temp, 'state/owner-desktop-consumed.json'), 'utf8'));
   assert.equal(ledger.length, 2); assert.deepEqual(Object.keys(ledger[0]).sort(), ['digest', 'until']);
 });
+await test('original Windows-MCP owner request enters the isolated task from real private/group callbacks', async h => {
+  const text = '你使用Windows-MCP控制我的电脑，打开b站刷一会';
+  h.settings.timeoutMs = 0;
+  for (const kind of ['private', 'group']) {
+    const event = h.event(kind);
+    event.message.at(-1).data.text = text;
+    await h.live[kind](event);
+    const pending = await h.request('pending');
+    assert.equal(pending.data.tasks.length, 1, kind + ': natural owner command must reach desktop intake');
+    assert.equal(h.calls.prompts.length, 0, 'desktop command must not enter the shared QQ model');
+    assert.equal(h.getSocialV2State(kind === 'private' ? 'private:123' : 'group:456').unread.length, 0);
+    const taskId = pending.data.tasks[0].id;
+    const claimed = await h.request('claim', { method: 'POST', body: { taskId, leaseId } });
+    assert.equal(claimed.status, 200);
+    assert.equal(claimed.data.task.text, text);
+    assert.equal(claimed.data.task.timeoutMs, 0);
+    assert.equal(claimed.data.task.expiresAt, null);
+    assert.equal(claimed.data.task.conversationKey, kind === 'private' ? 'private:123' : 'group:456');
+    assert.equal((await h.request('complete', { method: 'POST', body: { taskId, leaseId, status: 'done', output: 'fixture complete' } })).status, 200);
+  }
+});
 await test('direct/history-shaped handleIncoming cannot create a task; ordinary owner chat still queues QQ unread', async h => {
   await h.handleIncoming('private', 123, h.event(), h.cfg);
   assert.equal((await h.request('pending')).data.tasks.length, 0);

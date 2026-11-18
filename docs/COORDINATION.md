@@ -18,6 +18,7 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **主人私聊桌面指令识别（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-intent` | `feat/owner-desktop-intent`（基线cd36c1c） | Lead修复明确Windows-MCP自然指令与私聊提示；队友只读边界复核 | 原句旧版失败已复现；broker23、真实接收回调15、运行时56及设置/API/宿主检查通过，完整审计165/165；准备本机集成，未重放历史命令或发送测试消息 |
 | **主人桌面长任务（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-duration` | `feat/owner-desktop-duration`（基线4f0ce2f） | Lead负责UI/配置接口验证/集成，队友负责时限语义与测试 | 已集成本机并启用不限时；插件/桥接在线、原作者更新与配置保持；缓存兼容复现和时限/权限专项通过，审计162/165后两项复验通过，R11旧基线同样超时；未推送/发布/长期游戏实测 |
 | **主人专用 Computer Use（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-computer-use` | `feat/owner-computer-use`（基线6d25f3a） | 保留仿真模式，真实主人私聊/群@受控桌面任务；Lead整合，队友只读权限与身份审查 | 已集成本机 dev 并启用，runtime idle、QQ reserved2在线、原更新来源保留；49项插件脚本及最终50组运行时/API/预设/宿主检查通过，完整QQ桌面动作尚未实发验收；未推送/发布 |
 | **Fork dev 与原作者更新（2026-11-17）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-fork-dev` | `feat/fork-dev-upstream`（基线f80a5a2） | 双远程、本地dev推送、独立upstream/main更新；Lead管Git/配置，队友仅更新器源码与测试 | 两边历史完整保留；生产dev双远程已生效，原作者更新真实回读通过；审计163/163、专项与清单通过；仅fork/dev推送，服务端最终SHA见case所列验收记录 |

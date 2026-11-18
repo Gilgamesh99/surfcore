@@ -306,7 +306,7 @@ export function installOwnerDesktopRuntime(ctx, {
   function ordinaryDenial(exec) {
     if (!exec.agent || !isOwnerDesktopTool(exec.name)) return undefined;
     try { if (!isOtherManaged(exec.agent)) return undefined; } catch { /* Classification failure cannot enable Windows. */ }
-    return 'owner-desktop.owner-task-required: 普通 QQ 与 B站会话不能操作电脑。请由主人私聊或在群里 @ SurfCore 发送独立桌面指令。';
+    return 'owner-desktop.owner-task-required: 当前普通聊天会话不能直接操作电脑。主人可在 QQ 私聊直接发送一条新消息「电脑：打开B站」；群聊则需主人真正 @ 当前机器人后发送同样指令。主人私聊不需要群聊 @，已启用的桌面授权无需重复放行。';
   }
   async function preExecute(exec, next) {
     if (!managed(exec.agent)) {
