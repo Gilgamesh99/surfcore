@@ -1,6 +1,6 @@
 # 主人桌面使用独立连续会话
 
-日期：2026-11-18。基线：dev a8e4f8226600bab4590dcadb82412aa23d245349。隔离分支：feat/owner-desktop-conversation。当前阶段：实现与集成验证中，尚未部署。
+日期：2026-11-18。基线：dev a8e4f8226600bab4590dcadb82412aa23d245349。隔离分支：feat/owner-desktop-conversation。当前阶段：已集成本机dev并验收；运行代码2340d5e490f30adbd452268bad98c5ddfcc295cc，后续提交仅补验收文档和清单。
 
 ## 现象与证据
 
@@ -31,7 +31,7 @@
 3. **影响面**：桥接与宿主两个进程，broker/runtime、持久索引、原QQ短回执和设置界面共同读取状态。桌面索引仅存来源身份、QQ/child ID和reserved/ready，创建前留不可淘汰的deny记录；损坏、删除、锁定或容量满均关闭通道。按2进程×约4读者×可见错误1=8评估，需要身份、时序、停止和原QQ回归。配置与原会话不复制、不重置。
 4. **取舍**：独立桌面历史符合用户最终要求，避免长时间视觉工具挤占聊天上下文；直接复用旧管理子会话会继承错误来源并混淆授权，所以仅复用按主人、bot、来源会话精确绑定的新索引。官方startActivation创建、sendMessage冷恢复保留历史；每次使用来源QQ当前模型与桥接当前人格。准确拦截已登记child→该QQ的宿主settlement通知，主QQ仅收桥接短回执。
 5. **生效与重启**：桥接源码需重启桥接；宿主runtime、专用预设和客户端需正式插件重载并刷新既有GUI。注册并resolve新owner-desktop-conversation预设，不能只凭插件active判通过。稳定gate与boundary同放在外部预设目录，插件只重导出，避免宿主仅驱逐插件包缓存后出现两份WeakMap；今后修改外部gate实现必须完整重启DSH，或验证boundary与gate确实同时失效换代；单纯关开SurfCore不能宣称此实现已升级。原QQ守卫及QQ预设不改，不需更新QQ的旧预设代际。旧parentSessionId兼容保留但不再用作执行父级。
-6. **验证**：真实回调模拟私聊/群@、伪造过期引用；prepare/bind来源与目标分离、映射变化；真实host消息对象/receipt/claimed/pre-step时序；当前模型、独立历史、冷恢复同ID；仅主人续接取消，真实停止证明；终态与接收ack分离、排队进度竞态；普通QQ不受busy或inbox影响；Computer Use关闭或native边界缺失可见失败；索引并发/删盘/写失败；UI只导航不发送。broker33、桥接接收22、最终runtime36组、索引23、专用预设8、设置10与实际API/客户端/宿主检查通过；完整插件测试通过后，停止恢复改动另跑最终runtime36组通过。最终全仓audit162/165；R11性能、语音包导入和更新结果三项单独复验全部通过，未修改对应实现或放宽断言。新增缓存外部boundary、两次重新导入插件模块的回归先复现失败，再由稳定gate修复；修后preset8/runtime36/settings10/API/隔离host复验通过。本机验收待补齐。
+6. **验证**：真实回调模拟私聊/群@、伪造过期引用；prepare/bind来源与目标分离、映射变化；真实host消息对象/receipt/claimed/pre-step时序；当前模型、独立历史、冷恢复同ID；仅主人续接取消，真实停止证明；终态与接收ack分离、排队进度竞态；普通QQ不受busy或inbox影响；Computer Use关闭或native边界缺失可见失败；索引并发/删盘/写失败；UI只导航不发送。broker33、桥接接收22、最终runtime36组、索引23、专用预设8、设置10与实际API/客户端/宿主检查通过；完整插件测试通过后，停止恢复改动另跑最终runtime36组通过。最终全仓audit162/165；R11性能、语音包导入和更新结果三项单独复验全部通过，未修改对应实现或放宽断言。新增缓存外部boundary、两次重新导入插件模块的回归先复现失败，再由稳定gate修复；修后preset8/runtime36/settings10/API/隔离host复验通过。本机验收已通过，见下段。
 7. **回滚与残余**：revert本批代码、按提交对象重生成安装清单并重载桥接/宿主；保留配置备份和历史索引，不删除会话。历史任务不重放，断连后需主人发新指令；不限时取消总时限，模型回合结束仍收尾，继续指令重用历史而不自动重启。真实游戏或直播不在本次自动验证中，不发送QQ测试消息。
 
 ## 用户可见行为
@@ -45,7 +45,9 @@
 
 ## 本机验收
 
-待记录最终HEAD、新专用预设正式就绪、同一GUI截图、桥接PID、配置保留哈希与upstream/main preserve-local实际检查。尚未宣称完整QQ桌面实操通过。
+2026-11-18 13:31（Asia/Shanghai）正式插件关开、生产ff-only至2340d5e后，桥接PID19848→28876，reserved2、DSH与SnowLuma均在线。既有GUI http://127.0.0.1:51360 的主人桌面卡片已刷新：独立历史/来源QQ人格模型/第一条新任务创建提示均可见，不限时0仍选中。专用预设正式注册就绪，executionMode=desktop-conversation，runtime与broker均ok、idle、lastError=null；新索引尚无任务，未为验收伪造桌面历史或发送QQ指令。六份配置SHA逐字节一致，双远程/跟踪origin/dev保留；实际fetch upstream/main结果preserve-local、ahead39/behind0/dirty0（文档追加后ahead增加）。
+
+验收JSON：[本机运行证据](<D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-conversation-verification-20261118.json>)；界面：[主人桌面卡片](<D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-conversation-ui.png>)；备份位于工作区backups/surfcore-owner-desktop-conversation-20261118/activation。版本仍0.8.9，未推送或发布；新链路完整QQ桌面实操及长期游戏没有实发验证。
 
 ## 发布交接块
 
