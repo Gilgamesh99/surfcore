@@ -34,6 +34,8 @@ QQ 桥接在原有聊天入口识别当前 OneBot 连接的实时消息，核对
 
 同时修复了协议回归里已有的 QQ 文本格式耗时问题。R11 两次分别耗时 1389 和 1021 毫秒，超过 500 毫秒门限。Markdown 图片和链接都要求右括号。没有右括号的输入可以跳过两次匹配。保留原有计时断言与转换用例。[QQ 文本格式](../../src/md-to-plain.js)
 
+Windows 的更新测试会多次启动 PowerShell 打包。在整仓运行中两次达到 60 秒的外层时限，单独完成约需 66 秒，因此该用例在 Windows 上获得 120 秒的总时限。用例自身的产物、校验及回滚断言继续执行。
+
 覆盖正式入站分流、宿主 RPC 和事件还原、成品校验、SDK 附件回执和桥接重启。集成用例实际运行温度换算 CLI，再运行从内存网关取回的附件。独立 DSH 抽查另外制作了一个数字乘二工具，前台 TAP 验收通过，取回的附件以 21 为输入，输出 42。测试使用隔离工作区与模拟 QQ 收件人。
 
 建议 minor。QQ 桥接新增可选交互，普通聊天和旧状态兼容。变更涉及 [QQ 入站](../../src/qq-coding-intent.js)、[宿主会话](../../src/qq-coding-dsh.js)、[任务状态](../../src/qq-coding-tasks.js)、[附件交付](../../src/qq-coding-delivery.js)、[桥接接线](../../src/bridge.js)和[端到端回归](../../scripts/test-qq-coding-flow.mjs)。全量门禁为 `npm run test:audit`，协议回归为 `npm run test:regressions`。真实 QQ 客户端收件和实际群文件配额仍取决于部署时的账号与网关。

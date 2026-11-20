@@ -304,12 +304,15 @@ const tests = [
   // 唤醒人格卡注入：二代唤醒必须带人格卡正文，且与 qq_get_prompt 同源（2026-11-01 A1）。
   'test-persona-wake-injection.mjs',
 ];
+const timeouts = {
+  'test-update-git-apply.mjs': 240_000, // Creates multiple real Git repositories.
+  'test-update-apply-result.mjs': process.platform === 'win32' ? 120_000 : 60_000, // Builds multiple archives with PowerShell.
+};
 let failed = 0;
 for (const test of tests) {
   console.log(`\nRunning ${test}`);
   const result = spawnSync(process.execPath, [path.join(root, 'scripts', test)], {
-    // Real Git transactions create many repositories; Windows process startup needs a larger bounded budget.
-    cwd: root, stdio: 'inherit', timeout: test === 'test-update-git-apply.mjs' ? 240000 : 60000,
+    cwd: root, stdio: 'inherit', timeout: timeouts[test] ?? 60_000,
     env: { ...process.env, QQ_BRIDGE_TEST_LIVE: '0' },
   });
   if (result.status !== 0 || result.error) {
