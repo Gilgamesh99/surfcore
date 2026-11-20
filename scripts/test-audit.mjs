@@ -11,6 +11,7 @@ const tests = [
   // QQ scoped 工具：晚注册的全局危险工具也要补装 Schema 限制。
   'test-qq-tool-restrict-events.mjs',
   'test-owner-desktop-broker.mjs', 'test-owner-desktop-wiring.mjs',
+  'test-qq-coding-intent.mjs', 'test-qq-coding-dsh.mjs', 'test-qq-coding-delivery.mjs', 'test-qq-coding-flow.mjs',
   // Controlled generation, safe owned artifacts, MCP adapter and mocked OneBot delivery.
   'test-generated-images.mjs', 'test-magpie-image-backend.mjs', 'test-generated-image-flow.mjs',
   // DSH Desktop 安装目录里的 node 解析；bridge/scheduler/setup 共用同一个入口。
@@ -303,12 +304,15 @@ const tests = [
   // 唤醒人格卡注入：二代唤醒必须带人格卡正文，且与 qq_get_prompt 同源（2026-11-01 A1）。
   'test-persona-wake-injection.mjs',
 ];
+const timeouts = {
+  'test-update-git-apply.mjs': 240_000, // Creates multiple real Git repositories.
+  'test-update-apply-result.mjs': process.platform === 'win32' ? 120_000 : 60_000, // Builds multiple archives with PowerShell.
+};
 let failed = 0;
 for (const test of tests) {
   console.log(`\nRunning ${test}`);
   const result = spawnSync(process.execPath, [path.join(root, 'scripts', test)], {
-    // Real Git transactions create many repositories; Windows process startup needs a larger bounded budget.
-    cwd: root, stdio: 'inherit', timeout: test === 'test-update-git-apply.mjs' ? 240000 : 60000,
+    cwd: root, stdio: 'inherit', timeout: timeouts[test] ?? 60_000,
     env: { ...process.env, QQ_BRIDGE_TEST_LIVE: '0' },
   });
   if (result.status !== 0 || result.error) {
