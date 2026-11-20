@@ -20,7 +20,7 @@ function fixture(initial = { sandbox: 'workspace-write', approval: 'ask' }) {
   const api = new NodeApiClient('http://example.invalid', 1000, {});
   const row = { workspaceId: 'workspace-1', path: workspace, sessionIds: [] };
   const events = [], calls = [], prompts = new Map();
-  const state = { sessionId: null, title: null, agentPreset: 'standard', directory: workspace, pageLimit: 4 };
+  const state = { sessionId: null, title: null, agentPreset: 'standard', directory: workspace, initialDirectory: workspace, pageLimit: 4 };
   const append = (type, data) => events.push({ type: 'event', event: { seq: events.length, time: 1_780_000_000_000 + events.length, type, data } }) - 1;
   function response(method, args) {
     switch (method) {
@@ -38,7 +38,7 @@ function fixture(initial = { sandbox: 'workspace-write', approval: 'ask' }) {
         append('approval/policy', { policy: initial.approval });
         return { sessionId: state.sessionId, agentPreset: state.agentPreset };
       }
-      case 'session/list': return { items: [{ sessionId: state.sessionId, cwd: workspace }] };
+      case 'session/list': return { items: [{ sessionId: state.sessionId, cwd: state.initialDirectory }] };
       case 'session/projections': return args.sessionId === state.sessionId ? { kind: 'sequenced', asOfSeq: events.length - 1,
         values: { agentPreset: state.agentPreset, workingDirectory: state.directory, title: state.title } } : null;
       case 'commands/execute': {
@@ -95,10 +95,11 @@ function fixture(initial = { sandbox: 'workspace-write', approval: 'ask' }) {
     append('user/message', user(id));
   };
   const toolCall = (name, args, id = 'c', turn = 1) => append('tool/call', { turn, step: 1, callId: id, arguments: JSON.stringify(args), name });
-  const toolResult = (text, id = 'c', turn = 1, error) => append('tool/result', { turn, step: 1,
-    message: { role: 'toolResult', toolCallId: id, source: { kind: 'tool', callId: id }, content: content(text), ...(error && { isError: true }) }, ...(error && { error }) });
+  const toolResult = (text, id = 'c', turn = 1, error, meta) => append('tool/result', { turn, step: 1,
+    message: { role: 'toolResult', toolCallId: id, source: { kind: 'tool', callId: id }, content: content(text), ...(error && { isError: true }) }, ...(error && { error }), ...(meta && { meta }) });
   const end = (turn = 1, reason = { kind: 'completed' }) => append('turn/end', { turn, reason });
   return { api, host, calls, prompts, state, row, events, append, startTurn, end, toolCall, toolResult,
+    cd: cwd => { state.directory = cwd; append('working-directory/change', { cwd }); },
     create: () => host.create({ taskId, workspace }), fresh: () => createCodingDsh({ api }),
     methods: method => calls.filter(call => call.method === method), snapshot: () => host.snapshot(state.sessionId) };
 }
@@ -138,8 +139,9 @@ test('丢失创建与投递回执后重试同一会话、同一 durable requestI
   const args = { sessionId: sid, taskId, task: '制作可运行的小程序' };
   h.state.loseNext = 'session/prompt';
   await assert.rejects(resumed.start(args), /connection closed/);
+  const existingLists = h.methods('session/list').length;
   assert.deepEqual(await h.fresh().start(args), { requestId });
-  assert.equal(h.methods('session/list').length, 1, 'cold callers can omit workspace');
+  assert.equal(h.methods('session/list').length, existingLists + 1, 'cold callers recover the immutable initial cwd once');
   assert.equal(h.methods('session/prompt').length, 2);
   assert.notEqual(h.methods('session/prompt')[0].rpcId, h.methods('session/prompt')[1].rpcId);
   assert.equal(h.prompts.size, 1);
@@ -224,6 +226,7 @@ test('PTC 单文本 JSON 回执必须属于原生 ops_bash 子调用且完整成
     [{ exitCode: 1 }, false], [{ exitCode: null }, false], [{ timedOut: true }, false], [{ signal: 'SIGKILL' }, false],
     [{ failure: { code: 'spawn-failed' } }, false], [{ stderr: { text: 'error' } }, false],
     [{ stdout: { text: tap, truncated: true } }, false], [{ stdout: { text: tap.replace('# fail 0', '# fail 1') } }, false],
+    [{ resolvedFrom: workspace }, true], [{ resolvedFrom: path.resolve('foreign') }, false], [{ resolvedFrom: null }, false],
     [{}, false, 'pwsh'], [{}, false, 'ops_bash', 'unrelated'],
   ]) {
     const h = fixture(); await h.create(); h.startTurn(); h.toolCall('run_code', { code: 'fixture' }, 'root');
@@ -262,6 +265,66 @@ test('单个 shell 回执必须在任务轮内对上真实命令、调用、命�
   const mixed = fixture(); await mixed.create(); mixed.startTurn(); mixed.append('user/message', user('foreign-rpc'));
   mixed.toolCall('bash', { command }); mixed.toolResult(tap); mixed.end();
   assert.equal((await mixed.snapshot()).runs[0].executionVerified, false);
+});
+
+test('按原生日志重放工作目录，返回根目录后须重新验收', async () => {
+  const h = fixture(), sid = await h.create(), elsewhere = path.join(workspace, 'subdirectory');
+  async function verify(expected) {
+    const hot = await h.host.snapshot(sid, workspace);
+    assert.equal(hot.runs[0].executionVerified, expected);
+    assert.equal(hot.runs[0].verifiedAt !== null, expected);
+    assert.deepEqual(await h.fresh().snapshot(sid, workspace), hot);
+  }
+  h.startTurn(); h.toolCall('bash', { command }); h.toolResult(tap);
+  await verify(true);
+
+  h.cd(elsewhere); h.toolCall('bash', { command, workdir: '.' }, 'wrong'); h.toolResult(tap, 'wrong');
+  h.cd(workspace); await verify(false);
+  h.toolCall('bash', { command: 'pwd' }, 'cwd'); h.toolResult(workspace, 'cwd');
+  await verify(false);
+  h.toolCall('run_code', { code: 'fixture' }, 'root');
+  const child = { rootCallId: 'root', parentCallId: 'root', subCallId: 'nested', name: 'ops_bash', arguments: { command } };
+  h.cd(elsewhere); h.append('tool/ptc-dispatch-start', child);
+  h.append('tool/ptc-dispatch', { ...child, content: content(tap + '[exit code: 0]'), isError: false });
+  h.toolResult('done', 'root'); await verify(false);
+  h.cd(workspace); await verify(false);
+  h.toolCall('pwsh', { command, workdir: '.' }, 'recheck'); h.toolResult(tap, 'recheck'); h.end();
+  await verify(true);
+
+  await assert.rejects(h.host.snapshot(sid, elsewhere), permanent('CODING_SESSION_SCOPE'));
+  await assert.rejects(h.fresh().snapshot(sid, elsewhere), permanent('CODING_SESSION_SCOPE'));
+  h.state.initialDirectory = null;
+  await assert.rejects(h.fresh().snapshot(sid), permanent('CODING_SESSION_SCOPE'));
+});
+
+test('目录在调用期间改变时核对原生 cwd，较早回执不能覆盖较新的异目录验收', async () => {
+  const other = path.resolve('other-workspace');
+  for (const [actual, expected] of [[undefined, false], [other, false], [workspace, true]]) {
+    const h = fixture(), sid = await h.create(); h.startTurn();
+    h.toolCall('bash', { command }); h.cd(other); h.cd(workspace);
+    h.toolResult(tap, 'c', 1, undefined, actual === undefined ? undefined : { cwd: actual }); h.end();
+    assert.equal((await h.fresh().snapshot(sid, workspace)).runs[0].executionVerified, expected);
+  }
+  const h = fixture(); await h.create(); h.startTurn();
+  h.toolCall('bash', { command }, 'old'); h.cd(other);
+  h.toolCall('bash', { command, workdir: '.' }, 'new'); h.toolResult(tap, 'new');
+  h.toolResult(tap, 'old', 1, undefined, { cwd: workspace }); h.cd(workspace);
+  assert.equal((await h.snapshot()).runs[0].executionVerified, false);
+  h.toolCall('bash', { command }, 'valid'); h.toolResult(tap, 'valid');
+  h.toolCall('bash', { command, workdir: other }, 'external'); h.toolResult(tap, 'external'); h.end();
+  assert.equal((await h.snapshot()).runs[0].executionVerified, false);
+});
+
+test('OPS 渲染的工作目录标记与会话头交叉核对', async () => {
+  for (const [cwd, expected] of [[workspace, true], [path.resolve('foreign'), false], ['.', false]]) {
+    const h = fixture(), sid = await h.create(); h.startTurn(); h.toolCall('run_code', {}, 'root');
+    const child = { rootCallId: 'root', parentCallId: 'root', subCallId: 'shell', name: 'ops_bash', arguments: { command } };
+    const header = '[cwd: resolvedFrom=' + JSON.stringify(cwd) + '; cwdSource="workingDirectory"]\n';
+    h.append('tool/ptc-dispatch-start', child);
+    h.append('tool/ptc-dispatch', { ...child, content: content(header + tap + '[exit code: 0]'), isError: false });
+    h.toolResult('done', 'root'); h.end();
+    assert.equal((await h.fresh().snapshot(sid, workspace)).runs[0].executionVerified, expected);
+  }
 });
 
 test('GUI 待审批、异步提问、后续答案和非成功轮次可在冷启动时区分', async () => {

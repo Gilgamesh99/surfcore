@@ -42,9 +42,15 @@ function json(text) {
   try { return JSON.parse(text); } catch { return undefined; }
 }
 
-function isCheckCommand(name, args) {
-  return shellTools.has(name) && (args?.command === checkCommand || args?.command === singleProcessCheck) && !args.script_path
-    && (!args.workdir || args.workdir === '.') && !args.run_in_background && !args.sandbox_permissions;
+function sameDirectory(a, b) {
+  return typeof a === 'string' && typeof b === 'string' && path.isAbsolute(a) && path.isAbsolute(b) && path.relative(a, b) === '';
+}
+
+function checkInvocation(name, args) {
+  const checkAttempt = shellTools.has(name) && (args?.command === checkCommand || args?.command === singleProcessCheck);
+  const eligible = checkAttempt && !args.script_path && (args.workdir === undefined || args.workdir === '.')
+    && !args.run_in_background && !args.sandbox_permissions;
+  return { checkAttempt, checkCommand: eligible };
 }
 
 // Native shell renderers omit an exit marker on success; host-backed ops_bash writes [exit code: 0].
@@ -52,19 +58,27 @@ function isCheckCommand(name, args) {
 function checkReceipt(text) {
   // PTC journals the native renderer's content. A single JSON text projection may instead contain the host's canonical ops_bash value.
   const structured = text.trimStart().startsWith('{');
+  let resolvedFrom;
   if (structured) {
     const value = json(text);
     if (value?.kind !== 'foreground' || value.status !== 'completed' || value.exitCode !== 0 || value.signal != null
       || value.timedOut || value.aborted || value.cancelled || value.stopped != null || value.error != null || value.failure
       || value.permission || value.restriction || value.sandbox?.denied || value.stdout?.truncated || value.stderr?.truncated
       || typeof value.stdout?.text !== 'string' || typeof value.stderr?.text !== 'string' || value.stderr.text.trim()) return null;
+    resolvedFrom = value.resolvedFrom;
     text = value.stdout.text.replace(/\r\n/g, '\n');
+  } else if (text.startsWith('[cwd:')) {
+    // ops_bash prepends this host-generated line before the process output.
+    const header = /^\[cwd: resolvedFrom=("(?:\\.|[^"\\])*"); cwdSource="[^"\n]+"\]\n/.exec(text);
+    if (!header) return null;
+    resolvedFrom = json(header[1]);
+    if (typeof resolvedFrom !== 'string') return null;
   }
   if (!/^TAP version 13$/m.test(text) || !/^# tests [1-9]\d*$/m.test(text) || !/^# pass [1-9]\d*$/m.test(text)
     || /^\[stderr\]$/m.test(text) || !/^# fail 0$/m.test(text) || /^# (?:(?:tests|pass) 0|(?:fail|cancelled) [1-9]\d*)$/m.test(text)
     || /^\[[^\]\n]+; effects: [^\]\n]+; retry: /m.test(text) || /^(?:not ok |\[(?:still running|timed out|stopped:|killed by signal:|cancelled|error:|sandbox:|output truncated|signal:|exit code: (?!0\])))/m.test(text)) return null;
   const requestId = /^ok \d+ - surfcore-acceptance ([a-f\d-]{36})$/m.exec(text)?.[1];
-  return requestId ? { requestId, structured, exitZero: structured || /\[exit code: 0\]\s*$/.test(text) } : null;
+  return requestId ? { requestId, structured, ...(resolvedFrom !== undefined && { resolvedFrom }), exitZero: structured || /\[exit code: 0\]\s*$/.test(text) } : null;
 }
 
 /** Normalize a native session wire event. Retain tool identities, never the task text, arguments or command output. */
@@ -91,7 +105,7 @@ export function codingObservation(event) {
     case 'tool/ptc-dispatch-start': {
       const nested = type === 'tool/ptc-dispatch-start';
       return { ...base, type: 'tool-call', name: data.name, callId: nested ? data.subCallId : data.callId,
-        ...(nested && { parentCallId: data.parentCallId, rootCallId: data.rootCallId }), checkCommand: isCheckCommand(data.name, nested ? data.arguments : json(data.arguments)) };
+        ...(nested && { parentCallId: data.parentCallId, rootCallId: data.rootCallId }), ...checkInvocation(data.name, nested ? data.arguments : json(data.arguments)) };
     }
     case 'tool/result':
     case 'tool/ptc-dispatch': {
@@ -105,7 +119,7 @@ export function codingObservation(event) {
       const time = Number.isSafeInteger(event.time) && event.time > 0 ? event.time : null;
       const questionPending = data.error?.code === 'TOOL_OUTCOME_UNKNOWN' || (text.startsWith('{') && json(text)?.pending === true);
       return { ...base, type: 'tool-result', callId, time, ok, questionPending,
-        ...(nested && { name: data.name, parentCallId: data.parentCallId, rootCallId: data.rootCallId, checkCommand: isCheckCommand(data.name, data.arguments) }),
+        ...(nested && { name: data.name, parentCallId: data.parentCallId, rootCallId: data.rootCallId, ...checkInvocation(data.name, data.arguments) }),
         check: ok ? checkReceipt(text) : null, ...(data.error?.code && { errorCode: data.error.code }) };
     }
     case 'assistant/attempt': {
@@ -117,16 +131,23 @@ export function codingObservation(event) {
 }
 
 // Retain only folded facts. The host keeps the durable journal, tool arguments and output.
-function makeHistory() {
+function makeHistory(workspace) {
   const runs = new Map();
   const accepted = new Set();
   const inbox = { 'next-step': [], 'next-turn': [] };
   const questions = new Map(); // callId -> originating request, including replies admitted on a later turn
   let current = null;
+  // DSH initializes workingDirectory from header.cwd. Directory changes affect future processes.
+  let atRoot = true, directoryRevision = 0;
   let sandbox, approval;
   let sandboxChanges = 0, approvalChanges = 0, touched = false;
   function apply(event) {
     const { type, data } = event;
+    if (type === 'working-directory/change') {
+      const nextAtRoot = sameDirectory(workspace, data.cwd);
+      if (nextAtRoot !== atRoot) directoryRevision++;
+      atRoot = nextAtRoot;
+    }
     if (type === 'sandbox/mode') { sandbox = data.mode; sandboxChanges++; }
     if (type === 'approval/policy') { approval = data.policy; approvalChanges++; }
     if (['command/run', 'session/title', 'working-directory/change', 'turn/start'].includes(type)) touched = true;
@@ -184,9 +205,13 @@ function makeHistory() {
       case 'approval-decided': current.approvals.delete(obs.id); run.waitingApproval = current.approvals.size > 0; break;
       case 'tool-call': {
         if (obs.parentCallId && (obs.rootCallId !== obs.parentCallId || current.calls.get(obs.parentCallId)?.name !== 'run_code')) break;
-        current.calls.set(obs.callId, obs);
+        current.calls.set(obs.callId, obs.checkCommand ? { ...obs, directoryRevision } : obs);
         run.lastTool = obs.name;
-        if (obs.checkCommand) { run.executionVerified = false; run.verifiedAt = null; }
+        if (obs.checkAttempt) {
+          current.latestCheck = obs.callId;
+          run.executionVerified = false;
+          run.verifiedAt = null;
+        }
         if (obs.name === 'ask_user_question') { questions.set(obs.callId, run.requestId); run.waitingQuestion = true; }
         break;
       }
@@ -198,8 +223,12 @@ function makeHistory() {
           questions.delete(obs.callId);
           run.waitingQuestion = [...questions.values()].includes(run.requestId);
         }
-        if (call.checkCommand && !run.mixed) {
-          run.executionVerified = obs.ok && obs.time !== null && obs.check?.requestId === run.requestId
+        if (call.checkCommand && current.latestCheck === obs.callId && !run.mixed) {
+          // Native bash/pwsh record the actual cwd in meta. OPS stamps its resolved basis (only default or '.' is eligible).
+          const reported = call.name === 'ops_bash' ? obs.check?.resolvedFrom : data.meta?.cwd;
+          const scopeKnown = call.directoryRevision === directoryRevision ? atRoot : reported !== undefined;
+          run.executionVerified = scopeKnown && (reported === undefined || sameDirectory(workspace, reported))
+            && obs.ok && obs.time !== null && obs.check?.requestId === run.requestId
             && (!call.parentCallId || obs.checkCommand) && (!obs.check.structured || call.name === 'ops_bash')
             && (call.name !== 'ops_bash' || obs.check.exitZero);
           run.verifiedAt = run.executionVerified ? obs.time : null;
@@ -218,7 +247,6 @@ function makeHistory() {
 
 export function createCodingDsh({ api }) {
   const histories = new Map();
-  const workspaces = new Map();
 
   async function rpc(method, args) {
     let envelope;
@@ -263,17 +291,37 @@ export function createCodingDsh({ api }) {
       for (const events of pages.reverse()) for (const event of events) entry.fold.apply(event);
     } catch (error) {
       entry.cursor = -1;
-      entry.fold = makeHistory();
+      entry.fold = makeHistory(entry.workspace);
       throw error;
     }
     entry.cursor = cursor;
     return entry.fold.view(cursor);
   }
 
-  function snapshot(sessionId) {
-    if (!histories.has(sessionId)) histories.set(sessionId, { cursor: -1, fold: makeHistory(), tail: Promise.resolve() });
-    const entry = histories.get(sessionId);
-    const result = entry.tail.then(() => readHistory(sessionId, entry));
+  function historyFor(sessionId) {
+    if (!histories.has(sessionId)) histories.set(sessionId, { cursor: -1, tail: Promise.resolve() });
+    return histories.get(sessionId);
+  }
+
+  async function workspaceRoot(sessionId, expected, entry) {
+    let root = entry.workspace;
+    if (root === undefined) {
+      // SessionSummary.cwd is the immutable header directory, including when the bridge was offline during a cd.
+      const list = await rpc('session/list', {});
+      root = list?.items?.find(row => row.sessionId === sessionId && !row.parentSessionId && row.origin !== 'subagent')?.cwd;
+    }
+    if (!sameDirectory(root, expected === undefined ? root : expected)) throw problem('CODING_SESSION_SCOPE', '无法确认 DSH 编程会话的初始工作区');
+    entry.workspace = root;
+    return root;
+  }
+
+  function snapshot(sessionId, workspace) {
+    const entry = historyFor(sessionId);
+    const result = entry.tail.then(async () => {
+      const root = await workspaceRoot(sessionId, workspace, entry);
+      entry.fold ??= makeHistory(root);
+      return readHistory(sessionId, entry);
+    });
     // The caller observes each rejection. Keep the serialization lane available to later reconnects.
     entry.tail = result.then(() => undefined, () => undefined);
     return result;
@@ -282,21 +330,20 @@ export function createCodingDsh({ api }) {
   async function sessionScope(sessionId, workspace) {
     const projection = await rpc('session/projections', { sessionId });
     const values = projection?.values;
-    if (projection?.kind !== 'sequenced' || values?.agentPreset !== 'standard' || typeof workspace !== 'string' || !path.isAbsolute(workspace)
-      || typeof values.workingDirectory !== 'string' || !path.isAbsolute(values.workingDirectory) || path.relative(workspace, values.workingDirectory) !== '') {
+    if (projection?.kind !== 'sequenced' || values?.agentPreset !== 'standard' || !sameDirectory(workspace, values.workingDirectory)) {
       throw problem('CODING_SESSION_SCOPE', '无法确认 DSH 独立编程会话的预设或工作区');
     }
     return values;
   }
 
   const safe = state => state.permissions.sandbox === 'workspace-write' && state.permissions.approval === 'ask';
-  async function requirePermissions(sessionId, initialize) {
-    const state = await snapshot(sessionId);
+  async function requirePermissions(sessionId, workspace, initialize) {
+    const state = await snapshot(sessionId, workspace);
     if (safe(state)) return;
     // Initialization can be retried after a lost create acknowledgement, only while the blank session still has its creation defaults.
     if (initialize && state.untouched) {
       const command = await rpc('commands/execute', { agentId: sessionId, line: '/permission workspace-write', submittedAttachments: [] });
-      if (command?.result?.kind === 'success' && safe(await snapshot(sessionId))) return;
+      if (command?.result?.kind === 'success' && safe(await snapshot(sessionId, workspace))) return;
     }
     throw problem('CODING_PERMISSION', '请在 DSH 检查本会话的 workspace-write 沙箱与人工审批设置');
   }
@@ -305,16 +352,18 @@ export function createCodingDsh({ api }) {
     if (typeof workspace !== 'string' || !path.isAbsolute(workspace)) throw problem('CODING_WORKSPACE', '编程任务需要独立工作区的绝对路径');
     const sessionId = taskUuid('session', taskId);
     const row = (await rpc('workspace/create', { path: workspace }))?.workspace;
-    if (!row?.workspaceId || typeof row.path !== 'string' || !path.isAbsolute(row.path) || path.relative(workspace, row.path) !== ''
+    if (!row?.workspaceId || !sameDirectory(workspace, row.path)
       || !Array.isArray(row.sessionIds) || row.sessionIds.some(id => id !== sessionId)) throw problem('CODING_WORKSPACE_CONFLICT', '无法独占该 DSH 任务工作区');
     if (!row.sessionIds.includes(sessionId)) {
       // session/create may mint another ID when given an unattached or nonblank session. Never adopt that replacement.
       if (await rpc('session/projections', { sessionId }) !== null) throw problem('CODING_SESSION_CONFLICT', '同一任务会话已存在，但宿主没有把它挂在本工作区');
       const created = await rpc('session/create', { workspaceId: row.workspaceId, sessionId, agentPreset: 'standard' });
       if (created?.sessionId !== sessionId || created.agentPreset !== 'standard') throw problem('CODING_SESSION_CONFLICT', '宿主返回了不同的任务会话或预设');
+      // Native session/create sets the header cwd to the registered workspace.path.
+      historyFor(sessionId).workspace = row.path;
     }
     await sessionScope(sessionId, workspace);
-    await requirePermissions(sessionId, true);
+    await requirePermissions(sessionId, workspace, true);
     // Read the current title immediately before the native rename, including manual GUI edits during setup.
     const { title: currentTitle } = await sessionScope(sessionId, workspace);
     if (currentTitle === null) {
@@ -322,7 +371,6 @@ export function createCodingDsh({ api }) {
       const renamed = await rpc('session/rename', { sessionId, title });
       if (renamed?.title !== title || !Number.isSafeInteger(renamed.seq)) throw problem('CODING_TITLE', 'DSH 未确认编程会话标题');
     } else if (typeof currentTitle !== 'string') throw problem('CODING_TITLE', 'DSH 缺少会话标题投影');
-    workspaces.set(sessionId, workspace);
     return sessionId;
   }
 
@@ -333,21 +381,15 @@ export function createCodingDsh({ api }) {
 
   function forget(sessionId) {
     histories.delete(sessionId);
-    workspaces.delete(sessionId);
     api.events.forget?.(sessionId);
   }
 
   async function start({ sessionId, workspace, taskId, task }) {
     if (!sessionId || sessionId !== taskUuid('session', taskId)) throw problem('CODING_SESSION_CONFLICT', '编程任务与 DSH 会话身份不匹配');
     if (typeof task !== 'string' || !task.trim()) throw problem('CODING_TASK_EMPTY', '请提供明确的编程任务内容');
-    workspace ??= workspaces.get(sessionId);
-    if (workspace === undefined) {
-      // ABI callers may omit the workspace after restart. SessionSummary.cwd is the immutable header directory.
-      const list = await rpc('session/list', {});
-      workspace = list?.items?.find(row => row.sessionId === sessionId && !row.parentSessionId && row.origin !== 'subagent')?.cwd;
-    }
+    workspace = await workspaceRoot(sessionId, workspace, historyFor(sessionId));
     await sessionScope(sessionId, workspace);
-    await requirePermissions(sessionId, false);
+    await requirePermissions(sessionId, workspace, false);
     watch(sessionId);
     const requestId = codingRequestId(taskId);
     const receipt = await rpc('session/prompt', { sessionId, requestId, mode: 'queue', content: [{ type: 'text', text: taskPrompt(task, requestId, taskId) }] });

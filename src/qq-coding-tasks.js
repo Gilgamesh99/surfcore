@@ -173,7 +173,7 @@ export function createCodingTasks({ stateFile, workspacesDir, writeState, host, 
     const cached = progressCache.get(task.id);
     if (!force && cached && now() - cached.at < 5000) return cached.fields;
     if (!readInFlight.has(task.id)) {
-      const read = host.snapshot(task.sessionId).then(snapshot => {
+      const read = host.snapshot(task.sessionId, workspaceFor(workspacesDir, task.id)).then(snapshot => {
         const fields = projectSnapshot(task, snapshot);
         progressCache.set(task.id, { at: now(), fields });
         return fields;

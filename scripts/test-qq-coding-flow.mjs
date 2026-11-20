@@ -55,6 +55,8 @@ function fixtureHost() {
         record(args.sessionId, 'approval/policy', { policy: 'ask' });
         return { sessionId: args.sessionId, agentPreset: args.agentPreset };
       }
+      case 'session/list':
+        return { items: created.map(({ sessionId, workspace }) => ({ sessionId, cwd: workspace })) };
       case 'session/projections': {
         const session = sessions.get(args.sessionId);
         return session ? { kind: 'sequenced', values: { agentPreset: session.agentPreset, workingDirectory: session.workspace.path, title: session.title } } : null;
@@ -365,6 +367,35 @@ test('成品和自报的检查清单齐备，宿主无验收命令回执时阻�
   assert.equal(final.issue, 'NO_RUN');
   assert.equal(h.gateway.requests.length, 0);
   assert.match(h.calls.sent.at(-1).text, /未取得.*验收.*请在 DSH/u);
+});
+
+test('桥接重启后仍能识别同名测试在另一目录通过，原群不会收到未经该测试验收的成品', async t => {
+  const first = await bridge(t);
+  await first.live(incoming(createText));
+  const [task] = first.rows();
+  const workspace = path.join(first.workspaces, task.id);
+  fs.mkdirSync(path.join(workspace, 'deliverables'));
+  fs.writeFileSync(path.join(workspace, 'deliverables', 'answer.txt'), '41');
+  fs.writeFileSync(path.join(workspace, 'surfcore-result.json'), JSON.stringify({ files: ['answer.txt'], checks: ['读取答案为 42'] }));
+
+  const other = fs.mkdtempSync(path.join(first.temp, 'other-cwd-'));
+  fs.writeFileSync(path.join(other, 'answer.txt'), '42');
+  const label = 'surfcore-acceptance ' + codingRequestId(task.id);
+  fs.writeFileSync(path.join(other, 'surfcore-check.mjs'), [
+    "import test from 'node:test'; import assert from 'node:assert/strict'; import fs from 'node:fs';",
+    "test(" + JSON.stringify(label) + ", () => assert.equal(fs.readFileSync('answer.txt', 'utf8'), '42'));",
+  ].join('\n'));
+  first.host.record(task.sessionId, 'working-directory/change', { cwd: other });
+  const callId = 'other-directory-check';
+  first.host.record(task.sessionId, 'tool/call', { turn: 1, callId, name: 'bash', arguments: JSON.stringify({ command: ['node', ...checkArgs].join(' ') }) });
+  const text = nodeIn(other, checkArgs);
+  assert.ok(text.includes('ok 1 - ' + label));
+  first.host.record(task.sessionId, 'tool/result', { turn: 1, message: { source: { callId }, content: [{ type: 'text', text }] } });
+  first.host.record(task.sessionId, 'turn/end', { turn: 1, reason: { kind: 'completed' } });
+
+  const recovered = await restart(t, first);
+  assert.equal(recovered.rows()[0].issue, 'NO_RUN');
+  assert.equal(recovered.gateway.requests.length, 0);
 });
 
 test('原生验收通过后、回合结束前改动第二个成品，批次中的文件均不上传', async t => {
