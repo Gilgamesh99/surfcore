@@ -5,17 +5,19 @@
 // 2026-11-01 当天 0 次），于是「她不知道自己是谁」成了常态。
 // 现在唤醒侧直接注入人格卡正文，并与 qq_get_prompt 同源（都经 composePersonaLayers）。
 //
-// 这里钉三件事：
+// 这里钉四件事：
 //   ① 两个唤醒入口（正常唤醒 / 「还没收尾」提醒）都走 personaWakeBlockV2；
 //   ② roleHintForMode 的 personaOnly 不重复拼管理员规则 / B站简报 / 记忆卡；
 //   ③ 分层引擎在 tone 模式仍然保留「我是谁 / 主人是谁」的身份底座（B 的设计承诺），
-//      只有「真的写了语气层」时才省掉核心。
+//      只有「真的写了语气层」时才省掉核心；
+//   ④ 普通群聊唤醒给出首答查证、日常闲聊和互相玩梗各自的条件。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { composePersonaLayers } from '../src/persona-layers.js';
 import { buildPersonaIdentity } from '../src/persona-identity.js';
+import { bridgeHarness } from './audit-bridge-harness.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const bridge = fs.readFileSync(path.join(root, 'src/bridge.js'), 'utf8');
@@ -65,5 +67,19 @@ const toneOnly = composePersonaLayers({ core, daily, tone: toneLayer, identity, 
 assert.equal(toneOnly.text.includes('喜欢下雨天'), false, '写了语气层后 tone 模式不该再带核心');
 assert.match(toneOnly.text, /你是小测/, 'tone 模式省核心后必须保留身份底座');
 assert.match(toneOnly.text, /句子短、爱用波浪号/, 'tone 模式没有带语气层');
+
+const harness = await bridgeHarness();
+try {
+  harness.setMode('reserved2');
+  const wake = harness.buildWakePromptV2('group:456', 'question');
+  const rule = wake.split('\n').find(line => line.startsWith('【反AI味】'));
+  assert.ok(rule, '普通群聊唤醒缺少反 AI 味规则');
+  assert.match(rule, /模型比较.*首答前主动查证/, '模型比较应在第一条答复前查证');
+  assert.match(rule, /日常闲聊.*卖萌/, '日常聊天可以保留可爱的语气');
+  assert.match(rule, /玩梗时才.*装傻/, '装傻应限于彼此玩梗');
+  assert.doesNotMatch(rule, /可以装傻、已读乱回/);
+} finally {
+  await harness.close();
+}
 
 console.log('✅ 唤醒人格卡注入（A1）通过');
