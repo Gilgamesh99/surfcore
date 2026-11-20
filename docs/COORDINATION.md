@@ -18,6 +18,7 @@
 
 | 会话 | 工作目录 | 分支 | 负责范围 | 状态 |
 | --- | --- | --- | --- | --- |
+| **QQ 编程任务和文件回传（2026-11-20）** | `surfcore-qq-coding-tasks` | `feat/qq-coding-tasks`（基线 75323ce） | 真实主人新会话指令、DSH 任务进度与原会话交付 | 实现与隔离集成验收已完成，含 DSH 实际成品复跑。合并、回滚与发布交接见[案例](cases/2026-11-20-qq-coding-tasks.md)。 |
 | **主人桌面独立连续性（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-conversation` | `feat/owner-desktop-conversation`（基线a8e4f82） | Lead设置/预设/GUI/文档/集成；队友broker+bridge、runtime+边界、持久索引分文件；只读事故与可见入口审查 | 已集成本机dev并验收；来源QQ人格/模型、独立历史、可见入口和停止证明专项通过；完整audit162/165后余3项复验全通过；插件/桥接28876在线，GUI与配置/原作者更新保持；未实发QQ或长期游戏测试、未推送发布 |
 | **主人私聊桌面指令识别（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-intent` | `feat/owner-desktop-intent`（基线cd36c1c） | Lead修复明确Windows-MCP自然指令与私聊提示；队友只读边界复核 | 已集成本机dev，插件/桥接在线、授权不限时、runtime无错误、配置与原作者更新保持；完整审计165/165及原句/权限专项通过；未重放历史命令、未发送测试消息、未推送发布 |
 | **主人桌面长任务（2026-11-18）** | `D:/ProgramData/DSH NEXT/Soul/surfcore-owner-desktop-duration` | `feat/owner-desktop-duration`（基线4f0ce2f） | Lead负责UI/配置接口验证/集成，队友负责时限语义与测试 | 已集成本机并启用不限时；插件/桥接在线、原作者更新与配置保持；缓存兼容复现和时限/权限专项通过，审计162/165后两项复验通过，R11旧基线同样超时；未推送/发布/长期游戏实测 |

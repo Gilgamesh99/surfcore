@@ -73,6 +73,10 @@ import {
 } from './admin-identity.js';
 import { isOwnerOnlyFrame, canConsumePending, buildQuestionAnswers } from './question-answers.js';
 import { createOwnerAudit } from './owner-audit.js';
+import { parseCodingRequest } from './qq-coding-intent.js';
+import { createCodingDsh } from './qq-coding-dsh.js';
+import { createCodingTasks } from './qq-coding-tasks.js';
+import { readCodingDelivery, uploadCodingFile } from './qq-coding-delivery.js';
 import { createOwnerDesktopBroker, handleOwnerDesktopRoute } from './owner-desktop-broker.js';
 import { readOwnerDesktopSettings, recordQqSessionSources } from './owner-desktop-config.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -1881,6 +1885,52 @@ async function main() {
   const ownerDesktopStartedAt = Date.now();
   let ownerDesktopLiveSince = ownerDesktopStartedAt;
   let ownerDesktopBroker = null;
+  let codingTasks = null;
+  let codingLoginVerified = false;
+  let codingConnection = 0;
+  function codingAuthorized(task) {
+    return String(cfg.ownerQQ ?? '') === task.ownerId && selfUserId === task.selfId
+      && !senderBlocked(task.ownerId, cfg.deny?.users) && isSessionAllowedInCurrentMode(task.originKey);
+  }
+  function canSendCoding(key, task) {
+    return codingAuthorized(task) && codingLoginVerified && snowlumaHealth.connected === true
+      && isSessionAllowedInCurrentMode(key) && !socialV2.paused && !shouldBlockSilentReply(key);
+  }
+  async function notifyCoding(key, message, task) {
+    if (!canSendCoding(key, task)) return { ok: false };
+    const assertCurrent = () => { if (!canSendCoding(key, task)) throw new Error('编程任务回执权限已变化'); };
+    const receipt = await sendToQQ(key, message, assertCurrent);
+    if (receipt.ok && currentMode === 'reserved2') recordSentMessagesV2(key, [message]);
+    return receipt;
+  }
+  function getCodingTasks() {
+    return codingTasks ??= createCodingTasks({
+      stateFile: path.join(STATE_DIR, 'qq-coding-tasks.json'), workspacesDir: path.join(SURFCORE_DIR, 'coding-workspaces'),
+      writeState: atomicWriteJson, host: createCodingDsh({ api }), readDelivery: readCodingDelivery,
+      upload: options => uploadCodingFile({ ...options, onebot: bot }), notify: notifyCoding, authorized: codingAuthorized,
+      canWork: task => dshReady && canSendCoding(task.originKey, task), canSend: canSendCoding, log,
+    });
+  }
+  function tickCodingTasks() {
+    if (!codingLoginVerified) return;
+    try { return getCodingTasks().tick(); }
+    catch { logThrottled('coding-task-state', 60000, '编程任务记录读取失败，请检查状态文件；现有记录已保留。'); }
+  }
+  async function handleCodingRequest(kind, id, event, key) {
+    if (!codingLoginVerified) return false;
+    const ownerId = String(cfg.ownerQQ ?? '');
+    const request = parseCodingRequest({ event, kind, id, selfId: selfUserId, ownerId, startedAt: ownerDesktopLiveSince, now: Date.now() });
+    if (!request) return false;
+    const actor = { ownerId, selfId: selfUserId, originKey: key };
+    if (!canSendCoding(key, actor)) return false;
+    try {
+      return await getCodingTasks().handle({ request, key, actorId: String(event.user_id), ownerId,
+        selfId: selfUserId, messageId: String(event.message_id ?? event.msg_id) });
+    } catch {
+      await notifyCoding(key, '编程任务记录暂时无法读取或保存。请主人在本机检查任务记录与磁盘空间，再查询进度。', actor);
+      return true;
+    }
+  }
   let ownerDesktopEpoch = 0;
   function revokeOwnerDesktop(reason, key = '') {
     // Advance even after task completion: queued result receipts must not survive off/on.
@@ -4075,6 +4125,7 @@ async function main() {
       dshReady = false;
       log('⚠️ DSH 不可用（重启中？），QQ 消息将入队等待');
     }
+    tickCodingTasks();
   };
   function startDshWatch() {
     if (dshCheckStarted) return;
@@ -16461,6 +16512,7 @@ async function main() {
       return;
     }
     if (source === ownerDesktopLiveSource) {
+      if (await handleCodingRequest(kind, id, event, key)) return;
       const intake = await getOwnerDesktopBroker().ingest({ source: 'onebot-live', kind, id, event });
       if (intake.handled) {
         const sourceMessageId = String(event.message_id ?? event.msg_id ?? '');
@@ -17359,6 +17411,7 @@ async function main() {
         for await (const envelope of stream) {
           framesThisStream += 1;
           const frame = envelope.payload;
+          if (frame.sessionId) codingTasks?.onEvent(frame.sessionId, frame.event?.type ?? frame.type);
           // 会话开场快照：只喂 token 账本。它含**历史** turn/end，绝不能让它们走
           // session/event 通道 —— 否则桥接会把早已结束的回合当成新回合去发 QQ 回复。
           if (frame.type === 'session/snapshot') {
@@ -17940,6 +17993,8 @@ async function main() {
   }
 
   bot.on('open', () => {
+    const connection = ++codingConnection;
+    codingLoginVerified = false;
     ownerDesktopLiveSince = Date.now();
     revokeOwnerDesktop('QQ 连接已重新建立，旧任务不会恢复。');
     // 用实际连接地址（自愈后可能与 config 里的初值不同，别打印过期的那个）
@@ -17953,6 +18008,7 @@ async function main() {
     void pollSnowlumaStatus();
     // 读取机器人昵称（用于社交模式"被提到"识别）；重连后也会刷新
     bot.getLoginInfo().then((login) => {
+      if (connection !== codingConnection) return;
       if (login?.nickname) {
         selfNickname = String(login.nickname).toLowerCase();
         selfDisplayName = String(login.nickname).trim();
@@ -17961,7 +18017,9 @@ async function main() {
       if (login?.user_id != null) {
         if (selfUserId !== String(login.user_id)) revokeOwnerDesktop('机器人登录身份已变化。');
         selfUserId = String(login.user_id);
+        codingLoginVerified = true;
         reconcileAllowlist('login');
+        tickCodingTasks();
       }
       // 把「QQ 昵称 / QQ 号」落一小份给另一侧用：B站 会话是插件进程，拿不到网关登录信息，
       // 但它要靠这两个锚点认出「自己的 QQ 资料卡截图」（2026-10-23 用户要求跨平台互认）。
@@ -18072,6 +18130,8 @@ async function main() {
   }
 
   bot.on('close', (info) => {
+    codingConnection++;
+    codingLoginVerified = false;
     revokeOwnerDesktop('QQ 连接已断开。');
     snowlumaHealth.connected = false;
     log(`SnowLuma 连接断开（code=${info?.code ?? '?'}），重连中…`);

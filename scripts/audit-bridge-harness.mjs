@@ -35,6 +35,10 @@ import * as commandSpam from '../src/command-spam.js';
 import * as adminIdentity from '../src/admin-identity.js';
 import * as questionAnswers from '../src/question-answers.js';
 import * as ownerAudit from '../src/owner-audit.js';
+import { parseCodingRequest } from '../src/qq-coding-intent.js';
+import { createCodingDsh } from '../src/qq-coding-dsh.js';
+import { createCodingTasks } from '../src/qq-coding-tasks.js';
+import { readCodingDelivery, uploadCodingFile } from '../src/qq-coding-delivery.js';
 import { recordQqSessionSources } from '../src/owner-desktop-config.js';
 import * as roleCard from '../src/role-card.js';
 import * as personaLayers from '../src/persona-layers.js';
@@ -208,6 +212,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   return {
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
+    receiveCodingLive: (kind, id, event) => handleIncoming(kind, id, event, cfg, ownerDesktopLiveSource),
+    tickCodingTasks, onCodingEvent: (sessionId, type) => getCodingTasks().onEvent(sessionId, type),
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     fishChatWindows, evaluateConversationFishGuard, fishGuardSendBlock, recordFishWindow,
     tokenGuardWakeBlock, tokenGuardSendBlock, bridgeDailyUsage, learnerBudgetBlock,
@@ -229,6 +235,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     setSelfIdentity(display, id) {
       selfDisplayName = String(display ?? '');
       selfUserId = String(id ?? '');
+      codingLoginVerified = Boolean(selfUserId);
       selfNickname = selfDisplayName.toLowerCase() || 'deepseek';
     },
     flushQueue, retireSession,
@@ -286,6 +293,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...tokenBudget,
     ...adminIdentity, ...roleCard, ...personaLayers, ...wakePolicy, ...groupPolicy, ...actionPlanner, ...sessionMap, ...contextTelemetry, ...memoryCard, ...vectorMemory, ...biliCard, ...characterStore, ...historyCatchup,
     ...questionAnswers, ...ownerAudit, ...turnGuard, ...gateEvents, recordQqSessionSources,
+    parseCodingRequest, createCodingDsh, createCodingTasks, readCodingDelivery, uploadCodingFile,
     ...purposeEngine,
     ...conversationClosure, ...conversationContinuation,
     ...sessionRollover,
