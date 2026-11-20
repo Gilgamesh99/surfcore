@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "version": "0.8.9",
   "source": "git:HEAD",
-  "generatedAt": "2026-11-20T08:02:29.657Z",
+  "generatedAt": "2026-11-20T08:12:59.734Z",
   "files": {
     ".gitattributes": "12e1f7fda0dfac65d39424de9a676702bbf64c0f867895517abd5e90a61b921d",
     ".github/workflows/sync-fork.yml": "e4af1474fa1a56a815e054003af4689ec7254d0122277940387df698259d8381",
